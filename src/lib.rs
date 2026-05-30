@@ -7,7 +7,10 @@
 //! - Built-in tools: shell, rhai, http, duckdb/ducklake, postgres, python, playbook, noop
 //! - Template engine with Jinja2-compatible syntax
 //! - Authentication resolvers (GCP ADC, credentials)
+//! - Apache Arrow IPC codec for the columnar data plane (R-2.1, see
+//!   Appendix H of the global hybrid cloud blueprint)
 
+pub mod arrow_codec;
 pub mod auth;
 pub mod context;
 pub mod error;
