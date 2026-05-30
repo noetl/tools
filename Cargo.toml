@@ -55,6 +55,23 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 tempfile = "3.10"
 
+# Apache Arrow columnar substrate.  Added in R-2.1 per Appendix H of
+# the global hybrid cloud blueprint:
+# https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
+#
+# - `arrow` is the core columnar types (RecordBatch, Schema, Array).
+# - `arrow-ipc` is the Feather V2 / IPC reader+writer used to
+#   round-trip RecordBatch bytes for the IpcHint payload contract.
+# - `arrow-flight` is the gRPC server/client that R-2.2 will use for
+#   cross-pod IPC retrieval (Arrow Flight endpoint on the worker).
+#
+# All three crates ship from the same arrow-rs workspace and share the
+# same `arrow-` major version, so version-pin them together to avoid
+# the subtle ABI breakage that mixed minors produce in arrow-rs.
+arrow = "53"
+arrow-ipc = "53"
+arrow-flight = "53"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
