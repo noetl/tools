@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0](https://github.com/noetl/tools/compare/v1.0.0...v1.1.0) (2026-05-30)
+
+### Features
+
+* **arrow:** add arrow-rs to noetl-tools (R-2.1) ([765aef5](https://github.com/noetl/tools/commit/765aef59553e96ff4b957afe2284b4710c1b674e)), closes [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30) [noetl/cli#19](https://github.com/noetl/cli/issues/19)
+
 ## 1.0.0 (2026-03-02)
 
 ### Bug Fixes
