@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1](https://github.com/noetl/tools/compare/v1.1.0...v1.1.1) (2026-05-31)
+
+### Bug Fixes
+
+* **shell:** default shell to sh instead of bash for Alpine compat ([58c0b8a](https://github.com/noetl/tools/commit/58c0b8acaf343808795b1fa63d3c7909509b3b33)), closes [noetl/tools#3](https://github.com/noetl/tools/issues/3) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [1.1.0](https://github.com/noetl/tools/compare/v1.0.0...v1.1.0) (2026-05-30)
 
 ### Features
