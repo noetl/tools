@@ -41,8 +41,21 @@ pub struct ShellConfig {
     pub capture: bool,
 }
 
+/// Default shell — `sh` because it's POSIX-guaranteed on every
+/// Unix-like OS the worker might run on (including minimal Alpine
+/// images where `bash` is not installed).  Playbooks that need
+/// bash-specific features set `shell: bash` explicitly AND must
+/// ensure their runtime image carries `/bin/bash`.
+///
+/// Pre-fix this defaulted to `"bash"` which broke shell-tool
+/// dispatch in any Alpine-based worker image with:
+///
+///     Process error: Failed to spawn process: No such file or directory (os error 2)
+///
+/// Surfaced by the noetl-worker (Rust) kind validation pass on
+/// 2026-05-31; tracked on [noetl/tools#3].
 fn default_shell() -> String {
-    "bash".to_string()
+    "sh".to_string()
 }
 
 fn default_capture() -> bool {
@@ -253,6 +266,51 @@ mod tests {
         assert!(result.is_success());
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.as_ref().unwrap().contains("hello world"));
+    }
+
+    /// Default shell is `sh` (POSIX-guaranteed) — locks in the
+    /// portability invariant for Alpine-based worker images.
+    /// Pre-fix the default was `bash` which broke shell dispatch
+    /// in any image without `/bin/bash`.  See noetl/tools#3.
+    #[test]
+    fn default_shell_is_sh() {
+        assert_eq!(default_shell(), "sh");
+    }
+
+    /// Shell substitutions (`$(...)`) work through the `sh -c`
+    /// wrapper — the kind-validation regression test.  Pre-fix
+    /// this failed because the default shell `bash` wasn't
+    /// available in the Alpine worker image; new default `sh`
+    /// is always present and supports `$(...)` per POSIX.
+    #[tokio::test]
+    async fn test_shell_substitution_with_default_sh() {
+        let tool = ShellTool::new();
+        let result = tool
+            .execute_command(
+                "echo \"hello from $(uname -s)\"",
+                "sh",
+                None,
+                &HashMap::new(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "got: {:?}", result);
+        let stdout = result.stdout.as_ref().unwrap();
+        assert!(
+            stdout.starts_with("hello from "),
+            "substitution must execute; stdout={:?}",
+            stdout,
+        );
+        // The substitution must actually have run — otherwise the
+        // literal `$(uname -s)` would still be in the output.
+        assert!(
+            !stdout.contains("$(uname -s)"),
+            "substitution didn't fire; shell tool isn't passing -c correctly; stdout={:?}",
+            stdout,
+        );
     }
 
     #[tokio::test]
