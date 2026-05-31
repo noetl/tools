@@ -6,7 +6,23 @@ on:
       - main
 
 permissions:
+  # `contents: write` — semantic-release pushes the version bump +
+  # CHANGELOG commit + tag back to main.
   contents: write
+  # `actions: write` — required for the "Trigger release-tools
+  # workflow" step (added below) to call
+  # `gh workflow run release.yml`.  Without this, the dispatch
+  # returns HTTP 403 "Resource not accessible by integration"
+  # and the pipeline silently leaves the newly-bumped version
+  # unpublished on crates.io.  Same permission set noetl/cli +
+  # noetl/worker + noetl/server use.
+  actions: write
+  # `issues: write` + `pull-requests: write` — semantic-release's
+  # GitHub plugin posts a successComment on the PR / closing
+  # comment on the resolved issue.  Required when those comments
+  # are enabled in .releaserc.json.
+  issues: write
+  pull-requests: write
 
 jobs:
   release:
@@ -20,6 +36,7 @@ jobs:
           fetch-depth: 0
 
       - name: Release
+        id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
           semantic_version: 24.2.3
@@ -30,3 +47,25 @@ jobs:
             conventional-changelog-conventionalcommits@8.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # GitHub Actions safeguard: tags created by GITHUB_TOKEN do not
+      # trigger workflows (prevents recursion).  The `release-tools`
+      # workflow is configured to run on `push: tags: ['v*']` but a
+      # tag pushed by the semantic-release-action via GITHUB_TOKEN
+      # won't fire it.  Explicitly dispatch it here so each new
+      # version reaches the crate / image / GitHub Release flow.
+      #
+      # Same pattern as noetl/cli + noetl/worker + noetl/server.
+      # Without this step, noetl-tools versions cut by semantic-
+      # release (1.1.0, 1.1.1, ...) sit unpublished on crates.io
+      # while the registry still shows the legacy 2.8.7 from the
+      # March 2026 release-stream reset.
+      - name: Trigger release-tools workflow
+        if: ${{ steps.semantic.outputs.new_release_published == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)"
+          gh workflow run release.yml --ref main -f version="${VERSION}"
