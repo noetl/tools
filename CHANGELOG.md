@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.9.0] (2026-05-31)
+
+### Versioning realignment (no behaviour change)
+
+Bump from `1.1.1` to `2.9.0` to skip past the yanked `2.8.7` release on crates.io.  Until this release the local source tree and the published crate were on diverging version tracks: the repo had been reset to a `1.x.x` line for the R-1.x development cycle, but the lone `2.8.7` publish (from March 2026, before the reset) was still the only crates.io artifact — so downstream consumers (noetl-worker, noetl-server) pinned to `noetl-tools = "2.8.7"` couldn't reach any of the 1.x fixes via crates.io.
+
+This release publishes the 1.1.1 code (including the EE-3 kind-validation shell-tool fix) under the version `2.9.0` so the existing `^2.8.7` SemVer constraint on downstream crates picks it up via `cargo update`.  `2.8.7` is yanked post-publish.
+
+Includes everything from 1.1.0 and 1.1.1:
+
+- **arrow:** add arrow-rs to noetl-tools (R-2.1)
+- **shell:** default shell to sh instead of bash for Alpine compat (closes [noetl/tools#3](https://github.com/noetl/tools/issues/3))
+- **ci:** trigger release.yml from semantic-release + add required perms
+
+Refs [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30).
+
 ## [1.1.1](https://github.com/noetl/tools/compare/v1.1.0...v1.1.1) (2026-05-31)
 
 ### Bug Fixes
