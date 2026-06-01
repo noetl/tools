@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.13.0](https://github.com/noetl/tools/compare/v2.12.0...v2.13.0) (2026-06-01)
+
+### Features
+
+* **result_fetch:** bearer-token + TLS-CA config (R-2.3 Phase C2.3) ([7a2896d](https://github.com/noetl/tools/commit/7a2896d64a63cc337ef26cc79253b07fad860a88)), closes [noetl/ai-meta#33](https://github.com/noetl/ai-meta/issues/33)
+
 ## [2.12.0](https://github.com/noetl/tools/compare/v2.11.0...v2.12.0) (2026-06-01)
 
 ### Features
