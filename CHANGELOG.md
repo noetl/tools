@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.11.0](https://github.com/noetl/tools/compare/v2.10.0...v2.11.0) (2026-06-01)
+
+### Features
+
+* **tools:** result_fetch tool kind — playbook-driven cross-step fetch ([df92c2a](https://github.com/noetl/tools/commit/df92c2afdf566ec5fd4f7ab6d674dbe110bc008d)), closes [noetl/cli#43](https://github.com/noetl/cli/issues/43) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [2.10.0](https://github.com/noetl/tools/compare/v2.9.0...v2.10.0) (2026-06-01)
 
 ### Features
