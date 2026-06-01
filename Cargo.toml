@@ -78,7 +78,16 @@ arrow-flight = "53"
 # output under playbook-step policy control (per
 # `agents/rules/execution-model.md`).  Falls back to HTTP
 # `/api/result/resolve` for non-tabular refs.
-noetl-arrow-flight-client = "0.1"
+#
+# `0.4` ships:
+# - `FlightTlsConfig` (Phase C2.2) for TLS-fronted Flight endpoints
+#   — `result_fetch`'s `tls_ca_path` field threads the on-disk CA
+#   bundle through.
+# - `FlightAuth` + `FlightConfig` + `connect_with` (Phase C2.3) for
+#   bearer-token auth — `result_fetch`'s `bearer_token` field
+#   resolves either as a NoETL keychain credential alias (preferred
+#   per `agents/rules/execution-model.md`) or a literal token.
+noetl-arrow-flight-client = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
