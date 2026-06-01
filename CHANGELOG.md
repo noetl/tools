@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.12.0](https://github.com/noetl/tools/compare/v2.11.0...v2.12.0) (2026-06-01)
+
+### Features
+
+* **template:** .result accessor proxy for cross-runtime parity ([4ee8b07](https://github.com/noetl/tools/commit/4ee8b078d224fbafd430ca511f15a3fe27f8ec43))
+
+### Bug Fixes
+
+* **result_fetch:** use http/https scheme for Flight endpoint (tonic compat) ([4118251](https://github.com/noetl/tools/commit/411825178ffe72645c3eb9497bd79bc467be0003))
+
 ## [2.11.0](https://github.com/noetl/tools/compare/v2.10.0...v2.11.0) (2026-06-01)
 
 ### Features
