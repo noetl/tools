@@ -72,6 +72,14 @@ arrow = "53"
 arrow-ipc = "53"
 arrow-flight = "53"
 
+# Rust consumer for the noetl-server's Arrow Flight `do_get`
+# endpoint.  Used by the `result_fetch` tool kind to materialise a
+# `noetl://execution/<eid>/result/<step>/<id>` URI into the step's
+# output under playbook-step policy control (per
+# `agents/rules/execution-model.md`).  Falls back to HTTP
+# `/api/result/resolve` for non-tabular refs.
+noetl-arrow-flight-client = "0.1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
