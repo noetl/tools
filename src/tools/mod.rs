@@ -18,6 +18,7 @@ mod noop;
 mod playbook;
 mod postgres;
 mod python;
+mod result_fetch;
 mod rhai;
 mod script;
 mod secrets;
@@ -32,6 +33,7 @@ pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
 pub use self::postgres::PostgresTool;
 pub use self::python::PythonTool;
+pub use self::result_fetch::ResultFetchTool;
 pub use self::rhai::RhaiTool;
 pub use self::script::ScriptTool;
 pub use self::secrets::{SecretManagerTool, SecretsTool};
@@ -59,6 +61,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(NoopTool::new());
     registry.register(SecretsTool::new());
     registry.register(SecretManagerTool::new());
+    registry.register(ResultFetchTool::new());
 
     registry
 }
