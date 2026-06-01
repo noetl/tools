@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.14.0](https://github.com/noetl/tools/compare/v2.13.0...v2.14.0) (2026-06-01)
+
+### Features
+
+* **result_fetch:** mTLS client identity config (R-2.3 Phase C2.4) ([7e2bd53](https://github.com/noetl/tools/commit/7e2bd532fc746036008bb0a89bb6e1768acead68)), closes [noetl/cli#47](https://github.com/noetl/cli/issues/47) [noetl/noetl#648](https://github.com/noetl/noetl/issues/648) [noetl/noetl#648](https://github.com/noetl/noetl/issues/648) [noetl/cli#47](https://github.com/noetl/cli/issues/47) [noetl/ai-meta#33](https://github.com/noetl/ai-meta/issues/33)
+
 ## [2.13.0](https://github.com/noetl/tools/compare/v2.12.0...v2.13.0) (2026-06-01)
 
 ### Features
