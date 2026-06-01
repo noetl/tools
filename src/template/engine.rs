@@ -1,7 +1,27 @@
 //! Template engine implementation using minijinja.
+//!
+//! ## `.result` accessor proxy (cross-runtime template compatibility)
+//!
+//! NoETL playbooks address prior-step outputs with the convention
+//! `{{ step_name.result.<field> }}`.  The Python renderer
+//! (`noetl/core/dsl/render.py`) implements `.result` as a fall-through
+//! proxy: if the step dict does not have an explicit `result` key,
+//! `step.result.X` is rewritten to `step.X`.
+//!
+//! Without that proxy on the Rust side, playbooks written against the
+//! Python worker break when the same step lands on the Rust worker —
+//! the engine reports `undefined value` because minijinja's default
+//! map lookup has no fall-through.
+//!
+//! `StepResultProxy` wraps `serde_json::Value::Object` entries with a
+//! custom [`Object`] implementation that intercepts `.result` lookups
+//! and aliases them back to the underlying map.  Nested map values are
+//! wrapped recursively so the proxy applies at every depth.
 
-use minijinja::{Environment, Value};
+use minijinja::value::{Enumerator, Object, Value};
+use minijinja::Environment;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::context::ExecutionContext;
 use crate::error::ToolError;
@@ -107,14 +127,70 @@ impl Default for TemplateEngine {
 }
 
 /// Convert a HashMap context to minijinja Value.
+///
+/// Top-level map entries are wrapped with [`StepResultProxy`] so the
+/// `.result` accessor (cross-runtime compatibility with the Python
+/// renderer's `StepResultProxy`) works at any depth.
 fn context_to_value(context: &HashMap<String, serde_json::Value>) -> Value {
-    let json = serde_json::Value::Object(
-        context
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    );
-    Value::from_serialize(&json)
+    let map: std::collections::BTreeMap<String, Value> = context
+        .iter()
+        .map(|(k, v)| (k.clone(), json_to_proxied_value(v.clone())))
+        .collect();
+    Value::from(map)
+}
+
+/// Convert a `serde_json::Value` to a minijinja [`Value`], wrapping
+/// map-shaped values with [`StepResultProxy`] so `.result` lookups
+/// fall through to the underlying map.
+fn json_to_proxied_value(v: serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Object(_) => Value::from_object(StepResultProxy(v)),
+        _ => Value::from_serialize(&v),
+    }
+}
+
+/// Wraps a `serde_json::Value::Object` to provide cross-runtime
+/// `.result` accessor semantics.
+///
+/// `step.result.X` resolves to `step.X` when the underlying map does
+/// not have an explicit `result` key.  This matches the Python
+/// renderer's [`StepResultProxy`](https://github.com/noetl/noetl/blob/main/noetl/core/dsl/render.py)
+/// fall-through, so playbooks that work against the Python worker
+/// also work against the Rust worker.
+#[derive(Debug)]
+struct StepResultProxy(serde_json::Value);
+
+impl Object for StepResultProxy {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let key_str = key.as_str()?;
+        let serde_json::Value::Object(map) = &self.0 else {
+            return None;
+        };
+
+        // Explicit key wins (matches Python: real `result` key takes
+        // precedence over the fall-through alias).
+        if let Some(found) = map.get(key_str) {
+            return Some(json_to_proxied_value(found.clone()));
+        }
+
+        // Fall-through: `.result` aliases to self.  We wrap a fresh
+        // proxy around the same underlying value so further chained
+        // accesses (`step.result.foo`, `step.result.result.foo`) also
+        // resolve.
+        if key_str == "result" {
+            return Some(Value::from_object(StepResultProxy(self.0.clone())));
+        }
+
+        None
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        let serde_json::Value::Object(map) = &self.0 else {
+            return Enumerator::Empty;
+        };
+        let keys: Vec<Value> = map.keys().map(|k| Value::from(k.as_str())).collect();
+        Enumerator::Iter(Box::new(keys.into_iter()))
+    }
 }
 
 // Custom filters
@@ -456,6 +532,105 @@ mod tests {
             .render("{% for item in items %}{{ item }}{% endfor %}", &ctx)
             .unwrap();
         assert_eq!(result, "abc");
+    }
+
+    // ---------------------------------------------------------------
+    // `.result` accessor proxy — cross-runtime compatibility with the
+    // Python renderer's `StepResultProxy`.  Playbooks address prior-
+    // step outputs with `{{ step.result.<field> }}` regardless of
+    // whether the next step lands on the Python worker (whose
+    // `render_template` proxies `.result` to the step dict itself) or
+    // the Rust worker (this engine).  These tests pin the Rust-side
+    // proxy semantics.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_result_proxy_aliases_to_step_dict() {
+        // `{{ producer.result.reference.ref }}` resolves to
+        // `producer.reference.ref` when no explicit `result` key.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "producer".to_string(),
+            serde_json::json!({
+                "reference": {"ref": "noetl://execution/1/result/producer/abc"}
+            }),
+        );
+        let out = engine
+            .render("{{ producer.result.reference.ref }}", &ctx)
+            .unwrap();
+        assert_eq!(out, "noetl://execution/1/result/producer/abc");
+    }
+
+    #[test]
+    fn test_result_proxy_chained_at_depth() {
+        // Nested maps are proxied too.  `producer.data.result.rows[0]`
+        // works because the inner `data` map is wrapped recursively.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "producer".to_string(),
+            serde_json::json!({
+                "data": {"row_count": 6000, "first": "user_000001"}
+            }),
+        );
+        let out = engine
+            .render("{{ producer.result.data.result.first }}", &ctx)
+            .unwrap();
+        assert_eq!(out, "user_000001");
+    }
+
+    #[test]
+    fn test_result_proxy_explicit_key_wins() {
+        // Python convention: if the dict has a real `result` key, it
+        // takes precedence over the fall-through alias.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "fetch_http".to_string(),
+            serde_json::json!({
+                "result": "explicit",
+                "url": "u",
+                "elapsed": 1.23
+            }),
+        );
+        // `.result` returns the literal "explicit" string, not the
+        // dict alias.
+        let out = engine.render("{{ fetch_http.result }}", &ctx).unwrap();
+        assert_eq!(out, "explicit");
+    }
+
+    #[test]
+    fn test_result_proxy_direct_access_unchanged() {
+        // Plain dict access keeps working — `.result` is additive,
+        // not replacing.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "producer".to_string(),
+            serde_json::json!({
+                "reference": {"ref": "noetl://..."}
+            }),
+        );
+        let out = engine.render("{{ producer.reference.ref }}", &ctx).unwrap();
+        assert_eq!(out, "noetl://...");
+    }
+
+    #[test]
+    fn test_result_proxy_missing_key_undefined() {
+        // Looking up a missing key (other than `result`) returns
+        // undefined, same as the bare map.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "producer".to_string(),
+            serde_json::json!({"reference": {"ref": "x"}}),
+        );
+        // Use `default` filter so we can observe the undefined.
+        let out = engine
+            .render("{{ producer.nonexistent | default('missing') }}", &ctx)
+            .unwrap();
+        assert_eq!(out, "missing");
     }
 
     #[test]

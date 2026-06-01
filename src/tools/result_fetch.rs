@@ -144,22 +144,35 @@ impl ResultFetchTool {
     /// swapping port 8082 → 8083 (the convention the R-2.3 Phase A
     /// manifest + kind extraPortMappings ship).  Falls back to the
     /// raw server_url if there's no port to swap.
+    ///
+    /// Scheme is preserved from `server_url` — tonic's
+    /// `Endpoint::from_shared` (used downstream by the Flight client)
+    /// requires `http://` for plaintext h2c or `https://` for TLS;
+    /// the `grpc://` scheme some Flight clients accept is NOT valid
+    /// for tonic and surfaces as `Bad :scheme header` at request
+    /// time (HTTP/2's `:scheme` pseudo-header must be `http` or
+    /// `https`).
     fn derive_flight_endpoint(server_url: &str) -> String {
         // server_url is e.g. http://noetl.noetl.svc.cluster.local:8082
-        // → grpc://noetl.noetl.svc.cluster.local:8083
-        let trimmed = server_url
-            .strip_prefix("https://")
-            .or_else(|| server_url.strip_prefix("http://"))
-            .unwrap_or(server_url);
+        // → http://noetl.noetl.svc.cluster.local:8083
+        // (or https://...:8083 if the server URL is TLS-fronted).
+        let (scheme, trimmed) = if let Some(rest) = server_url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = server_url.strip_prefix("http://") {
+            ("http", rest)
+        } else {
+            // No scheme on the input — default to plaintext h2c.
+            // Same default the K8s manifest ships in kind.
+            ("http", server_url)
+        };
         // Replace the trailing :8082 with :8083 — the only port
-        // pattern we ship.  Anything else falls through to the
-        // raw URL with grpc:// rewritten.
+        // pattern we ship.  Anything else falls through unchanged.
         let rewritten = if let Some(stripped) = trimmed.strip_suffix(":8082") {
             format!("{stripped}:8083")
         } else {
             trimmed.to_string()
         };
-        format!("grpc://{rewritten}")
+        format!("{scheme}://{rewritten}")
     }
 
     /// HTTP fallback: GET /api/result/resolve?ref=<uri>.  The server
@@ -336,31 +349,46 @@ mod tests {
 
     #[test]
     fn derive_flight_endpoint_swaps_port_8082_to_8083() {
+        // http:// is preserved — tonic's Endpoint::from_shared
+        // requires http/https; `grpc://` triggers `Bad :scheme
+        // header` at request time.
         assert_eq!(
             ResultFetchTool::derive_flight_endpoint("http://noetl.noetl.svc.cluster.local:8082"),
-            "grpc://noetl.noetl.svc.cluster.local:8083",
+            "http://noetl.noetl.svc.cluster.local:8083",
         );
         assert_eq!(
             ResultFetchTool::derive_flight_endpoint("http://localhost:8082"),
-            "grpc://localhost:8083",
+            "http://localhost:8083",
         );
+        // TLS-fronted server URL keeps https:// for the Flight
+        // endpoint — same TLS chain on the gRPC port (Phase C2).
         assert_eq!(
             ResultFetchTool::derive_flight_endpoint("https://noetl.example.com:8082"),
-            "grpc://noetl.example.com:8083",
+            "https://noetl.example.com:8083",
         );
     }
 
     #[test]
     fn derive_flight_endpoint_passes_through_non_8082() {
-        // No port → falls through to grpc:// + host.
+        // No port → falls through with scheme preserved.
         assert_eq!(
             ResultFetchTool::derive_flight_endpoint("http://noetl.example.com"),
-            "grpc://noetl.example.com",
+            "http://noetl.example.com",
         );
         // Non-8082 port → kept as-is (caller's responsibility).
         assert_eq!(
             ResultFetchTool::derive_flight_endpoint("http://noetl.example.com:9000"),
-            "grpc://noetl.example.com:9000",
+            "http://noetl.example.com:9000",
+        );
+    }
+
+    #[test]
+    fn derive_flight_endpoint_defaults_to_http_when_scheme_missing() {
+        // Bare host:port input — assume plaintext h2c, same as
+        // the K8s manifest ships in kind.
+        assert_eq!(
+            ResultFetchTool::derive_flight_endpoint("noetl.example.com:8082"),
+            "http://noetl.example.com:8083",
         );
     }
 
