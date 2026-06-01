@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.10.0](https://github.com/noetl/tools/compare/v2.9.0...v2.10.0) (2026-06-01)
+
+### Features
+
+* **arrow_codec:** add try_encode_tabular_json for R-2.2 tabular outputs ([0655fc0](https://github.com/noetl/tools/commit/0655fc0acad7e3797ef4e410de7e0ea724975036)), closes [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [2.9.0] (2026-05-31)
 
 ### Versioning realignment (no behaviour change)
