@@ -93,6 +93,37 @@ pub struct ResultFetchConfig {
     /// kind extraPortMappings the R-2.3 Phase A PR shipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_endpoint: Option<String>,
+
+    /// R-2.3 Phase C2.3 — bearer token sent on every Flight gRPC
+    /// call.  Either a **NoETL keychain credential alias** (preferred,
+    /// per `agents/rules/execution-model.md`) or a literal token
+    /// string.  When the value matches a known credential alias on
+    /// the worker's `ExecutionContext` the resolved secret is used;
+    /// otherwise the literal is passed through.
+    ///
+    /// Required when the noetl-server is started with
+    /// `NOETL_FLIGHT_BEARER_TOKENS` set (Phase C2.3 server side,
+    /// noetl/noetl#647); without it the call returns
+    /// `FlightError::Server` with an `unauthenticated`-shaped
+    /// message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+
+    /// R-2.3 Phase C2.2/3 — filesystem path to a PEM-encoded CA
+    /// bundle the worker uses to validate the Flight server's TLS
+    /// certificate.  Required when the server is TLS-fronted with a
+    /// non-public CA (the typical in-cluster case where a private
+    /// CA signs the Flight cert) — without it, tonic falls back to
+    /// the default trust roots which usually don't include the
+    /// cluster CA.
+    ///
+    /// The path is on the **worker filesystem** (mounted via a
+    /// k8s Secret or ConfigMap); it is NOT a keychain alias since
+    /// the public cert is not a credential.  The HTTP fallback
+    /// uses reqwest's `rustls-tls` defaults; this knob only
+    /// affects the Flight leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_path: Option<String>,
 }
 
 /// Backend preference for the fetch.
@@ -213,6 +244,54 @@ impl ResultFetchTool {
         Ok(body)
     }
 
+    /// Resolve a `bearer_token` config value to the secret it
+    /// references on the execution context.  When the value matches
+    /// a keychain alias the resolved secret is returned; otherwise
+    /// the literal is passed through (with a debug log noting the
+    /// alias miss so the operator can spot misconfigured aliases).
+    fn resolve_bearer(value: &str, ctx: &ExecutionContext) -> String {
+        match ctx.get_secret(value) {
+            Some(token) => token.to_string(),
+            None => {
+                tracing::debug!(
+                    alias_or_literal = %value,
+                    "bearer_token didn't match a keychain alias; treating as literal token",
+                );
+                value.to_string()
+            }
+        }
+    }
+
+    /// Build a [`noetl_arrow_flight_client::FlightConfig`] from the
+    /// playbook config + execution context.  Returns `None` when the
+    /// caller doesn't need a non-default channel config (no TLS CA +
+    /// no bearer token) — `connect()` is fine in that case and
+    /// avoids the extra wiring.
+    fn build_flight_config(
+        cfg: &ResultFetchConfig,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<noetl_arrow_flight_client::FlightConfig>, FlightFetchError> {
+        use noetl_arrow_flight_client::{FlightAuth, FlightConfig, FlightTlsConfig};
+
+        let mut out: Option<FlightConfig> = None;
+
+        if let Some(ca_path) = &cfg.tls_ca_path {
+            let ca_pem = std::fs::read(ca_path).map_err(|e| {
+                FlightFetchError::Transport(format!("read TLS CA bundle from {ca_path}: {e}"))
+            })?;
+            let tls = FlightTlsConfig::new().ca_certificate(ca_pem);
+            out = Some(out.unwrap_or_default().tls(tls));
+        }
+
+        if let Some(bearer_value) = &cfg.bearer_token {
+            let token = Self::resolve_bearer(bearer_value, ctx);
+            let auth = FlightAuth::bearer(token);
+            out = Some(out.unwrap_or_default().auth(auth));
+        }
+
+        Ok(out)
+    }
+
     /// Flight path: connect + resolve_rows.  Returns the JSON-shaped
     /// row vec wrapped in the same `{data: {rows, columns}}` shape
     /// the HTTP fallback returns, so the playbook step's output
@@ -227,11 +306,16 @@ impl ResultFetchTool {
             .clone()
             .unwrap_or_else(|| Self::derive_flight_endpoint(&ctx.server_url));
 
-        let resolver = noetl_arrow_flight_client::FlightResolver::connect(&endpoint)
-            .await
-            .map_err(|e| {
-                FlightFetchError::Transport(format!("connect to Flight endpoint {endpoint}: {e}"))
-            })?;
+        let flight_config = Self::build_flight_config(cfg, ctx)?;
+        let resolver = match flight_config {
+            Some(config) => {
+                noetl_arrow_flight_client::FlightResolver::connect_with(&endpoint, config).await
+            }
+            None => noetl_arrow_flight_client::FlightResolver::connect(&endpoint).await,
+        }
+        .map_err(|e| {
+            FlightFetchError::Transport(format!("connect to Flight endpoint {endpoint}: {e}"))
+        })?;
 
         match resolver.resolve_rows(&cfg.r#ref).await {
             Ok(rows) => {
@@ -444,5 +528,144 @@ mod tests {
         // future expansion can add a wiremock-style fixture.
         let tool = ResultFetchTool::new();
         let _ = tool.http_client; // touch the field so it isn't flagged unused
+    }
+
+    // -----------------------------------------------------------------
+    // R-2.3 Phase C2.3 — bearer-token + TLS-CA config wiring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn config_round_trips_bearer_token() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "bearer_token": "noetl_flight_token",
+        }))
+        .unwrap();
+        assert_eq!(cfg.bearer_token.as_deref(), Some("noetl_flight_token"));
+        assert!(cfg.tls_ca_path.is_none());
+    }
+
+    #[test]
+    fn config_round_trips_tls_ca_path() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "tls_ca_path": "/etc/noetl/flight-ca.pem",
+        }))
+        .unwrap();
+        assert_eq!(cfg.tls_ca_path.as_deref(), Some("/etc/noetl/flight-ca.pem"),);
+        assert!(cfg.bearer_token.is_none());
+    }
+
+    #[test]
+    fn config_round_trips_full_auth_shape() {
+        // Full Phase C2.3 + C2.2 surface in one config — TLS CA +
+        // bearer alias + explicit Flight endpoint.
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "prefer": "flight",
+            "flight_endpoint": "https://noetl.example.com:8083",
+            "bearer_token": "noetl_flight_token",
+            "tls_ca_path": "/etc/noetl/flight-ca.pem",
+        }))
+        .unwrap();
+        assert_eq!(cfg.prefer, BackendPreference::Flight);
+        assert_eq!(cfg.bearer_token.as_deref(), Some("noetl_flight_token"));
+        assert_eq!(cfg.tls_ca_path.as_deref(), Some("/etc/noetl/flight-ca.pem"));
+    }
+
+    #[test]
+    fn resolve_bearer_finds_keychain_alias() {
+        // When the playbook config value matches a known keychain
+        // alias on the ExecutionContext, the resolved secret is
+        // used instead of the literal string.
+        let mut ctx = ExecutionContext::new(1, "step", "http://noetl");
+        ctx.set_secret("noetl_flight_token", "sk-ant-real-token-bytes");
+        let resolved = ResultFetchTool::resolve_bearer("noetl_flight_token", &ctx);
+        assert_eq!(resolved, "sk-ant-real-token-bytes");
+    }
+
+    #[test]
+    fn resolve_bearer_falls_through_for_unknown_alias() {
+        // Per execution-model.md the playbook author SHOULD use an
+        // alias, but literal tokens are tolerated for back-compat
+        // (matches the postgres-tool credential pattern).  An
+        // unknown alias is passed through as a literal.
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let resolved = ResultFetchTool::resolve_bearer("sk-literal-not-an-alias", &ctx);
+        assert_eq!(resolved, "sk-literal-not-an-alias");
+    }
+
+    #[test]
+    fn build_flight_config_none_when_no_auth_or_tls() {
+        // No bearer + no CA → caller should use plaintext connect()
+        // (returns None so we skip the extra connect_with wiring).
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let result = ResultFetchTool::build_flight_config(&cfg, &ctx).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_flight_config_some_for_bearer_only() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "bearer_token": "tok-literal",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let result = ResultFetchTool::build_flight_config(&cfg, &ctx).unwrap();
+        assert!(result.is_some());
+        // We can't introspect the FlightConfig's auth field from
+        // outside the crate, but the integration test in
+        // noetl-arrow-flight-client (connect_with bearer) already
+        // exercises the wire path; this test just confirms we
+        // produced *some* config.
+    }
+
+    #[test]
+    fn build_flight_config_some_for_tls_only() {
+        // Use a small fake CA bundle written to a tempdir.  We
+        // don't actually negotiate TLS in this unit test — we just
+        // confirm the config is constructed without erroring.
+        let dir =
+            std::env::temp_dir().join(format!("noetl-tools-tls-test-{}", std::process::id(),));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----",
+        )
+        .unwrap();
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "tls_ca_path": ca_path.to_str().unwrap(),
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let result = ResultFetchTool::build_flight_config(&cfg, &ctx).unwrap();
+        assert!(result.is_some());
+        // Cleanup; ignore errors on shutdown.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_flight_config_error_when_ca_path_unreadable() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "tls_ca_path": "/does/not/exist.pem",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let err = ResultFetchTool::build_flight_config(&cfg, &ctx).expect_err("unreadable");
+        match err {
+            FlightFetchError::Transport(msg) => {
+                assert!(msg.contains("/does/not/exist.pem"), "got: {msg}");
+                assert!(msg.contains("TLS CA bundle"), "got: {msg}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
     }
 }
