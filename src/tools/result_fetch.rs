@@ -124,6 +124,27 @@ pub struct ResultFetchConfig {
     /// affects the Flight leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_path: Option<String>,
+
+    /// R-2.3 Phase C2.4 — filesystem path to the **worker's**
+    /// PEM-encoded client certificate.  Required when the noetl-server
+    /// is started with `NOETL_FLIGHT_CLIENT_CA` set (mTLS,
+    /// noetl/noetl#648).  Must be set together with `client_key_path`.
+    ///
+    /// Lives on the worker filesystem; mounted via a k8s Secret in
+    /// the typical deployment.  The cert + key together identify the
+    /// worker to the server — business-logic credential per
+    /// `agents/rules/execution-model.md`, but resolved by filesystem
+    /// path rather than keychain alias because the consumer is the
+    /// tonic TLS handshake (not the NoETL secret store API).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert_path: Option<String>,
+
+    /// R-2.3 Phase C2.4 — companion to `client_cert_path`.  Filesystem
+    /// path to the **worker's** PEM-encoded private key.  Must be set
+    /// together with `client_cert_path`; partial pair raises a
+    /// configuration error at `build_flight_config` time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key_path: Option<String>,
 }
 
 /// Backend preference for the fetch.
@@ -265,21 +286,51 @@ impl ResultFetchTool {
     /// Build a [`noetl_arrow_flight_client::FlightConfig`] from the
     /// playbook config + execution context.  Returns `None` when the
     /// caller doesn't need a non-default channel config (no TLS CA +
-    /// no bearer token) — `connect()` is fine in that case and
-    /// avoids the extra wiring.
+    /// no client identity + no bearer token) — `connect()` is fine
+    /// in that case and avoids the extra wiring.
     fn build_flight_config(
         cfg: &ResultFetchConfig,
         ctx: &ExecutionContext,
     ) -> Result<Option<noetl_arrow_flight_client::FlightConfig>, FlightFetchError> {
         use noetl_arrow_flight_client::{FlightAuth, FlightConfig, FlightTlsConfig};
 
-        let mut out: Option<FlightConfig> = None;
+        // Phase C2.4 — partial client-identity pair is a config bug.
+        // Fail fast so a misconfigured playbook doesn't silently fall
+        // back to anonymous TLS.
+        match (&cfg.client_cert_path, &cfg.client_key_path) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(FlightFetchError::Transport(format!(
+                    "client_cert_path and client_key_path must both be set or both be None; \
+                     got cert={cert:?}, key={key:?}",
+                    cert = cfg.client_cert_path,
+                    key = cfg.client_key_path,
+                )));
+            }
+            _ => {}
+        }
+
+        let mut tls: Option<FlightTlsConfig> = None;
 
         if let Some(ca_path) = &cfg.tls_ca_path {
             let ca_pem = std::fs::read(ca_path).map_err(|e| {
                 FlightFetchError::Transport(format!("read TLS CA bundle from {ca_path}: {e}"))
             })?;
-            let tls = FlightTlsConfig::new().ca_certificate(ca_pem);
+            tls = Some(tls.unwrap_or_default().ca_certificate(ca_pem));
+        }
+
+        if let (Some(cert_path), Some(key_path)) = (&cfg.client_cert_path, &cfg.client_key_path) {
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                FlightFetchError::Transport(format!("read client cert from {cert_path}: {e}"))
+            })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                FlightFetchError::Transport(format!("read client key from {key_path}: {e}"))
+            })?;
+            tls = Some(tls.unwrap_or_default().identity(cert_pem, key_pem));
+        }
+
+        let mut out: Option<FlightConfig> = None;
+
+        if let Some(tls) = tls {
             out = Some(out.unwrap_or_default().tls(tls));
         }
 
@@ -571,6 +622,148 @@ mod tests {
         assert_eq!(cfg.prefer, BackendPreference::Flight);
         assert_eq!(cfg.bearer_token.as_deref(), Some("noetl_flight_token"));
         assert_eq!(cfg.tls_ca_path.as_deref(), Some("/etc/noetl/flight-ca.pem"));
+    }
+
+    #[test]
+    fn config_round_trips_client_identity_paths() {
+        // Phase C2.4 — `client_cert_path` + `client_key_path` for
+        // mTLS.  Filesystem paths on the worker pod, mounted via
+        // k8s Secret in the typical deployment.
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "client_cert_path": "/etc/noetl/worker-client.crt",
+            "client_key_path": "/etc/noetl/worker-client.key",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_cert_path.as_deref(),
+            Some("/etc/noetl/worker-client.crt"),
+        );
+        assert_eq!(
+            cfg.client_key_path.as_deref(),
+            Some("/etc/noetl/worker-client.key"),
+        );
+    }
+
+    #[test]
+    fn config_round_trips_full_mtls_shape() {
+        // The full externally-exposed shape: TLS CA (server trust) +
+        // client cert + key (mTLS identity) + bearer (app auth).
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "prefer": "flight",
+            "flight_endpoint": "https://noetl.example.com:8083",
+            "bearer_token": "noetl_flight_token",
+            "tls_ca_path": "/etc/noetl/flight-ca.pem",
+            "client_cert_path": "/etc/noetl/worker-client.crt",
+            "client_key_path": "/etc/noetl/worker-client.key",
+        }))
+        .unwrap();
+        assert_eq!(cfg.bearer_token.as_deref(), Some("noetl_flight_token"));
+        assert_eq!(cfg.tls_ca_path.as_deref(), Some("/etc/noetl/flight-ca.pem"));
+        assert_eq!(
+            cfg.client_cert_path.as_deref(),
+            Some("/etc/noetl/worker-client.crt"),
+        );
+        assert_eq!(
+            cfg.client_key_path.as_deref(),
+            Some("/etc/noetl/worker-client.key"),
+        );
+    }
+
+    #[test]
+    fn build_flight_config_rejects_partial_client_identity_cert_without_key() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "client_cert_path": "/etc/noetl/worker-client.crt",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let err = ResultFetchTool::build_flight_config(&cfg, &ctx)
+            .expect_err("expected partial-pair error");
+        match err {
+            FlightFetchError::Transport(msg) => {
+                assert!(
+                    msg.contains("client_cert_path and client_key_path must both be set"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_flight_config_rejects_partial_client_identity_key_without_cert() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "client_key_path": "/etc/noetl/worker-client.key",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let err = ResultFetchTool::build_flight_config(&cfg, &ctx)
+            .expect_err("expected partial-pair error");
+        match err {
+            FlightFetchError::Transport(msg) => {
+                assert!(
+                    msg.contains("client_cert_path and client_key_path must both be set"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_flight_config_some_for_client_identity_pair() {
+        // Both paths set + readable → returns Some(config) with the
+        // identity threaded into FlightTlsConfig.  Uses an in-tempdir
+        // dummy PEM since the test doesn't actually negotiate TLS.
+        let dir = std::env::temp_dir().join(format!(
+            "noetl-tools-mtls-test-{}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("client.crt");
+        let key_path = dir.join("client.key");
+        std::fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----",
+        )
+        .unwrap();
+        std::fs::write(
+            &key_path,
+            "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+        )
+        .unwrap();
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "client_cert_path": cert_path.to_str().unwrap(),
+            "client_key_path": key_path.to_str().unwrap(),
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let result = ResultFetchTool::build_flight_config(&cfg, &ctx).unwrap();
+        assert!(result.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_flight_config_error_when_client_cert_unreadable() {
+        let cfg: ResultFetchConfig = serde_json::from_value(serde_json::json!({
+            "ref": "noetl://execution/1/result/x/y",
+            "client_cert_path": "/does/not/exist/client.crt",
+            "client_key_path": "/does/not/exist/client.key",
+        }))
+        .unwrap();
+        let ctx = ExecutionContext::new(1, "step", "http://noetl");
+        let err = ResultFetchTool::build_flight_config(&cfg, &ctx).expect_err("unreadable");
+        match err {
+            FlightFetchError::Transport(msg) => {
+                assert!(msg.contains("/does/not/exist"), "got: {msg}");
+                assert!(msg.contains("client"), "got: {msg}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
     }
 
     #[test]

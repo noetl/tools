@@ -2263,9 +2263,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-arrow-flight-client"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "569459e83be25e065285d6b0df9734cda53183acdc248715dcf25e1e8bb97603"
+checksum = "c908b727308473022b69fe5bc6c060fe8ef400253f24f63710d2b696ea108f17"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",

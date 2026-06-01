@@ -79,7 +79,7 @@ arrow-flight = "53"
 # `agents/rules/execution-model.md`).  Falls back to HTTP
 # `/api/result/resolve` for non-tabular refs.
 #
-# `0.4` ships:
+# `0.5` ships:
 # - `FlightTlsConfig` (Phase C2.2) for TLS-fronted Flight endpoints
 #   — `result_fetch`'s `tls_ca_path` field threads the on-disk CA
 #   bundle through.
@@ -87,7 +87,10 @@ arrow-flight = "53"
 #   bearer-token auth — `result_fetch`'s `bearer_token` field
 #   resolves either as a NoETL keychain credential alias (preferred
 #   per `agents/rules/execution-model.md`) or a literal token.
-noetl-arrow-flight-client = "0.4"
+# - `FlightTlsConfig::identity` (Phase C2.4) for mTLS — `result_fetch`'s
+#   `client_cert_path` + `client_key_path` fields point at the
+#   worker-mounted PEM pair (typical: k8s Secret).
+noetl-arrow-flight-client = "0.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
