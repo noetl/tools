@@ -14,6 +14,7 @@
 mod duckdb;
 mod ducklake;
 mod http;
+mod nats;
 mod noop;
 mod playbook;
 mod postgres;
@@ -29,6 +30,7 @@ mod transfer;
 pub use self::duckdb::DuckdbTool;
 pub use self::ducklake::DucklakeTool;
 pub use self::http::HttpTool;
+pub use self::nats::NatsTool;
 pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
 pub use self::postgres::PostgresTool;
@@ -62,6 +64,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(SecretsTool::new());
     registry.register(SecretManagerTool::new());
     registry.register(ResultFetchTool::new());
+    registry.register(NatsTool::new());
 
     registry
 }
