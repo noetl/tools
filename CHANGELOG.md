@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.16.0](https://github.com/noetl/tools/compare/v2.15.0...v2.16.0) (2026-06-02)
+
+### Features
+
+* **mcp:** add McpTool — MCP (Model Context Protocol) JSON-RPC bridge ([3f2e8fc](https://github.com/noetl/tools/commit/3f2e8fc79e26a8c24fc8dd656f825e270e970fc5)), closes [noetl/ai-meta#39](https://github.com/noetl/ai-meta/issues/39)
+
 ## [2.15.0](https://github.com/noetl/tools/compare/v2.14.0...v2.15.0) (2026-06-02)
 
 ### Features
