@@ -10,10 +10,12 @@
 //! - `snowflake` - Execute Snowflake SQL queries
 //! - `transfer` - Transfer data between sources
 //! - `script` - Execute scripts as Kubernetes jobs
+//! - `mcp` - MCP (Model Context Protocol) JSON-RPC bridge
 
 mod duckdb;
 mod ducklake;
 mod http;
+mod mcp;
 mod nats;
 mod noop;
 mod playbook;
@@ -30,6 +32,7 @@ mod transfer;
 pub use self::duckdb::DuckdbTool;
 pub use self::ducklake::DucklakeTool;
 pub use self::http::HttpTool;
+pub use self::mcp::McpTool;
 pub use self::nats::NatsTool;
 pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
@@ -65,6 +68,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(SecretManagerTool::new());
     registry.register(ResultFetchTool::new());
     registry.register(NatsTool::new());
+    registry.register(McpTool::new());
 
     registry
 }
