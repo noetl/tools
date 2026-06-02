@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.15.0](https://github.com/noetl/tools/compare/v2.14.0...v2.15.0) (2026-06-02)
+
+### Features
+
+* **nats:** add NatsTool — KV / Object Store / JetStream-publish tool kind ([b40dcca](https://github.com/noetl/tools/commit/b40dcca31d32605d09ae6ac26532281621520075)), closes [noetl/ai-meta#38](https://github.com/noetl/ai-meta/issues/38) [noetl/ai-meta#38](https://github.com/noetl/ai-meta/issues/38)
+
 ## [2.14.0](https://github.com/noetl/tools/compare/v2.13.0...v2.14.0) (2026-06-01)
 
 ### Features
