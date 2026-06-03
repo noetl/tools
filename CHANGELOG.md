@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.17.0](https://github.com/noetl/tools/compare/v2.16.0...v2.17.0) (2026-06-03)
+
+### Features
+
+* **nats:** add bounded js_consume operation ([7247417](https://github.com/noetl/tools/commit/7247417e47a178e3e3fa56b4a740becabb3a2166)), closes [noetl/ai-meta#52](https://github.com/noetl/ai-meta/issues/52) [noetl/ai-meta#46](https://github.com/noetl/ai-meta/issues/46) [noetl/ai-meta#52](https://github.com/noetl/ai-meta/issues/52)
+
 ## [2.16.0](https://github.com/noetl/tools/compare/v2.15.0...v2.16.0) (2026-06-02)
 
 ### Features
