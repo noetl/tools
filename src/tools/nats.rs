@@ -3,11 +3,21 @@
 //! Provides playbook-facing operations for:
 //! - Key-Value store: `kv_get`, `kv_put` (with optional TTL), `kv_delete`, `kv_keys`, `kv_purge`
 //! - Object Store:   `object_get`, `object_put`, `object_delete`, `object_list`, `object_info`
-//! - JetStream:      `js_publish`, `js_get_msg`, `js_stream_info`
+//! - JetStream:      `js_publish`, `js_consume`, `js_get_msg`, `js_stream_info`
 //!
-//! **No subscriptions / pull operations** — those would hold a worker slot while
-//! waiting for an external event, which violates the NoETL execution model
+//! ### Bounded `js_consume`, not subscriptions
+//!
+//! The tool deliberately does NOT expose long-lived subscriptions or push
+//! consumers — those would hold a worker slot indefinitely while waiting
+//! for an external event, which violates the NoETL execution model
 //! (`agents/rules/execution-model.md`).
+//!
+//! `js_consume` is a *bounded* pull-consumer fetch: it asks the named
+//! durable consumer for up to `batch` messages, waits at most
+//! `timeout_ms` (capped at 5000ms by the tool), and returns immediately
+//! with whatever it got — empty array if the stream is idle.  Callers
+//! drive the cadence themselves (e.g. system playbooks scheduled by the
+//! orchestrator).  This keeps the worker-slot contract intact.
 //!
 //! ## Playbook config shape
 //!
@@ -138,7 +148,42 @@ pub struct NatsConfig {
     /// Fetch the last message in the stream (`js_get_msg`).
     #[serde(default)]
     pub last: bool,
+
+    // --- js_consume fields ---
+
+    /// Durable pull-consumer name (`js_consume`).  The consumer must
+    /// already exist on the stream — `js_consume` does not create or
+    /// alter consumer configurations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<String>,
+
+    /// Maximum messages to fetch in a single call (`js_consume`).
+    /// Defaults to 100; capped at 1000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u32>,
+
+    /// Maximum time to wait for `batch` messages (`js_consume`).
+    /// Defaults to 1000ms; capped at 5000ms to honor the
+    /// execution-model "don't hold a worker slot" contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+
+    /// Auto-ack fetched messages before returning (`js_consume`).
+    /// Defaults to true.  When false, messages stay pending on the
+    /// consumer and will be redelivered after the ack-wait timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack: Option<bool>,
 }
+
+/// Maximum value enforced for `js_consume.batch`.
+pub const JS_CONSUME_BATCH_MAX: u32 = 1000;
+/// Default value for `js_consume.batch`.
+pub const JS_CONSUME_BATCH_DEFAULT: u32 = 100;
+/// Maximum value enforced for `js_consume.timeout_ms` — honors the
+/// execution-model "don't hold a worker slot waiting" rule.
+pub const JS_CONSUME_TIMEOUT_MAX_MS: u64 = 5_000;
+/// Default value for `js_consume.timeout_ms`.
+pub const JS_CONSUME_TIMEOUT_DEFAULT_MS: u64 = 1_000;
 
 fn default_encoding() -> String {
     "utf-8".to_string()
@@ -342,12 +387,13 @@ impl Tool for NatsTool {
                 "object_list" => object_list(&js, &nats_cfg).await,
                 "object_info" => object_info(&js, &nats_cfg).await,
                 "js_publish" => js_publish(&js, &nats_cfg).await,
+                "js_consume" => js_consume(&js, &nats_cfg).await,
                 "js_get_msg" => js_get_msg(&js, &nats_cfg).await,
                 "js_stream_info" => js_stream_info(&js, &nats_cfg).await,
                 unknown => Err(ToolError::Configuration(format!(
                     "Unknown NATS operation '{}'. Valid: kv_get, kv_put, kv_delete, kv_keys, \
                      kv_purge, object_get, object_put, object_delete, object_list, object_info, \
-                     js_publish, js_get_msg, js_stream_info",
+                     js_publish, js_consume, js_get_msg, js_stream_info",
                     unknown
                 ))),
             }
@@ -707,6 +753,130 @@ async fn js_publish(
     }))
 }
 
+/// Bounded pull-consumer fetch.
+///
+/// Honors the NoETL execution-model rule that worker slots must
+/// not be held indefinitely: `timeout_ms` is hard-capped at
+/// [`JS_CONSUME_TIMEOUT_MAX_MS`] (5s) and `batch` at
+/// [`JS_CONSUME_BATCH_MAX`] (1000).  The consumer named in
+/// `cfg.consumer` must already exist on the stream — `js_consume`
+/// does not create or modify consumer configurations.
+///
+/// Returns immediately when the timeout elapses, even if no
+/// messages were received.  Empty `messages` array is a normal
+/// successful result, not an error.
+async fn js_consume(
+    js: &jetstream::Context,
+    cfg: &NatsConfig,
+) -> Result<serde_json::Value, ToolError> {
+    let stream_name = cfg
+        .stream
+        .as_deref()
+        .ok_or_else(|| ToolError::Configuration("js_consume requires 'stream'".into()))?;
+    let consumer_name = cfg
+        .consumer
+        .as_deref()
+        .ok_or_else(|| ToolError::Configuration("js_consume requires 'consumer'".into()))?;
+
+    let batch = cfg
+        .batch
+        .unwrap_or(JS_CONSUME_BATCH_DEFAULT)
+        .min(JS_CONSUME_BATCH_MAX)
+        .max(1);
+    let timeout_ms = cfg
+        .timeout_ms
+        .unwrap_or(JS_CONSUME_TIMEOUT_DEFAULT_MS)
+        .min(JS_CONSUME_TIMEOUT_MAX_MS);
+    let ack = cfg.ack.unwrap_or(true);
+
+    let stream = js.get_stream(stream_name).await.map_err(|e| {
+        ToolError::ExecutionFailed(format!(
+            "js_consume: stream '{}' not found: {}",
+            stream_name, e
+        ))
+    })?;
+
+    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
+        .get_consumer(consumer_name)
+        .await
+        .map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "js_consume: consumer '{}' on stream '{}' not found: {}",
+                consumer_name, stream_name, e
+            ))
+        })?;
+
+    // `fetch` returns immediately when either `max_messages` is hit
+    // OR `expires` elapses — whichever comes first.  This is the
+    // bounded behavior the docstring promises.
+    let mut messages = consumer
+        .fetch()
+        .max_messages(batch as usize)
+        .expires(std::time::Duration::from_millis(timeout_ms))
+        .messages()
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("js_consume fetch failed: {}", e)))?;
+
+    let mut out_messages: Vec<serde_json::Value> = Vec::with_capacity(batch as usize);
+    while let Some(message_result) = messages.next().await {
+        let message = message_result.map_err(|e| {
+            ToolError::ExecutionFailed(format!("js_consume message error: {}", e))
+        })?;
+
+        let payload_bytes = &message.payload;
+        let payload_str = std::str::from_utf8(payload_bytes).unwrap_or("");
+        let data: serde_json::Value = serde_json::from_str(payload_str)
+            .unwrap_or_else(|_| serde_json::Value::String(payload_str.to_string()));
+
+        let info = message.info().map_err(|e| {
+            ToolError::ExecutionFailed(format!("js_consume message info failed: {}", e))
+        })?;
+
+        let mut headers_json = serde_json::Map::new();
+        if let Some(hdrs) = &message.headers {
+            for (k, v) in hdrs.iter() {
+                let values: Vec<serde_json::Value> = v
+                    .iter()
+                    .map(|val| serde_json::Value::String(val.to_string()))
+                    .collect();
+                headers_json.insert(
+                    k.to_string(),
+                    if values.len() == 1 {
+                        values.into_iter().next().unwrap()
+                    } else {
+                        serde_json::Value::Array(values)
+                    },
+                );
+            }
+        }
+
+        out_messages.push(serde_json::json!({
+            "subject": message.subject.to_string(),
+            "stream_seq": info.stream_sequence,
+            "consumer_seq": info.consumer_sequence,
+            "delivered": info.delivered,
+            "pending": info.pending,
+            "data": data,
+            "headers": serde_json::Value::Object(headers_json),
+        }));
+
+        if ack {
+            message.ack().await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("js_consume ack failed: {}", e))
+            })?;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "success",
+        "stream": stream_name,
+        "consumer": consumer_name,
+        "count": out_messages.len(),
+        "messages": out_messages,
+        "acked": ack,
+    }))
+}
+
 async fn js_get_msg(
     js: &jetstream::Context,
     cfg: &NatsConfig,
@@ -944,6 +1114,69 @@ mod tests {
         assert!(cfg.last);
     }
 
+    // --- js_consume config ---
+
+    #[test]
+    fn test_nats_config_js_consume_minimal() {
+        let json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "operation": "js_consume",
+            "stream": "NOETL_EVENTS",
+            "consumer": "noetl_projector",
+        });
+        let cfg: NatsConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.operation, "js_consume");
+        assert_eq!(cfg.stream.as_deref(), Some("NOETL_EVENTS"));
+        assert_eq!(cfg.consumer.as_deref(), Some("noetl_projector"));
+        assert!(cfg.batch.is_none());
+        assert!(cfg.timeout_ms.is_none());
+        assert!(cfg.ack.is_none());
+    }
+
+    #[test]
+    fn test_nats_config_js_consume_all_fields() {
+        let json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "operation": "js_consume",
+            "stream": "NOETL_EVENTS",
+            "consumer": "noetl_projector",
+            "batch": 250,
+            "timeout_ms": 2000,
+            "ack": false,
+        });
+        let cfg: NatsConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.batch, Some(250));
+        assert_eq!(cfg.timeout_ms, Some(2000));
+        assert_eq!(cfg.ack, Some(false));
+    }
+
+    #[test]
+    fn js_consume_batch_capping_logic() {
+        // Mirrors the inline `min(MAX).max(1)` shape in js_consume.
+        let cap = |b: u32| b.min(JS_CONSUME_BATCH_MAX).max(1);
+        assert_eq!(cap(50), 50);
+        assert_eq!(cap(0), 1);
+        assert_eq!(cap(99_999), JS_CONSUME_BATCH_MAX);
+    }
+
+    #[test]
+    fn js_consume_timeout_capping_logic() {
+        // Mirrors `.min(MAX)` in js_consume so we never wait past
+        // the execution-model contract.
+        let cap = |t: u64| t.min(JS_CONSUME_TIMEOUT_MAX_MS);
+        assert_eq!(cap(500), 500);
+        assert_eq!(cap(JS_CONSUME_TIMEOUT_MAX_MS), JS_CONSUME_TIMEOUT_MAX_MS);
+        assert_eq!(cap(60_000), JS_CONSUME_TIMEOUT_MAX_MS);
+    }
+
+    #[test]
+    fn js_consume_defaults_are_under_caps() {
+        // Sanity: defaults are within the enforced caps so the
+        // bounded-by-default contract holds.
+        assert!(JS_CONSUME_BATCH_DEFAULT <= JS_CONSUME_BATCH_MAX);
+        assert!(JS_CONSUME_TIMEOUT_DEFAULT_MS <= JS_CONSUME_TIMEOUT_MAX_MS);
+    }
+
     // --- Auth resolution ---
 
     #[test]
@@ -971,6 +1204,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let params = tool.resolve_connection(&cfg, &ctx).unwrap();
         assert_eq!(params.url, "nats://localhost:4222");
@@ -1003,6 +1240,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let result = tool.resolve_connection(&cfg, &ctx);
         assert!(matches!(result, Err(ToolError::Configuration(_))));
@@ -1037,6 +1278,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let params = tool.resolve_connection(&cfg, &ctx).unwrap();
         assert_eq!(params.url, "nats://secure:4222");
@@ -1069,6 +1314,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let result = tool.resolve_connection(&cfg, &ctx);
         assert!(matches!(result, Err(ToolError::Auth(_))));
@@ -1133,6 +1382,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let bytes = encode_object_data(&cfg).unwrap();
         assert_eq!(bytes, b"hello world");
@@ -1163,6 +1416,10 @@ mod tests {
             headers: None,
             seq: None,
             last: false,
+            consumer: None,
+            batch: None,
+            timeout_ms: None,
+            ack: None,
         };
         let bytes = encode_object_data(&cfg).unwrap();
         assert_eq!(bytes, raw);
