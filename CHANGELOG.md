@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.3](https://github.com/noetl/tools/compare/v2.18.2...v2.18.3) (2026-06-05)
+
+### Bug Fixes
+
+* **postgres,duckdb:** support canonical v10 SQL shapes ([40be79e](https://github.com/noetl/tools/commit/40be79e85ae3db16cd1306b5e2fe04337c51dc25)), closes [noetl/tools#23](https://github.com/noetl/tools/issues/23) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.18.2](https://github.com/noetl/tools/compare/v2.18.1...v2.18.2) (2026-06-05)
 
 ### Bug Fixes
