@@ -18,7 +18,9 @@ use crate::template::TemplateEngine;
 /// PostgreSQL tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
-    /// SQL query to execute.
+    /// SQL to execute. Canonical v10 playbooks use `command:`; `query:`
+    /// is accepted as an alias for the same field so both shapes parse.
+    #[serde(alias = "command")]
     pub query: String,
 
     /// Query parameters.
@@ -60,6 +62,43 @@ pub struct PostgresConfig {
 
 fn default_as_objects() -> bool {
     true
+}
+
+/// Split a SQL string into individual statements on top-level semicolons,
+/// ignoring semicolons inside single-quoted string literals (and the `''`
+/// escape sequence). Trailing empty fragments are dropped. Used to support
+/// canonical v10 multi-statement `command:` blocks on tools whose normal
+/// execution path only accepts a single prepared statement.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // `''` inside a string literal is an escaped quote, not a close.
+                if in_single && chars.peek() == Some(&'\'') {
+                    current.push(c);
+                    current.push(chars.next().unwrap());
+                    continue;
+                }
+                in_single = !in_single;
+                current.push(c);
+            }
+            ';' if !in_single => {
+                if !current.trim().is_empty() {
+                    statements.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        statements.push(current.trim().to_string());
+    }
+    statements
 }
 
 /// PostgreSQL query execution tool.
@@ -175,6 +214,32 @@ impl PostgresTool {
             .iter()
             .map(|p| p.as_ref() as &(dyn ToSql + Sync))
             .collect();
+
+        // Multi-statement support (canonical v10: `CREATE …; INSERT …; SELECT …`
+        // in a single `command:`). The extended protocol used by query()/execute()
+        // rejects multiple statements ("cannot insert multiple commands into a
+        // prepared statement"), so run every statement except the final one via
+        // the simple protocol (batch_execute) and let the existing single-statement
+        // path handle the last one (which may be a SELECT that returns rows).
+        // Bound parameters can't ride the simple protocol, so this only fires when
+        // there are none — multi-statement fixtures inline their values.
+        let statements = if params.is_empty() {
+            split_sql_statements(query)
+        } else {
+            vec![query.to_string()]
+        };
+        let effective_query: String = if statements.len() > 1 {
+            let (last, leading) = statements.split_last().unwrap();
+            let leading_sql = format!("{};", leading.join(";\n"));
+            client
+                .batch_execute(&leading_sql)
+                .await
+                .map_err(|e| ToolError::Database(format_pg_error("Batch execute failed", &e)))?;
+            last.clone()
+        } else {
+            query.to_string()
+        };
+        let query = effective_query.as_str();
 
         // Check if it's a SELECT query
         let is_select = query.trim().to_uppercase().starts_with("SELECT")
@@ -411,6 +476,35 @@ mod tests {
         assert_eq!(config.query, "SELECT * FROM users WHERE id = $1");
         assert_eq!(config.params.len(), 1);
         assert!(config.connection_string.is_some());
+    }
+
+    #[test]
+    fn test_postgres_config_command_alias() {
+        // Canonical v10 postgres steps use `command:` instead of `query:`.
+        // The serde alias must accept it and map it to the same field.
+        let json = serde_json::json!({
+            "command": "DROP TABLE IF EXISTS t; CREATE TABLE t (id INT);"
+        });
+        let config: PostgresConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.query,
+            "DROP TABLE IF EXISTS t; CREATE TABLE t (id INT);"
+        );
+    }
+
+    #[test]
+    fn test_split_sql_statements() {
+        assert_eq!(split_sql_statements("SELECT 1").len(), 1);
+        assert_eq!(split_sql_statements("SELECT 1;").len(), 1);
+        let s = split_sql_statements(
+            "DROP TABLE IF EXISTS t; CREATE TABLE t (id INT); INSERT INTO t VALUES (1);",
+        );
+        assert_eq!(s.len(), 3);
+        assert!(s[0].starts_with("DROP"));
+        // Semicolons inside single-quoted literals stay put.
+        let s = split_sql_statements("INSERT INTO t VALUES ('a;b'); SELECT 1");
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("'a;b'"));
     }
 
     #[test]

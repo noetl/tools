@@ -35,6 +35,43 @@ fn default_as_objects() -> bool {
     true
 }
 
+/// Split a SQL string into individual statements on top-level semicolons,
+/// ignoring semicolons inside single-quoted string literals (and the `''`
+/// escape sequence). Trailing empty fragments are dropped. Used to support
+/// canonical v10 multi-statement `query:` / `command:` blocks, which duckdb's
+/// single-statement `prepare()` would otherwise reject.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // `''` inside a string literal is an escaped quote, not a close.
+                if in_single && chars.peek() == Some(&'\'') {
+                    current.push(c);
+                    current.push(chars.next().unwrap());
+                    continue;
+                }
+                in_single = !in_single;
+                current.push(c);
+            }
+            ';' if !in_single => {
+                if !current.trim().is_empty() {
+                    statements.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        statements.push(current.trim().to_string());
+    }
+    statements
+}
+
 /// DuckDB query execution tool.
 pub struct DuckdbTool {
     /// Default connection for in-memory database.
@@ -89,6 +126,30 @@ impl DuckdbTool {
         // Convert params to duckdb types
         let duckdb_params: Vec<Box<dyn duckdb::ToSql>> =
             params.iter().map(|v| json_to_duckdb_param(v)).collect();
+
+        // Multi-statement support (canonical v10: `CREATE …; INSERT …; SELECT …`
+        // in a single `query:`/`command:`). duckdb's prepare() rejects multiple
+        // statements ("Cannot prepare multiple statements at once!"), so run every
+        // statement except the final one as a batch on the same connection and let
+        // the existing single-statement path handle the last one (which may be a
+        // SELECT that returns rows). Bound params apply only to the final prepared
+        // statement, so this fires only when there are none.
+        let statements = if params.is_empty() {
+            split_sql_statements(query)
+        } else {
+            vec![query.to_string()]
+        };
+        let effective_query: String = if statements.len() > 1 {
+            let (last, leading) = statements.split_last().unwrap();
+            for stmt in leading {
+                conn.execute_batch(stmt)
+                    .map_err(|e| ToolError::Database(format!("Batch statement failed: {}", e)))?;
+            }
+            last.clone()
+        } else {
+            query.to_string()
+        };
+        let query = effective_query.as_str();
 
         // Execute query
         let mut stmt = conn
@@ -344,6 +405,46 @@ mod tests {
         assert!(config.params.is_empty());
         assert!(config.db_path.is_none());
         assert!(config.as_objects);
+    }
+
+    #[test]
+    fn test_split_sql_statements() {
+        // Single statement → one element, no split.
+        assert_eq!(split_sql_statements("SELECT 1").len(), 1);
+        // Trailing semicolon is not a second (empty) statement.
+        assert_eq!(split_sql_statements("SELECT 1;").len(), 1);
+        // Multi-statement splits on top-level semicolons.
+        let s = split_sql_statements(
+            "CREATE TABLE t(id INT); INSERT INTO t VALUES (1); SELECT * FROM t;",
+        );
+        assert_eq!(s.len(), 3);
+        assert!(s[0].starts_with("CREATE"));
+        assert!(s[2].starts_with("SELECT"));
+        // Semicolons inside single-quoted literals are NOT split points.
+        let s = split_sql_statements("INSERT INTO t VALUES ('a;b'); SELECT 1");
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("'a;b'"));
+        // Escaped '' inside a literal is preserved.
+        let s = split_sql_statements("INSERT INTO t VALUES ('it''s; fine'); SELECT 2");
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn test_duckdb_multi_statement_query() {
+        // Canonical v10 shape: CREATE; INSERT; SELECT in a single query block.
+        // Before the multi-statement fix this failed with
+        // "Cannot prepare multiple statements at once!".
+        let tool = DuckdbTool::new();
+        let sql = "CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);\n\
+                   INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35);\n\
+                   SELECT name, age FROM users WHERE age >= 30 ORDER BY age;";
+        let result = tool.execute_query(sql, &[], None, true).unwrap();
+        assert!(result.is_success());
+        let data = result.data.unwrap();
+        assert_eq!(data["row_count"], 2);
+        let rows = data["rows"].as_array().unwrap();
+        assert_eq!(rows[0]["name"], "Alice");
+        assert_eq!(rows[1]["name"], "Charlie");
     }
 
     #[test]
