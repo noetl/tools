@@ -69,9 +69,25 @@ impl TaskSequenceTool {
         }
     }
 
-    /// Parse the task list from the incoming config.  Accepts
-    /// either the bare-array shape (server's emit) or a wrapped
-    /// `{tasks: [...]}` object shape.
+    /// Parse the task list from the incoming config.  Three
+    /// acceptable shapes:
+    ///
+    /// 1. **Bare array** — `[{label: spec}, ...]`.  Pre-worker-
+    ///    envelope shape; useful for unit tests and any caller
+    ///    that hands a raw task list to the tool.
+    /// 2. **Object with `tasks` field** — `{"tasks": [...]}`.
+    ///    Future-proof wrap shape; no current emitter uses it but
+    ///    the parser accepts it so producers can adopt without a
+    ///    coordinated change.
+    /// 3. **Worker envelope** — `{"args": ..., "tool_config":
+    ///    [...], "render_context": ...}`.  The actual shape the
+    ///    Rust worker's command-dispatch path produces: the
+    ///    rendered tool config gets wrapped in `args` +
+    ///    `tool_config` + `render_context` before being handed to
+    ///    the registry.  Most other tools (PythonTool, etc.)
+    ///    deserialize from this envelope via serde-default-skip
+    ///    on the unknown fields; task_sequence needs the actual
+    ///    list, which lives under `tool_config`.
     fn parse_tasks(
         &self,
         config: &ToolConfig,
@@ -87,19 +103,24 @@ impl TaskSequenceTool {
                 Ok(tasks)
             }
             serde_json::Value::Object(map) => {
-                if let Some(tasks_value) = map.get("tasks") {
-                    let tasks: Vec<HashMap<String, serde_json::Value>> =
-                        serde_json::from_value(tasks_value.clone()).map_err(|e| {
-                            ToolError::Configuration(format!(
-                                "task_sequence: nested 'tasks' field did not decode: {e}"
-                            ))
-                        })?;
-                    Ok(tasks)
-                } else {
-                    Err(ToolError::Configuration(
-                        "task_sequence config must be either an array of tasks or an object with a 'tasks' field".to_string(),
-                    ))
-                }
+                // Prefer `tool_config` (worker envelope shape) over
+                // `tasks` (forward-compat wrap shape) so callers can
+                // mix and match without ambiguity in this parser.
+                let array_value = map
+                    .get("tool_config")
+                    .or_else(|| map.get("tasks"))
+                    .ok_or_else(|| {
+                        ToolError::Configuration(
+                            "task_sequence config must be an array, or an object containing a `tool_config` field (worker envelope) or a `tasks` field".to_string(),
+                        )
+                    })?;
+                let tasks: Vec<HashMap<String, serde_json::Value>> =
+                    serde_json::from_value(array_value.clone()).map_err(|e| {
+                        ToolError::Configuration(format!(
+                            "task_sequence: pipeline field did not decode as Vec<HashMap<String, Value>>: {e}"
+                        ))
+                    })?;
+                Ok(tasks)
             }
             other => Err(ToolError::Configuration(format!(
                 "task_sequence: config must be array or object, got {}",
@@ -325,6 +346,38 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert!(tasks[0].contains_key("transform"));
         assert!(tasks[1].contains_key("save"));
+    }
+
+    #[test]
+    fn test_parse_tasks_worker_envelope_shape() {
+        // The Rust worker's command-dispatch path wraps the
+        // rendered tool config in `{args, tool_config,
+        // render_context}` before handing it to the registry.
+        // task_sequence must walk into `tool_config` to find the
+        // actual task list — without this, every flat-pipeline
+        // playbook fixture (start_with_action, end_with_action,
+        // iterator_save_test, http_test, postgres_test, ...)
+        // failed with "config must be array or object with
+        // 'tasks' field" in local kind.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!({
+                "args": {},
+                "tool_config": [
+                    {"init_action": {"kind": "python", "code": "result={}"}},
+                    {"finish":      {"kind": "python", "code": "result={}"}},
+                ],
+                "render_context": {"workload": {"test_value": "hello"}}
+            }),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let tasks = tool.parse_tasks(&config).expect("worker envelope parses");
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks[0].contains_key("init_action"));
+        assert!(tasks[1].contains_key("finish"));
     }
 
     #[test]
