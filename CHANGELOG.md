@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.0](https://github.com/noetl/tools/compare/v2.18.5...v2.19.0) (2026-06-05)
+
+### Features
+
+* **secrets:** add GCP Secret Manager provider behind a SecretProvider trait ([469bfc7](https://github.com/noetl/tools/commit/469bfc73db6c32c4307d22dcdc88c8cc0ed34d77)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.18.5](https://github.com/noetl/tools/compare/v2.18.4...v2.18.5) (2026-06-05)
 
 ### Bug Fixes
