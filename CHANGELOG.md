@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.4](https://github.com/noetl/tools/compare/v2.18.3...v2.18.4) (2026-06-05)
+
+### Bug Fixes
+
+* **duckdb:** accept command: as alias for query: (parity with postgres) ([e10e53c](https://github.com/noetl/tools/commit/e10e53c619856e3bdfe0456453969de5e8476fa9)), closes [noetl/tools#23](https://github.com/noetl/tools/issues/23) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **http:** coerce non-string params/headers/form values ([4d4c785](https://github.com/noetl/tools/commit/4d4c7852244390c6d9c3ae231d669b0f0cc71941)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.18.3](https://github.com/noetl/tools/compare/v2.18.2...v2.18.3) (2026-06-05)
 
 ### Bug Fixes
