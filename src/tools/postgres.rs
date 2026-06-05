@@ -157,7 +157,7 @@ impl PostgresTool {
         let client = pool
             .get()
             .await
-            .map_err(|e| ToolError::Database(format!("Failed to get connection: {}", e)))?;
+            .map_err(|e| ToolError::Database(format!("Failed to get connection: {e}")))?;
 
         // Set search_path if schema specified
         if let Some(schema) = schema {
@@ -185,7 +185,7 @@ impl PostgresTool {
             let rows = client
                 .query(query, &param_refs)
                 .await
-                .map_err(|e| ToolError::Database(format!("Query failed: {}", e)))?;
+                .map_err(|e| ToolError::Database(format_pg_error("Query failed", &e)))?;
 
             if rows.is_empty() {
                 serde_json::json!({
@@ -232,7 +232,7 @@ impl PostgresTool {
             let affected = client
                 .execute(query, &param_refs)
                 .await
-                .map_err(|e| ToolError::Database(format!("Execute failed: {}", e)))?;
+                .map_err(|e| ToolError::Database(format_pg_error("Execute failed", &e)))?;
 
             serde_json::json!({
                 "affected_rows": affected
@@ -295,6 +295,44 @@ impl Tool for PostgresTool {
             pg_config.as_objects,
         )
         .await
+    }
+}
+
+/// Format a `tokio_postgres::Error` so the real server-side message
+/// reaches the caller.
+///
+/// `tokio_postgres::Error`'s `Display` is terse — for a server-side
+/// failure it renders just `"db error"`, hiding the actual SQLSTATE +
+/// message (e.g. `syntax error at or near ")"`).  The detail lives in
+/// the attached `DbError`.  Surface `severity: message (SQLSTATE code)`
+/// plus `DETAIL` / `HINT` when present so operators see the real cause
+/// in the event log instead of an opaque "Execute failed: db error".
+fn format_pg_error(context: &str, e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut msg = format!(
+            "{}: {}: {} (SQLSTATE {})",
+            context,
+            db.severity(),
+            db.message(),
+            db.code().code()
+        );
+        if let Some(detail) = db.detail() {
+            msg.push_str(&format!(" | DETAIL: {detail}"));
+        }
+        if let Some(hint) = db.hint() {
+            msg.push_str(&format!(" | HINT: {hint}"));
+        }
+        msg
+    } else {
+        // Connection / protocol / type errors carry no DbError — the
+        // Display + source chain is the most informative we have.
+        let mut msg = format!("{context}: {e}");
+        let mut src = std::error::Error::source(e);
+        while let Some(inner) = src {
+            msg.push_str(&format!(": {inner}"));
+            src = inner.source();
+        }
+        msg
     }
 }
 
