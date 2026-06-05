@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.0](https://github.com/noetl/tools/compare/v2.17.1...v2.18.0) (2026-06-05)
+
+### Features
+
+* **task_sequence:** add tool for pipeline / sequential-task execution ([faf1d0c](https://github.com/noetl/tools/commit/faf1d0ce3aca72446e8d7578f9bd36680927222f)), closes [noetl/server#63](https://github.com/noetl/server/issues/63) [#1](https://github.com/noetl/tools/issues/1) [#2](https://github.com/noetl/tools/issues/2) [noetl/tools#15](https://github.com/noetl/tools/issues/15)
+
 ## [2.17.1](https://github.com/noetl/tools/compare/v2.17.0...v2.17.1) (2026-06-05)
 
 ### Bug Fixes

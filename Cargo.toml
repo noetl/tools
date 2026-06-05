@@ -1,6 +1,6 @@
 [package]
 name = "noetl-tools"
-version = "2.17.1"
+version = "2.18.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
