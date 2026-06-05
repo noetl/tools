@@ -15,7 +15,10 @@ use crate::template::TemplateEngine;
 /// DuckDB tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuckdbConfig {
-    /// SQL query to execute.
+    /// SQL to execute. Canonical v10 playbooks use `command:`; `query:`
+    /// is accepted as an alias for the same field so both shapes parse
+    /// (parity with the postgres tool).
+    #[serde(alias = "command")]
     pub query: String,
 
     /// Query parameters.
@@ -405,6 +408,18 @@ mod tests {
         assert!(config.params.is_empty());
         assert!(config.db_path.is_none());
         assert!(config.as_objects);
+    }
+
+    #[test]
+    fn test_duckdb_config_command_alias() {
+        // Canonical v10 duckdb steps may use `command:` instead of
+        // `query:` (parity with postgres). The serde alias maps it to
+        // the same field. Surfaced by retry_test/duckdb_retry_query.yaml.
+        let json = serde_json::json!({
+            "command": "SELECT 42 as answer"
+        });
+        let config: DuckdbConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.query, "SELECT 42 as answer");
     }
 
     #[test]
