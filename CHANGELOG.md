@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.1](https://github.com/noetl/tools/compare/v2.18.0...v2.18.1) (2026-06-05)
+
+### Bug Fixes
+
+* **task_sequence:** accept worker-envelope `tool_config` shape ([7bde2d9](https://github.com/noetl/tools/commit/7bde2d92a3fbfd6ac95c535b25aa6c074b48e691)), closes [noetl/tools#19](https://github.com/noetl/tools/issues/19)
+
 ## [2.18.0](https://github.com/noetl/tools/compare/v2.17.1...v2.18.0) (2026-06-05)
 
 ### Features
