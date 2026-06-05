@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.5](https://github.com/noetl/tools/compare/v2.18.4...v2.18.5) (2026-06-05)
+
+### Bug Fixes
+
+* **postgres,duckdb:** dollar-quote-aware statement splitter ([3bcea06](https://github.com/noetl/tools/commit/3bcea06641705e6519670dc23bc2930e7a6f809f)), closes [noetl/tools#24](https://github.com/noetl/tools/issues/24) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.18.4](https://github.com/noetl/tools/compare/v2.18.3...v2.18.4) (2026-06-05)
 
 ### Bug Fixes
