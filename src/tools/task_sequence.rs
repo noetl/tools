@@ -380,6 +380,39 @@ mod tests {
         assert!(tasks[1].contains_key("finish"));
     }
 
+    #[tokio::test]
+    async fn test_task_sequence_duckdb_multi_statement() {
+        // Regression (noetl/ai-meta#54): duckdb_test.yaml wraps a duckdb
+        // tool in a single-item `tool:` list, so it dispatches through
+        // task_sequence. A multi-statement query (CREATE; INSERT; SELECT)
+        // must run end-to-end via the sub-task registry dispatch, the same
+        // way it does for a direct single-tool duckdb step.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {"run_query": {
+                    "kind": "duckdb",
+                    "database": ":memory:",
+                    "query": "CREATE TABLE u (id INTEGER, name VARCHAR);\nINSERT INTO u VALUES (1, 'Alice'), (2, 'Bob');\nSELECT name FROM u ORDER BY id;"
+                }},
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool
+            .execute(&config, &ctx)
+            .await
+            .expect("task_sequence duckdb sub-task runs");
+        assert!(
+            result.is_success(),
+            "expected success, got: {:?}",
+            result.error
+        );
+    }
+
     #[test]
     fn test_parse_tasks_nested_object_shape() {
         let tool = TaskSequenceTool::new();
