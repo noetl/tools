@@ -15,6 +15,38 @@ use crate::registry::{Tool, ToolConfig};
 use crate::result::{ToolResult, ToolStatus};
 use crate::template::TemplateEngine;
 
+/// Sentinel string the wrapper script uses to mark the JSON line
+/// carrying the user-set `result` global.  Chosen to be improbable
+/// in real user output.  See `extract_result_from_stdout` for the
+/// parsing side.
+const NOETL_RESULT_MARKER: &str = "@@__NOETL_RESULT__@@";
+
+/// Find the wrapper-emitted result line in stdout and return
+/// `(captured_result, cleaned_stdout)`.  If no marker is present
+/// (e.g. the wrapper failed before emit), returns `(None, stdout)`.
+///
+/// Side effect: the marker line is stripped from the cleaned stdout
+/// so the user-visible output stays clean.
+fn extract_result_from_stdout(stdout: &str) -> (Option<serde_json::Value>, String) {
+    let mut kept_lines = Vec::new();
+    let mut captured: Option<serde_json::Value> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix(NOETL_RESULT_MARKER) {
+            // Last marker wins if the user code is weird enough to
+            // emit multiple — keeps the wrapper's emit authoritative.
+            captured = serde_json::from_str(rest).ok();
+            continue;
+        }
+        kept_lines.push(line);
+    }
+    // Preserve original trailing-newline shape.
+    let mut cleaned = kept_lines.join("\n");
+    if stdout.ends_with('\n') && !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    (captured, cleaned)
+}
+
 /// Python tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonConfig {
@@ -78,7 +110,24 @@ impl PythonTool {
     ) -> Result<ToolResult, ToolError> {
         let start = std::time::Instant::now();
 
-        // Create wrapper script that handles JSON I/O
+        // Create wrapper script that handles JSON I/O.
+        //
+        // The wrapper emits the user-set `result` global as a JSON
+        // line prefixed with the `NOETL_RESULT_MARKER` sentinel.
+        // The tool's stdout parser (below) finds that line, parses
+        // the rest as JSON, and strips it from the visible stdout
+        // before exposing the result to downstream consumers.  This
+        // preserves user-side `print(...)` calls (visible in stdout
+        // for debugging) while also capturing the structured
+        // `result` value the orchestrator needs for
+        // `{{ step_name.field }}` references in next.arcs.
+        //
+        // The marker string is intentionally improbable in real
+        // output; user code that legitimately wants to print this
+        // exact substring would conflict, but the probability is
+        // low enough not to warrant a more complex out-of-band
+        // channel (e.g. fd 3) at this stage.  See noetl/ai-meta#60
+        // for the surfacing finding.
         let wrapper_code = format!(
             r#"
 import sys
@@ -97,10 +146,20 @@ globals().update(args)
 # User code
 {}
 
-# If the last expression is a result, capture it
-# (This won't work for all cases, but covers simple scripts)
+# Emit the user-set `result` global as JSON on a single line
+# prefixed with the noetl marker.  Missing / non-JSON-serializable
+# results fall back to `null` so the tool can still complete
+# successfully.
+try:
+    __noetl_captured = globals().get('result', None)
+    sys.stdout.write('{marker}' + json.dumps(__noetl_captured, default=str) + '\n')
+    sys.stdout.flush()
+except Exception as __noetl_err:
+    sys.stdout.write('{marker}null\n')
+    sys.stderr.write('noetl result capture failed: ' + repr(__noetl_err) + '\n')
 "#,
-            code
+            code,
+            marker = NOETL_RESULT_MARKER
         );
 
         // Write script to temp file
@@ -186,13 +245,35 @@ globals().update(args)
         };
 
         let exit_code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // Pick out the wrapper's marked result line; the visible
+        // stdout (user `print(...)` calls) is what's left after
+        // stripping that line out.  See `extract_result_from_stdout`
+        // + the wrapper script's emit section.
+        let (captured_result, stdout) = extract_result_from_stdout(&raw_stdout);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Try to parse stdout as JSON for data
-        let data = if !stdout.trim().is_empty() {
+        // `result = {...}` global captured by the wrapper is the
+        // authoritative tool result.  Fall back to the legacy
+        // parse-stdout-as-JSON path only when no marker was found
+        // (e.g. wrapper exited before emit) so back-compat with
+        // tooling that printed JSON-only on stdout stays intact.
+        let data = if let Some(value) = captured_result {
+            // Treat a null capture (user didn't set `result`) as a
+            // no-data successful run rather than a confusing
+            // `data: null`.
+            if value.is_null() {
+                Some(serde_json::json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }))
+            } else {
+                Some(value)
+            }
+        } else if !stdout.trim().is_empty() {
             serde_json::from_str(&stdout).ok()
         } else {
             None
@@ -311,6 +392,117 @@ mod tests {
         assert!(config.args.is_empty());
         assert!(config.env.is_empty());
         assert_eq!(config.python, default_python());
+    }
+
+    #[test]
+    fn test_extract_result_strips_marker_line() {
+        // Wrapper-emitted result line at the end gets stripped from
+        // visible stdout; the JSON after the marker is parsed.
+        let raw = "hello from user\n@@__NOETL_RESULT__@@{\"is_hot\":true}\n";
+        let (captured, cleaned) = extract_result_from_stdout(raw);
+        assert_eq!(
+            captured,
+            Some(serde_json::json!({"is_hot": true})),
+            "marker JSON should parse"
+        );
+        assert_eq!(cleaned, "hello from user\n", "marker line stripped");
+    }
+
+    #[test]
+    fn test_extract_result_no_marker_returns_none() {
+        // Legacy scripts without the wrapper (or scripts whose
+        // wrapper failed before emit) — no marker means no capture.
+        let raw = "just user output\n";
+        let (captured, cleaned) = extract_result_from_stdout(raw);
+        assert!(captured.is_none(), "no marker = no capture");
+        assert_eq!(cleaned, "just user output\n", "stdout unchanged");
+    }
+
+    #[test]
+    fn test_extract_result_handles_null_capture() {
+        // User script that didn't set `result` — wrapper emits the
+        // marker with `null` as the JSON payload.  Capture is
+        // Some(Null), not None — the caller distinguishes the two
+        // cases (no marker = legacy, marker+null = explicit
+        // "user ran but set no result").
+        let raw = "@@__NOETL_RESULT__@@null\n";
+        let (captured, cleaned) = extract_result_from_stdout(raw);
+        assert_eq!(captured, Some(serde_json::Value::Null));
+        assert_eq!(cleaned, "");
+    }
+
+    #[tokio::test]
+    async fn test_python_captures_result_global() {
+        // The whole point of the noetl-tools change — user code that
+        // assigns `result = {...}` should expose that dict as the
+        // tool's data field so the orchestrator can resolve
+        // `{{ step_name.field }}` references in next.arcs.
+        let tool = PythonTool::new();
+        let args = HashMap::new();
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let result = tool
+            .execute_code(
+                "result = {'is_hot': True, 'message': 'hot'}",
+                &args,
+                &env,
+                "python3",
+                None,
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success());
+        let data = result.data.expect("data should be the captured result");
+        assert_eq!(
+            data.get("is_hot").and_then(|v| v.as_bool()),
+            Some(true),
+            "captured result must expose `is_hot`"
+        );
+        assert_eq!(
+            data.get("message").and_then(|v| v.as_str()),
+            Some("hot"),
+            "captured result must expose `message`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_python_capture_preserves_user_stdout() {
+        // User `print(...)` calls and the captured result coexist —
+        // the marker line is stripped, but the user's print stays
+        // visible in stdout for debugging.
+        let tool = PythonTool::new();
+        let args = HashMap::new();
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let result = tool
+            .execute_code(
+                "print('debug: starting'); result = {'ok': True}",
+                &args,
+                &env,
+                "python3",
+                None,
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success());
+        // stdout has the user print, NOT the marker line.
+        let stdout = result.stdout.as_ref().unwrap();
+        assert!(stdout.contains("debug: starting"), "user print preserved");
+        assert!(
+            !stdout.contains(NOETL_RESULT_MARKER),
+            "marker line must be stripped from visible stdout"
+        );
+        // data has the result.
+        let data = result.data.expect("captured result");
+        assert_eq!(data.get("ok").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[tokio::test]
