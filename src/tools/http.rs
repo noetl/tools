@@ -53,7 +53,7 @@ pub struct HttpConfig {
     pub method: HttpMethod,
 
     /// Request headers.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_map")]
     pub headers: HashMap<String, String>,
 
     /// Request body (for POST/PUT/PATCH).
@@ -65,11 +65,15 @@ pub struct HttpConfig {
     pub json: Option<serde_json::Value>,
 
     /// Form data (sets Content-Type to application/x-www-form-urlencoded).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_string_map"
+    )]
     pub form: Option<HashMap<String, String>>,
 
     /// Query parameters.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_map")]
     pub params: HashMap<String, String>,
 
     /// Request timeout in seconds.
@@ -87,6 +91,54 @@ pub struct HttpConfig {
 
 fn default_follow_redirects() -> bool {
     true
+}
+
+/// Coerce a JSON-valued map into a string-valued map. Template rendering
+/// commonly produces non-string scalars for header / query-param values —
+/// e.g. `offset: "{{ ctx.offset }}"` rendering to an integer, or an
+/// undefined reference rendering to null. Without coercion these fail
+/// deserialization with `invalid type: integer/null, expected a string`,
+/// which blocks the bulk of the pagination / http fixtures. Numbers and
+/// bools are stringified; null entries are dropped (an unset param/header
+/// is omitted rather than sent as the literal "null").
+fn coerce_string_map(raw: HashMap<String, serde_json::Value>) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        match v {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(s) => {
+                out.insert(k, s);
+            }
+            serde_json::Value::Bool(b) => {
+                out.insert(k, b.to_string());
+            }
+            serde_json::Value::Number(n) => {
+                out.insert(k, n.to_string());
+            }
+            other => {
+                out.insert(k, other.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn deserialize_string_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(coerce_string_map(raw))
+}
+
+fn deserialize_opt_string_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<HashMap<String, serde_json::Value>>::deserialize(deserializer)?;
+    Ok(raw.map(coerce_string_map))
 }
 
 /// Expected response type.
@@ -325,6 +377,28 @@ mod tests {
         assert_eq!(config.url, "https://api.example.com/data");
         assert!(matches!(config.method, HttpMethod::POST));
         assert!(config.json.is_some());
+    }
+
+    #[test]
+    fn test_http_config_lenient_params_headers() {
+        // Template rendering produces non-string scalars for params /
+        // headers (e.g. `offset: "{{ ctx.offset }}"` -> integer, an
+        // undefined ref -> null). Coerce numbers/bools to strings and
+        // drop null entries instead of failing deserialization.
+        // Surfaced by pagination/offset, /cursor, /max_iterations,
+        // /pipeline (noetl/ai-meta#54).
+        let json = serde_json::json!({
+            "url": "http://test-server/api/v1/users",
+            "params": {"offset": 10, "limit": 25, "cursor": null, "active": true},
+            "headers": {"X-Page": 1, "X-Trace": "abc"}
+        });
+        let config: HttpConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.params.get("offset"), Some(&"10".to_string()));
+        assert_eq!(config.params.get("limit"), Some(&"25".to_string()));
+        assert_eq!(config.params.get("active"), Some(&"true".to_string()));
+        assert!(!config.params.contains_key("cursor")); // null dropped
+        assert_eq!(config.headers.get("X-Page"), Some(&"1".to_string()));
+        assert_eq!(config.headers.get("X-Trace"), Some(&"abc".to_string()));
     }
 
     #[test]
