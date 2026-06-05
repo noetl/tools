@@ -38,35 +38,99 @@ fn default_as_objects() -> bool {
     true
 }
 
+/// Match a dollar-quote tag starting at `chars[i]` (which must be `$`). Returns
+/// the full opening/closing tag (e.g. `$$` or `$func$`) when the `$` begins a
+/// valid dollar-quote delimiter — a `$`, optional identifier (letters / digits
+/// / `_`, not starting with a digit), then a closing `$`. Returns `None` for a
+/// bare `$` or a positional parameter like `$1`.
+fn match_dollar_tag(chars: &[char], i: usize) -> Option<String> {
+    if chars.get(i) != Some(&'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    if let Some(&first) = chars.get(j) {
+        if first.is_ascii_digit() {
+            return None;
+        }
+    }
+    while let Some(&c) = chars.get(j) {
+        if c.is_alphanumeric() || c == '_' {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if chars.get(j) == Some(&'$') {
+        Some(chars[i..=j].iter().collect())
+    } else {
+        None
+    }
+}
+
 /// Split a SQL string into individual statements on top-level semicolons,
 /// ignoring semicolons inside single-quoted string literals (and the `''`
-/// escape sequence). Trailing empty fragments are dropped. Used to support
-/// canonical v10 multi-statement `query:` / `command:` blocks, which duckdb's
-/// single-statement `prepare()` would otherwise reject.
+/// escape sequence) and inside dollar-quoted blocks (`$$ … $$` / `$tag$ … $tag$`).
+/// Trailing empty fragments are dropped. Used to support canonical v10
+/// multi-statement `query:` / `command:` blocks, which duckdb's single-statement
+/// `prepare()` would otherwise reject.
 fn split_sql_statements(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut dollar_tag: Option<String> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(tag) = &dollar_tag {
+            if c == '$' {
+                if let Some(close) = match_dollar_tag(&chars, i) {
+                    if &close == tag {
+                        current.push_str(&close);
+                        i += close.chars().count();
+                        dollar_tag = None;
+                        continue;
+                    }
+                }
+            }
+            current.push(c);
+            i += 1;
+            continue;
+        }
         match c {
             '\'' => {
                 // `''` inside a string literal is an escaped quote, not a close.
-                if in_single && chars.peek() == Some(&'\'') {
-                    current.push(c);
-                    current.push(chars.next().unwrap());
+                if in_single && chars.get(i + 1) == Some(&'\'') {
+                    current.push('\'');
+                    current.push('\'');
+                    i += 2;
                     continue;
                 }
                 in_single = !in_single;
                 current.push(c);
+                i += 1;
+            }
+            '$' if !in_single => {
+                if let Some(open) = match_dollar_tag(&chars, i) {
+                    current.push_str(&open);
+                    i += open.chars().count();
+                    dollar_tag = Some(open);
+                } else {
+                    current.push(c);
+                    i += 1;
+                }
             }
             ';' if !in_single => {
                 if !current.trim().is_empty() {
                     statements.push(current.trim().to_string());
                 }
                 current.clear();
+                i += 1;
             }
-            _ => current.push(c),
+            _ => {
+                current.push(c);
+                i += 1;
+            }
         }
     }
     if !current.trim().is_empty() {
@@ -442,6 +506,10 @@ mod tests {
         // Escaped '' inside a literal is preserved.
         let s = split_sql_statements("INSERT INTO t VALUES ('it''s; fine'); SELECT 2");
         assert_eq!(s.len(), 2);
+        // Semicolons inside a dollar-quoted block are NOT split points.
+        let s = split_sql_statements("SELECT $$ a; b; c $$ AS x; SELECT 2");
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("$$ a; b; c $$"));
     }
 
     #[test]
