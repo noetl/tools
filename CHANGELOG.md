@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.17.1](https://github.com/noetl/tools/compare/v2.17.0...v2.17.1) (2026-06-05)
+
+### Bug Fixes
+
+* **python:** capture user code's `result` global as the tool's data field ([082a294](https://github.com/noetl/tools/commit/082a2945b26de34cb0ad108dcff8d4713b10d435)), closes [noetl/ai-meta#59](https://github.com/noetl/ai-meta/issues/59) [noetl/tools#16](https://github.com/noetl/tools/issues/16) [noetl/tools#16](https://github.com/noetl/tools/issues/16)
+
 ## [2.17.0](https://github.com/noetl/tools/compare/v2.16.0...v2.17.0) (2026-06-03)
 
 ### Features
