@@ -27,6 +27,7 @@ mod script;
 mod secrets;
 mod shell;
 mod snowflake;
+mod task_sequence;
 mod transfer;
 
 pub use self::duckdb::DuckdbTool;
@@ -44,6 +45,7 @@ pub use self::script::ScriptTool;
 pub use self::secrets::{SecretManagerTool, SecretsTool};
 pub use self::shell::ShellTool;
 pub use self::snowflake::SnowflakeTool;
+pub use self::task_sequence::TaskSequenceTool;
 pub use self::transfer::TransferTool;
 
 use crate::registry::ToolRegistry;
@@ -64,6 +66,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(ScriptTool::new());
     registry.register(PlaybookTool::new());
     registry.register(NoopTool::new());
+    registry.register(TaskSequenceTool::new());
     registry.register(SecretsTool::new());
     registry.register(SecretManagerTool::new());
     registry.register(ResultFetchTool::new());
