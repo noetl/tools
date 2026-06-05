@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.2](https://github.com/noetl/tools/compare/v2.18.1...v2.18.2) (2026-06-05)
+
+### Bug Fixes
+
+* **postgres:** surface the real SQL error instead of generic "db error" ([f3321d9](https://github.com/noetl/tools/commit/f3321d9b514ce4729e3d14ee1ddb3eca0a7fc077)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/tools#21](https://github.com/noetl/tools/issues/21) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.18.1](https://github.com/noetl/tools/compare/v2.18.0...v2.18.1) (2026-06-05)
 
 ### Bug Fixes
