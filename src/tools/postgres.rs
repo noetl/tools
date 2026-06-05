@@ -64,35 +64,102 @@ fn default_as_objects() -> bool {
     true
 }
 
+/// Match a PostgreSQL dollar-quote tag starting at `chars[i]` (which must be
+/// `$`). Returns the full opening/closing tag (e.g. `$$` or `$func$`) when the
+/// `$` begins a valid dollar-quote delimiter — a `$`, optional identifier
+/// (letters / digits / `_`, not starting with a digit), then a closing `$`.
+/// Returns `None` for a bare `$` or a positional parameter like `$1`.
+fn match_dollar_tag(chars: &[char], i: usize) -> Option<String> {
+    if chars.get(i) != Some(&'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    // A tag identifier may not start with a digit (so `$1` is a param, not a tag).
+    if let Some(&first) = chars.get(j) {
+        if first.is_ascii_digit() {
+            return None;
+        }
+    }
+    while let Some(&c) = chars.get(j) {
+        if c.is_alphanumeric() || c == '_' {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if chars.get(j) == Some(&'$') {
+        Some(chars[i..=j].iter().collect())
+    } else {
+        None
+    }
+}
+
 /// Split a SQL string into individual statements on top-level semicolons,
 /// ignoring semicolons inside single-quoted string literals (and the `''`
-/// escape sequence). Trailing empty fragments are dropped. Used to support
-/// canonical v10 multi-statement `command:` blocks on tools whose normal
-/// execution path only accepts a single prepared statement.
+/// escape sequence) and inside dollar-quoted blocks (`$$ … $$` / `$tag$ … $tag$`,
+/// e.g. a plpgsql function body or a `DO` block). Trailing empty fragments are
+/// dropped. Used to support canonical v10 multi-statement `command:` blocks on
+/// tools whose normal execution path only accepts a single prepared statement.
 fn split_sql_statements(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut dollar_tag: Option<String> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Inside a dollar-quoted block: only the matching close tag ends it;
+        // semicolons and single quotes are inert.
+        if let Some(tag) = &dollar_tag {
+            if c == '$' {
+                if let Some(close) = match_dollar_tag(&chars, i) {
+                    if &close == tag {
+                        current.push_str(&close);
+                        i += close.chars().count();
+                        dollar_tag = None;
+                        continue;
+                    }
+                }
+            }
+            current.push(c);
+            i += 1;
+            continue;
+        }
         match c {
             '\'' => {
                 // `''` inside a string literal is an escaped quote, not a close.
-                if in_single && chars.peek() == Some(&'\'') {
-                    current.push(c);
-                    current.push(chars.next().unwrap());
+                if in_single && chars.get(i + 1) == Some(&'\'') {
+                    current.push('\'');
+                    current.push('\'');
+                    i += 2;
                     continue;
                 }
                 in_single = !in_single;
                 current.push(c);
+                i += 1;
+            }
+            '$' if !in_single => {
+                if let Some(open) = match_dollar_tag(&chars, i) {
+                    current.push_str(&open);
+                    i += open.chars().count();
+                    dollar_tag = Some(open);
+                } else {
+                    current.push(c);
+                    i += 1;
+                }
             }
             ';' if !in_single => {
                 if !current.trim().is_empty() {
                     statements.push(current.trim().to_string());
                 }
                 current.clear();
+                i += 1;
             }
-            _ => current.push(c),
+            _ => {
+                current.push(c);
+                i += 1;
+            }
         }
     }
     if !current.trim().is_empty() {
@@ -505,6 +572,19 @@ mod tests {
         let s = split_sql_statements("INSERT INTO t VALUES ('a;b'); SELECT 1");
         assert_eq!(s.len(), 2);
         assert!(s[0].contains("'a;b'"));
+        // Semicolons inside a dollar-quoted block (plpgsql body) are NOT splits.
+        let s = split_sql_statements(
+            "CREATE FUNCTION f() RETURNS void AS $$ BEGIN PERFORM 1; PERFORM 2; END; $$ LANGUAGE plpgsql; SELECT f();",
+        );
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("$$ BEGIN PERFORM 1; PERFORM 2; END; $$"));
+        assert!(s[1].starts_with("SELECT f()"));
+        // Tagged dollar-quote ($tag$ … $tag$) with inner semicolons.
+        let s = split_sql_statements("DO $do$ BEGIN; END $do$; SELECT 1");
+        assert_eq!(s.len(), 2);
+        // A positional parameter `$1` is not a dollar-quote opener.
+        let s = split_sql_statements("UPDATE t SET a = $1 WHERE id = 2; SELECT 1");
+        assert_eq!(s.len(), 2);
     }
 
     #[test]
