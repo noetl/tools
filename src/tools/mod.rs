@@ -42,7 +42,7 @@ pub use self::python::PythonTool;
 pub use self::result_fetch::ResultFetchTool;
 pub use self::rhai::RhaiTool;
 pub use self::script::ScriptTool;
-pub use self::secrets::{SecretManagerTool, SecretsTool};
+pub use self::secrets::SecretsTool;
 pub use self::shell::ShellTool;
 pub use self::snowflake::SnowflakeTool;
 pub use self::task_sequence::TaskSequenceTool;
@@ -68,7 +68,6 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(NoopTool::new());
     registry.register(TaskSequenceTool::new());
     registry.register(SecretsTool::new());
-    registry.register(SecretManagerTool::new());
     registry.register(ResultFetchTool::new());
     registry.register(NatsTool::new());
     registry.register(McpTool::new());

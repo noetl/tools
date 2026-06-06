@@ -1,4 +1,6 @@
-//! Secrets tools (`secrets` and `secret_manager`) compatibility layer.
+//! Secrets tool (`secrets`) — the one standard tool kind for secret
+//! resolution. (The earlier `secret_manager` alias was dropped; `secrets` is
+//! the single formal name across playbooks and the registry.)
 //!
 //! Dispatches on the config's `provider` field to a backend in
 //! [`crate::secrets`] (Secrets Wallet Phase 3, noetl/ai-meta#61). `env` reads
@@ -59,7 +61,7 @@ async fn execute_secret_lookup(
                 "value": value
             })))
         }
-        "gcp" | "gcp_secret_manager" | "google_secret_manager" => {
+        "gcp" => {
             let sm = GcpSecretManager::from_env()?;
             let secret_ref = SecretRef {
                 name: parsed.name.clone(),
@@ -97,30 +99,6 @@ impl SecretsTool {
 impl Tool for SecretsTool {
     fn name(&self) -> &'static str {
         "secrets"
-    }
-
-    async fn execute(
-        &self,
-        config: &ToolConfig,
-        ctx: &ExecutionContext,
-    ) -> Result<ToolResult, ToolError> {
-        execute_secret_lookup(config, ctx).await
-    }
-}
-
-/// `secret_manager` compatibility alias.
-pub struct SecretManagerTool;
-
-impl SecretManagerTool {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl Tool for SecretManagerTool {
-    fn name(&self) -> &'static str {
-        "secret_manager"
     }
 
     async fn execute(
