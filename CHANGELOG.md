@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.1](https://github.com/noetl/tools/compare/v2.19.0...v2.19.1) (2026-06-06)
+
+### Bug Fixes
+
+* **secrets:** make `secrets` the single tool kind (drop secret_manager alias) ([09a033c](https://github.com/noetl/tools/commit/09a033c69aa56d9c5093377057a86ab95061927d)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.19.0](https://github.com/noetl/tools/compare/v2.18.5...v2.19.0) (2026-06-05)
 
 ### Features
