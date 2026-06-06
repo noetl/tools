@@ -132,10 +132,7 @@ impl TaskSequenceTool {
     /// Convert a single labeled task entry into a `ToolConfig` the
     /// registry can dispatch.  The label is dropped; the embedded
     /// `kind` field on the spec becomes the registry lookup key.
-    fn build_task_config(
-        label: &str,
-        spec: &serde_json::Value,
-    ) -> Result<ToolConfig, ToolError> {
+    fn build_task_config(label: &str, spec: &serde_json::Value) -> Result<ToolConfig, ToolError> {
         let spec_obj = spec.as_object().ok_or_else(|| {
             ToolError::Configuration(format!(
                 "task_sequence: task '{label}' spec must be a JSON object, got {spec}"
@@ -205,10 +202,7 @@ impl Tool for TaskSequenceTool {
         let mut last_stderr = String::new();
         let mut total_exit_code: i32 = 0;
 
-        tracing::debug!(
-            task_count = tasks.len(),
-            "task_sequence: starting pipeline"
-        );
+        tracing::debug!(task_count = tasks.len(), "task_sequence: starting pipeline");
 
         for (idx, task_entry) in tasks.into_iter().enumerate() {
             if task_entry.len() != 1 {
@@ -299,9 +293,10 @@ impl Tool for TaskSequenceTool {
                         "labeled_results": labeled_results,
                         "failed_task": idx,
                     })),
-                    error: task_result.error.clone().or_else(|| {
-                        Some(format!("task_sequence task[{idx}] failed"))
-                    }),
+                    error: task_result
+                        .error
+                        .clone()
+                        .or_else(|| Some(format!("task_sequence task[{idx}] failed"))),
                     stdout: Some(last_stdout),
                     stderr: Some(last_stderr),
                     exit_code: Some(total_exit_code),
@@ -542,7 +537,10 @@ mod tests {
             auth: None,
         };
         let ctx = ExecutionContext::default();
-        let result = tool.execute(&config, &ctx).await.expect("execute returns Ok with Error status");
+        let result = tool
+            .execute(&config, &ctx)
+            .await
+            .expect("execute returns Ok with Error status");
 
         assert_eq!(result.status, ToolStatus::Error);
         let data = result.data.expect("partial data present");
@@ -550,7 +548,10 @@ mod tests {
         // `never_runs` task did not contribute.
         let failed_idx = data.get("failed_task").and_then(|v| v.as_i64());
         assert_eq!(failed_idx, Some(1), "second task is the failure point");
-        let labeled = data.get("labeled_results").and_then(|v| v.as_object()).unwrap();
+        let labeled = data
+            .get("labeled_results")
+            .and_then(|v| v.as_object())
+            .unwrap();
         assert!(labeled.contains_key("ok"), "first task's result recorded");
         assert!(
             !labeled.contains_key("never_runs"),

@@ -160,8 +160,7 @@ impl Tool for PlaybookTool {
             let body = response.text().await.unwrap_or_default();
             return Err(ToolError::Http(format!(
                 "Failed to start child playbook: {} {}",
-                response_status,
-                body
+                response_status, body
             )));
         }
 

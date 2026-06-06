@@ -56,7 +56,6 @@ use crate::template::TemplateEngine;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsConfig {
     // --- connection ---
-
     /// NATS server URL (e.g. `nats://localhost:4222`).
     /// Omit when using a credential alias via `auth`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,18 +79,15 @@ pub struct NatsConfig {
     pub token: Option<String>,
 
     // --- operation ---
-
     /// Operation to perform.  See module-level docs for the full list.
     pub operation: String,
 
     // --- KV / Object Store common ---
-
     /// Bucket name (KV or Object Store).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
 
     // --- KV fields ---
-
     /// Key within the bucket (KV operations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
@@ -110,7 +106,6 @@ pub struct NatsConfig {
     pub pattern: Option<String>,
 
     // --- Object Store fields ---
-
     /// Object name within the bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -128,7 +123,6 @@ pub struct NatsConfig {
     pub description: Option<String>,
 
     // --- JetStream fields ---
-
     /// JetStream stream name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
@@ -150,7 +144,6 @@ pub struct NatsConfig {
     pub last: bool,
 
     // --- js_consume fields ---
-
     /// Durable pull-consumer name (`js_consume`).  The consumer must
     /// already exist on the stream — `js_consume` does not create or
     /// alter consumer configurations.
@@ -368,11 +361,7 @@ impl Tool for NatsTool {
         let js = async_nats::jetstream::new(nc);
 
         let result = {
-            let span = tracing::info_span!(
-                "nats.op",
-                operation = op,
-                execution_id,
-            );
+            let span = tracing::info_span!("nats.op", operation = op, execution_id,);
             let _guard = span.enter();
 
             match op {
@@ -416,9 +405,9 @@ impl Tool for NatsTool {
 // ---------------------------------------------------------------------------
 
 fn require_bucket(cfg: &NatsConfig) -> Result<&str, ToolError> {
-    cfg.bucket
-        .as_deref()
-        .ok_or_else(|| ToolError::Configuration("NATS KV/Object operation requires 'bucket'".into()))
+    cfg.bucket.as_deref().ok_or_else(|| {
+        ToolError::Configuration("NATS KV/Object operation requires 'bucket'".into())
+    })
 }
 
 fn require_key(cfg: &NatsConfig) -> Result<&str, ToolError> {
@@ -499,7 +488,10 @@ async fn kv_delete(
     }))
 }
 
-async fn kv_keys(js: &jetstream::Context, cfg: &NatsConfig) -> Result<serde_json::Value, ToolError> {
+async fn kv_keys(
+    js: &jetstream::Context,
+    cfg: &NatsConfig,
+) -> Result<serde_json::Value, ToolError> {
     let bucket = require_bucket(cfg)?;
     let store = open_kv(js, bucket).await?;
     let pattern = cfg.pattern.as_deref();
@@ -553,9 +545,9 @@ async fn kv_purge(
 // ---------------------------------------------------------------------------
 
 fn require_object_name(cfg: &NatsConfig) -> Result<&str, ToolError> {
-    cfg.name
-        .as_deref()
-        .ok_or_else(|| ToolError::Configuration("NATS Object Store operation requires 'name'".into()))
+    cfg.name.as_deref().ok_or_else(|| {
+        ToolError::Configuration("NATS Object Store operation requires 'name'".into())
+    })
 }
 
 async fn open_object_store(
@@ -563,7 +555,10 @@ async fn open_object_store(
     bucket: &str,
 ) -> Result<object_store::ObjectStore, ToolError> {
     js.get_object_store(bucket).await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("Cannot open Object Store bucket '{}': {}", bucket, e))
+        ToolError::ExecutionFailed(format!(
+            "Cannot open Object Store bucket '{}': {}",
+            bucket, e
+        ))
     })
 }
 
@@ -577,14 +572,16 @@ async fn object_get(
     let name = require_object_name(cfg)?;
     let store = open_object_store(js, bucket).await?;
 
-    let mut object = store.get(name).await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("object_get '{}' failed: {}", name, e))
-    })?;
+    let mut object = store
+        .get(name)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("object_get '{}' failed: {}", name, e)))?;
 
     let mut buf = Vec::new();
-    object.read_to_end(&mut buf).await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("object_get read failed: {}", e))
-    })?;
+    object
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("object_get read failed: {}", e)))?;
 
     let size = buf.len();
     let data: serde_json::Value = if cfg.encoding == "base64" {
@@ -621,9 +618,10 @@ async fn object_put(
 
     // `put` takes `impl AsyncRead + Unpin`; use a cursor over our Vec<u8>.
     let mut reader = std::io::Cursor::new(binary);
-    store.put(meta, &mut reader).await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("object_put '{}' failed: {}", name, e))
-    })?;
+    store
+        .put(meta, &mut reader)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("object_put '{}' failed: {}", name, e)))?;
 
     Ok(serde_json::json!({
         "status": "success",
@@ -659,9 +657,10 @@ async fn object_list(
     let bucket = require_bucket(cfg)?;
     let store = open_object_store(js, bucket).await?;
 
-    let mut list_stream = store.list().await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("object_list failed: {}", e))
-    })?;
+    let mut list_stream = store
+        .list()
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("object_list failed: {}", e)))?;
 
     let mut objects = Vec::new();
     while let Some(item) = list_stream.next().await {
@@ -697,9 +696,10 @@ async fn object_info(
     let name = require_object_name(cfg)?;
     let store = open_object_store(js, bucket).await?;
 
-    let info = store.info(name).await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("object_info '{}' failed: {}", name, e))
-    })?;
+    let info = store
+        .info(name)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("object_info '{}' failed: {}", name, e)))?;
 
     Ok(serde_json::json!({
         "status": "success",
@@ -796,10 +796,8 @@ async fn js_consume(
         ))
     })?;
 
-    let consumer: async_nats::jetstream::consumer::PullConsumer = stream
-        .get_consumer(consumer_name)
-        .await
-        .map_err(|e| {
+    let consumer: async_nats::jetstream::consumer::PullConsumer =
+        stream.get_consumer(consumer_name).await.map_err(|e| {
             ToolError::ExecutionFailed(format!(
                 "js_consume: consumer '{}' on stream '{}' not found: {}",
                 consumer_name, stream_name, e
@@ -819,9 +817,8 @@ async fn js_consume(
 
     let mut out_messages: Vec<serde_json::Value> = Vec::with_capacity(batch as usize);
     while let Some(message_result) = messages.next().await {
-        let message = message_result.map_err(|e| {
-            ToolError::ExecutionFailed(format!("js_consume message error: {}", e))
-        })?;
+        let message = message_result
+            .map_err(|e| ToolError::ExecutionFailed(format!("js_consume message error: {}", e)))?;
 
         let payload_bytes = &message.payload;
         let payload_str = std::str::from_utf8(payload_bytes).unwrap_or("");
@@ -861,9 +858,10 @@ async fn js_consume(
         }));
 
         if ack {
-            message.ack().await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("js_consume ack failed: {}", e))
-            })?;
+            message
+                .ack()
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("js_consume ack failed: {}", e)))?;
         }
     }
 
@@ -940,9 +938,10 @@ async fn js_stream_info(
         ToolError::ExecutionFailed(format!("js_stream_info: '{}': {}", stream_name, e))
     })?;
 
-    let info = stream.info().await.map_err(|e| {
-        ToolError::ExecutionFailed(format!("js_stream_info fetch failed: {}", e))
-    })?;
+    let info = stream
+        .info()
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("js_stream_info fetch failed: {}", e)))?;
 
     Ok(serde_json::json!({
         "status": "success",
@@ -983,9 +982,9 @@ fn encode_object_data(cfg: &NatsConfig) -> Result<Vec<u8>, ToolError> {
         None => Ok(Vec::new()),
         Some(serde_json::Value::String(s)) => {
             if cfg.encoding == "base64" {
-                BASE64.decode(s).map_err(|e| {
-                    ToolError::Configuration(format!("base64 decode failed: {}", e))
-                })
+                BASE64
+                    .decode(s)
+                    .map_err(|e| ToolError::Configuration(format!("base64 decode failed: {}", e)))
             } else {
                 Ok(s.as_bytes().to_vec())
             }
