@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.3](https://github.com/noetl/tools/compare/v2.19.2...v2.19.3) (2026-06-06)
+
+### Bug Fixes
+
+* **python:** accept nested script.source.code (inline) shape ([d444345](https://github.com/noetl/tools/commit/d444345763a768909e2de4c577e1b62e60cc9381)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/ai-meta#63](https://github.com/noetl/ai-meta/issues/63) [#32](https://github.com/noetl/tools/issues/32) [noetl/ai-meta#63](https://github.com/noetl/ai-meta/issues/63)
+
 ## [2.19.2](https://github.com/noetl/tools/compare/v2.19.1...v2.19.2) (2026-06-06)
 
 ### Bug Fixes
