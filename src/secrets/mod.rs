@@ -1,10 +1,10 @@
-//! Secret-provider registry for the `secrets` / `secret_manager` tools.
+//! Secret-provider registry for the `secrets` tool.
 //!
 //! Phase 3 of the Secrets Wallet (noetl/ai-meta#61): resolve a secret
 //! reference against an external secret manager at step-execution time, so a
 //! playbook references a secret by name instead of carrying the value. Each
-//! backend implements [`SecretProvider`]; the `secrets` / `secret_manager`
-//! tools dispatch on the config's `provider` field.
+//! backend implements [`SecretProvider`]; the `secrets` tool dispatches on the
+//! config's `provider` field.
 //!
 //! The first provider is [`GcpSecretManager`] (matches the GCP-first KMS
 //! choice for the KEK in noetl-server). AWS Secrets Manager, Azure Key Vault,

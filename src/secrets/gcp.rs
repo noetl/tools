@@ -166,7 +166,7 @@ impl SecretProvider for GcpSecretManager {
             provider = PROVIDER,
             secret = %secret.name,
             version = %version,
-            "secret_manager.fetch"
+            "secrets.fetch"
         );
 
         let resp = self
