@@ -718,10 +718,8 @@ mod tests {
         // Both paths set + readable → returns Some(config) with the
         // identity threaded into FlightTlsConfig.  Uses an in-tempdir
         // dummy PEM since the test doesn't actually negotiate TLS.
-        let dir = std::env::temp_dir().join(format!(
-            "noetl-tools-mtls-test-{}",
-            std::process::id(),
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("noetl-tools-mtls-test-{}", std::process::id(),));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("client.crt");
         let key_path = dir.join("client.key");

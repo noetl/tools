@@ -86,7 +86,6 @@ const MIN_TIMEOUT_SECS: f64 = 0.1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     // --- endpoint resolution ---
-
     /// Direct MCP server endpoint URL (e.g. `http://host:8080/mcp`).
     /// Takes precedence over `server` + env var resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,7 +113,6 @@ pub struct McpConfig {
     pub name: Option<String>,
 
     // --- request ---
-
     /// JSON-RPC method.  Recognised shortcuts:
     /// - `tools/call` (default) — call a named tool with `arguments`.
     /// - `tools/list` — list tools advertised by the server.
@@ -128,7 +126,6 @@ pub struct McpConfig {
     pub action: Option<String>,
 
     // --- tools/call ---
-
     /// Tool name for `tools/call`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -146,19 +143,16 @@ pub struct McpConfig {
     pub args: Option<serde_json::Value>,
 
     // --- passthrough ---
-
     /// Params for non-standard JSON-RPC methods.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 
     // --- timing ---
-
     /// Request timeout in seconds.  Clamped by `NOETL_WORKER_COMMAND_TIMEOUT_SECONDS`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<serde_json::Value>,
 
     // --- protocol ---
-
     /// JSON-RPC request id (default: 1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
@@ -250,11 +244,7 @@ impl Tool for McpTool {
         let timeout_secs = resolve_timeout(&mcp_cfg.timeout);
         let request_id = mcp_cfg.request_id.unwrap_or(1);
 
-        let log_level = if method == "health" {
-            "debug"
-        } else {
-            "debug"
-        };
+        let log_level = if method == "health" { "debug" } else { "debug" };
         let _ = log_level; // level selection reserved for tracing macro expansions below
 
         tracing::debug!(
@@ -377,10 +367,7 @@ async fn execute_mcp(
         .client_version
         .clone()
         .unwrap_or_else(|| "0".to_string());
-    let capabilities = cfg
-        .capabilities
-        .clone()
-        .unwrap_or(serde_json::json!({}));
+    let capabilities = cfg.capabilities.clone().unwrap_or(serde_json::json!({}));
 
     let init_payload = serde_json::json!({
         "jsonrpc": "2.0",
@@ -454,7 +441,9 @@ fn build_method_params(
                 .tool
                 .clone()
                 .or_else(|| cfg.tool_name.clone())
-                .ok_or_else(|| McpError::Config("mcp tool name is required for tools/call".into()))?;
+                .ok_or_else(|| {
+                    McpError::Config("mcp tool name is required for tools/call".into())
+                })?;
 
             let arguments = cfg
                 .arguments
@@ -467,11 +456,7 @@ fn build_method_params(
                 "name": tool_name,
                 "arguments": arguments,
             });
-            Ok((
-                params,
-                serde_json::Value::String(tool_name),
-                arguments,
-            ))
+            Ok((params, serde_json::Value::String(tool_name), arguments))
         }
         "tools/list" => Ok((
             serde_json::json!({}),
@@ -479,28 +464,19 @@ fn build_method_params(
             serde_json::Value::Null,
         )),
         _ => {
-            let params = cfg
-                .params
-                .clone()
-                .unwrap_or(serde_json::json!({}));
+            let params = cfg.params.clone().unwrap_or(serde_json::json!({}));
             let params = coerce_to_object(params, "params")?;
             Ok((params, serde_json::Value::Null, serde_json::Value::Null))
         }
     }
 }
 
-fn coerce_to_object(
-    v: serde_json::Value,
-    field: &str,
-) -> Result<serde_json::Value, McpError> {
+fn coerce_to_object(v: serde_json::Value, field: &str) -> Result<serde_json::Value, McpError> {
     match v {
         serde_json::Value::Object(_) => Ok(v),
-        serde_json::Value::String(s) => serde_json::from_str(&s).map_err(|e| {
-            McpError::Config(format!("mcp {field} must be a JSON object: {e}"))
-        }),
-        _ => Err(McpError::Config(format!(
-            "mcp {field} must be an object"
-        ))),
+        serde_json::Value::String(s) => serde_json::from_str(&s)
+            .map_err(|e| McpError::Config(format!("mcp {field} must be a JSON object: {e}"))),
+        _ => Err(McpError::Config(format!("mcp {field} must be an object"))),
     }
 }
 
@@ -601,7 +577,11 @@ pub(crate) fn parse_mcp_envelope(body: &str, context: &str) -> Result<serde_json
         .collect();
 
     if data_lines.is_empty() {
-        let preview: String = body.split_whitespace().take(40).collect::<Vec<_>>().join(" ");
+        let preview: String = body
+            .split_whitespace()
+            .take(40)
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(McpError::Envelope(format!(
             "Invalid MCP response for {context}: {preview}"
         )));
@@ -698,7 +678,13 @@ pub(crate) fn resolve_endpoint(cfg: &McpConfig) -> Result<String, McpError> {
 pub(crate) fn server_env_name(server: &str) -> String {
     let safe: String = server
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("NOETL_MCP_{safe}_ENDPOINT")
 }
@@ -757,9 +743,15 @@ pub(crate) fn resolve_health_url(endpoint: &str) -> String {
 /// Chain: `config.timeout` → `NOETL_MCP_REQUEST_TIMEOUT_SECONDS` env → 60s default,
 /// then clamp to `NOETL_WORKER_COMMAND_TIMEOUT_SECONDS` (default 180s).
 pub(crate) fn resolve_timeout(timeout_value: &Option<serde_json::Value>) -> f64 {
-    let default_timeout = read_float_env("NOETL_MCP_REQUEST_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECS);
-    let command_budget =
-        read_float_env("NOETL_WORKER_COMMAND_TIMEOUT_SECONDS", DEFAULT_COMMAND_TIMEOUT_SECS).max(1.0);
+    let default_timeout = read_float_env(
+        "NOETL_MCP_REQUEST_TIMEOUT_SECONDS",
+        DEFAULT_MCP_TIMEOUT_SECS,
+    );
+    let command_budget = read_float_env(
+        "NOETL_WORKER_COMMAND_TIMEOUT_SECONDS",
+        DEFAULT_COMMAND_TIMEOUT_SECS,
+    )
+    .max(1.0);
 
     let requested = match timeout_value {
         None => return (default_timeout).min(command_budget),
@@ -768,9 +760,7 @@ pub(crate) fn resolve_timeout(timeout_value: &Option<serde_json::Value>) -> f64 
         Some(serde_json::Value::String(s)) if s.trim().is_empty() => {
             return (default_timeout).min(command_budget)
         }
-        Some(serde_json::Value::String(s)) => {
-            s.trim().parse::<f64>().unwrap_or(default_timeout)
-        }
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().unwrap_or(default_timeout),
         Some(_) => return (default_timeout).min(command_budget),
     };
 
@@ -929,10 +919,7 @@ mod tests {
             client_version: None,
             capabilities: None,
         };
-        assert_eq!(
-            resolve_endpoint(&cfg).unwrap(),
-            "http://localhost:8080/mcp"
-        );
+        assert_eq!(resolve_endpoint(&cfg).unwrap(), "http://localhost:8080/mcp");
     }
 
     #[test]
@@ -958,10 +945,7 @@ mod tests {
             client_version: None,
             capabilities: None,
         };
-        assert_eq!(
-            resolve_endpoint(&cfg).unwrap(),
-            "http://localhost:8080/mcp"
-        );
+        assert_eq!(resolve_endpoint(&cfg).unwrap(), "http://localhost:8080/mcp");
     }
 
     #[test]
@@ -1028,7 +1012,10 @@ mod tests {
 
     #[test]
     fn test_server_env_name_simple() {
-        assert_eq!(server_env_name("kubernetes"), "NOETL_MCP_KUBERNETES_ENDPOINT");
+        assert_eq!(
+            server_env_name("kubernetes"),
+            "NOETL_MCP_KUBERNETES_ENDPOINT"
+        );
     }
 
     #[test]
@@ -1038,7 +1025,10 @@ mod tests {
 
     #[test]
     fn test_server_env_name_dots() {
-        assert_eq!(server_env_name("my.server.v2"), "NOETL_MCP_MY_SERVER_V2_ENDPOINT");
+        assert_eq!(
+            server_env_name("my.server.v2"),
+            "NOETL_MCP_MY_SERVER_V2_ENDPOINT"
+        );
     }
 
     // --- timeout resolution ---
@@ -1283,8 +1273,15 @@ mod tests {
             client_version: None,
             capabilities: None,
         };
-        let result = execute_mcp(&cfg, "test", cfg.endpoint.as_deref().unwrap(), "health", 10.0, 1)
-            .await;
+        let result = execute_mcp(
+            &cfg,
+            "test",
+            cfg.endpoint.as_deref().unwrap(),
+            "health",
+            10.0,
+            1,
+        )
+        .await;
         assert!(result.is_ok(), "health probe failed: {:?}", result);
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");

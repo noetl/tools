@@ -16,7 +16,6 @@ pub mod context;
 pub mod error;
 pub mod registry;
 pub mod result;
-pub mod secrets;
 pub mod template;
 pub mod tools;
 
