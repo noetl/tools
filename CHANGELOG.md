@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.2](https://github.com/noetl/tools/compare/v2.19.1...v2.19.2) (2026-06-06)
+
+### Bug Fixes
+
+* **secrets:** remove the standalone secrets tool + provider module ([f2591ad](https://github.com/noetl/tools/commit/f2591adf58a79a894e6ade58a2e69827c7c448b7)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.19.1](https://github.com/noetl/tools/compare/v2.19.0...v2.19.1) (2026-06-06)
 
 ### Bug Fixes
