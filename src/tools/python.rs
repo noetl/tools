@@ -47,11 +47,45 @@ fn extract_result_from_stdout(stdout: &str) -> (Option<serde_json::Value>, Strin
     (captured, cleaned)
 }
 
+/// Source of a Python script inside the richer `script:` block.
+///
+/// `type: inline` carries the code directly — the nested analog of the flat
+/// `code:` field. `type: file` / `gcs` / `http` name an external script via
+/// the script's `uri`; loading those is not yet supported here (see
+/// [`PythonConfig::resolve_code`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PythonScriptSource {
+    /// `inline` (default) / `file` / `gcs` / `http`.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    /// Inline code (when `type: inline`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// The `script:` block — the richer script-loading shape canonical v10
+/// fixtures use (`script: { uri, source: { type, code } }`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PythonScript {
+    /// Where the script lives: `inline`, a file path, or a gcs/http URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PythonScriptSource>,
+}
+
 /// Python tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonConfig {
-    /// Python code to execute.
-    pub code: String,
+    /// Python code to execute (flat form).  Either this or `script` must
+    /// supply the code — see [`PythonConfig::resolve_code`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+
+    /// Richer script-loading block.  The `inline` source type is the nested
+    /// analog of `code:`; external sources aren't loaded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<PythonScript>,
 
     /// Arguments passed to the script (available as 'args' dict).
     #[serde(default)]
@@ -76,6 +110,39 @@ pub struct PythonConfig {
 
 fn default_python() -> String {
     std::env::var("PYTHON_PATH").unwrap_or_else(|_| "python3".to_string())
+}
+
+impl PythonConfig {
+    /// Resolve the effective Python source.
+    ///
+    /// Accepts both the flat `code:` field and the nested
+    /// `script.source.code` (inline) shape that canonical v10 fixtures use.
+    /// The flat `code:` wins when both are present.  External script sources
+    /// (`file` / `gcs` / `http`) are not yet loaded — they produce a clear
+    /// error instead of a confusing `missing field code` decode failure
+    /// (noetl/ai-meta#63).
+    pub fn resolve_code(&self) -> Result<&str, ToolError> {
+        if let Some(code) = self.code.as_deref() {
+            return Ok(code);
+        }
+        if let Some(source) = self.script.as_ref().and_then(|s| s.source.as_ref()) {
+            let kind = source.source_type.as_deref().unwrap_or("inline");
+            if kind == "inline" {
+                return source.code.as_deref().ok_or_else(|| {
+                    ToolError::Configuration(
+                        "python script `source.type: inline` has no `code`".to_string(),
+                    )
+                });
+            }
+            return Err(ToolError::Configuration(format!(
+                "python script `source.type: {kind}` (external script loading) is not yet \
+                 supported; provide inline code (flat `code:` or `script.source.code`)"
+            )));
+        }
+        Err(ToolError::Configuration(
+            "python config has no code: set `code:` or `script.source.code`".to_string(),
+        ))
+    }
 }
 
 /// Python script execution tool.
@@ -339,6 +406,7 @@ impl Tool for PythonTool {
         ctx: &ExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let python_config = self.parse_config(config, ctx)?;
+        let code = python_config.resolve_code()?;
 
         let timeout_duration = python_config
             .timeout_seconds
@@ -346,14 +414,14 @@ impl Tool for PythonTool {
             .map(Duration::from_secs);
 
         tracing::debug!(
-            code_len = python_config.code.len(),
+            code_len = code.len(),
             python = %python_config.python,
             timeout = ?timeout_duration,
             "Executing Python script"
         );
 
         self.execute_code(
-            &python_config.code,
+            code,
             &python_config.args,
             &python_config.env,
             &python_config.python,
@@ -378,8 +446,63 @@ mod tests {
         });
 
         let config: PythonConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.code, "print('hello')");
+        assert_eq!(config.resolve_code().unwrap(), "print('hello')");
         assert!(config.args.contains_key("name"));
+    }
+
+    #[test]
+    fn test_python_inline_script_shape_resolves_code() {
+        // Canonical v10 script-loading shape (root_scripts/test_script_loading):
+        // script: { uri: inline, source: { type: inline, code } }.
+        let json = serde_json::json!({
+            "script": {
+                "uri": "inline",
+                "source": { "type": "inline", "code": "result = {'ok': 1}" }
+            }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.resolve_code().unwrap(), "result = {'ok': 1}");
+    }
+
+    #[test]
+    fn test_python_source_without_type_defaults_inline() {
+        let json = serde_json::json!({
+            "script": { "source": { "code": "x = 1" } }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.resolve_code().unwrap(), "x = 1");
+    }
+
+    #[test]
+    fn test_flat_code_wins_over_script() {
+        let json = serde_json::json!({
+            "code": "flat",
+            "script": { "source": { "type": "inline", "code": "nested" } }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.resolve_code().unwrap(), "flat");
+    }
+
+    #[test]
+    fn test_external_script_source_errors_clearly() {
+        // file / gcs / http loading is not implemented yet — must be a clear
+        // error, not a confusing missing-field decode failure.
+        let json = serde_json::json!({
+            "script": { "uri": "scripts/run.py", "source": { "type": "file" } }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        let err = config.resolve_code().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("file"), "got: {msg}");
+        assert!(msg.contains("not yet supported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_no_code_anywhere_errors() {
+        let json = serde_json::json!({ "args": {} });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        let err = config.resolve_code().unwrap_err();
+        assert!(format!("{err}").contains("no code"), "got: {err}");
     }
 
     #[test]
