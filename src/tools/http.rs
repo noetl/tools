@@ -294,6 +294,7 @@ impl HttpTool {
             stderr: None,
             exit_code: Some(if is_success { 0 } else { 1 }),
             duration_ms: Some(duration_ms),
+            pending_callback: None,
         };
 
         Ok(result)
