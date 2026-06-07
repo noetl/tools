@@ -473,6 +473,39 @@ globals().update(args)
 # User code
 {}
 
+# Legacy `main()` convention (noetl/ai-meta#65): the
+# script_execution/* fixtures + the Python (legacy) tool support
+# function-based scripts that define a `main(...)` callable instead
+# of setting the `result` global directly.  When the user code
+# didn't set a non-None `result` AND defines a callable `main`,
+# call it with the matching args and capture its return value.
+# Mirrors noetl/tools/python/executor.py:_invoke_main — binds
+# main's named params from `args` by name, forwards all args when
+# main accepts `**kwargs`, and awaits async `main` via asyncio.run.
+if globals().get('result', None) is None:
+    __noetl_main = globals().get('main', None)
+    if callable(__noetl_main):
+        import inspect as __noetl_inspect
+        __noetl_sig = __noetl_inspect.signature(__noetl_main)
+        __noetl_kwargs = {{}}
+        __noetl_var_kw = any(
+            __p.kind == __p.VAR_KEYWORD
+            for __p in __noetl_sig.parameters.values()
+        )
+        for __pname, __p in __noetl_sig.parameters.items():
+            if __p.kind in (__p.VAR_POSITIONAL, __p.VAR_KEYWORD):
+                continue
+            if __pname in args:
+                __noetl_kwargs[__pname] = args[__pname]
+        if __noetl_var_kw:
+            for __k, __v in args.items():
+                __noetl_kwargs.setdefault(__k, __v)
+        if __noetl_inspect.iscoroutinefunction(__noetl_main):
+            import asyncio as __noetl_asyncio
+            result = __noetl_asyncio.run(__noetl_main(**__noetl_kwargs))
+        else:
+            result = __noetl_main(**__noetl_kwargs)
+
 # Emit the user-set `result` global as JSON on a single line
 # prefixed with the noetl marker.  Missing / non-JSON-serializable
 # results fall back to `null` so the tool can still complete
@@ -985,6 +1018,112 @@ mod tests {
             data.get("message").and_then(|v| v.as_str()),
             Some("hot"),
             "captured result must expose `message`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_python_main_function_convention() {
+        // The script_execution/* fixtures + the Python (legacy) tool
+        // support function-based scripts: a `main(...)` callable whose
+        // return value becomes the result.  noetl/ai-meta#65.
+        let tool = PythonTool::new();
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), serde_json::json!("NoETL"));
+        args.insert("count".to_string(), serde_json::json!(3));
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let code = r#"
+def main(name="World", count=1):
+    messages = [f"Hello, {name}! (#{i+1})" for i in range(count)]
+    return {"status": "success", "messages": messages, "total": count}
+"#;
+        let result = tool
+            .execute_code(code, &args, &env, "python3", None, None, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("main() return becomes data");
+        assert_eq!(data.get("status").and_then(|v| v.as_str()), Some("success"));
+        assert_eq!(data.get("total").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(
+            data.get("messages").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(3),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_python_explicit_result_wins_over_main() {
+        // When the user code sets `result` directly AND defines a
+        // `main`, the explicit `result` wins — main() is not called.
+        let tool = PythonTool::new();
+        let args = HashMap::new();
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let code = r#"
+def main():
+    return {"from": "main"}
+result = {"from": "explicit"}
+"#;
+        let result = tool
+            .execute_code(code, &args, &env, "python3", None, None, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_success());
+        let data = result.data.expect("explicit result");
+        assert_eq!(data.get("from").and_then(|v| v.as_str()), Some("explicit"));
+    }
+
+    #[tokio::test]
+    async fn test_python_async_main_function() {
+        // Async `main` is awaited via asyncio.run, matching the
+        // legacy `_invoke_main` coroutine path.
+        let tool = PythonTool::new();
+        let args = HashMap::new();
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let code = r#"
+async def main():
+    return {"async": True, "value": 42}
+"#;
+        let result = tool
+            .execute_code(code, &args, &env, "python3", None, None, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("async main() return becomes data");
+        assert_eq!(data.get("async").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(data.get("value").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_python_main_with_var_kwargs() {
+        // A `main(**kwargs)` receives all args.
+        let tool = PythonTool::new();
+        let mut args = HashMap::new();
+        args.insert("a".to_string(), serde_json::json!(1));
+        args.insert("b".to_string(), serde_json::json!(2));
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let code = r#"
+def main(**kwargs):
+    return {"sum": sum(v for v in kwargs.values() if isinstance(v, int))}
+"#;
+        let result = tool
+            .execute_code(code, &args, &env, "python3", None, None, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        assert_eq!(
+            result.data.unwrap().get("sum").and_then(|v| v.as_i64()),
+            Some(3),
         );
     }
 
