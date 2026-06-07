@@ -9,11 +9,18 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::auth::GcpAuth;
 use crate::context::ExecutionContext;
 use crate::error::ToolError;
 use crate::registry::{Tool, ToolConfig};
 use crate::result::{ToolResult, ToolStatus};
 use crate::template::TemplateEngine;
+
+/// GCS read scope — narrower than full cloud-platform.
+const GCS_READ_SCOPES: &[&str] = &["https://www.googleapis.com/auth/devstorage.read_only"];
+
+/// Default per-fetch timeout (seconds) for `gcs` / `http` script loaders.
+const DEFAULT_LOADER_TIMEOUT_SECS: u64 = 30;
 
 /// Sentinel string the wrapper script uses to mark the JSON line
 /// carrying the user-set `result` global.  Chosen to be improbable
@@ -50,9 +57,16 @@ fn extract_result_from_stdout(stdout: &str) -> (Option<serde_json::Value>, Strin
 /// Source of a Python script inside the richer `script:` block.
 ///
 /// `type: inline` carries the code directly — the nested analog of the flat
-/// `code:` field. `type: file` / `gcs` / `http` name an external script via
-/// the script's `uri`; loading those is not yet supported here (see
-/// [`PythonConfig::resolve_code`]).
+/// `code:` field.  `type: file` / `gcs` / `http` name an external script,
+/// loaded by [`PythonTool::load_script_code`]:
+///
+/// - **file** — the script's `uri` is a local filesystem path; read it.
+/// - **gcs** — the script's `uri` is a `gs://bucket/object` URL; download
+///   via the GCS JSON API with a GCP ADC token (workload identity on
+///   GKE, `GOOGLE_APPLICATION_CREDENTIALS` / `gcloud` locally).
+/// - **http** — GET the URL in `source.endpoint` (falling back to the
+///   script's `uri`), honoring `source.method` (default GET) +
+///   `source.timeout` (seconds).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PythonScriptSource {
     /// `inline` (default) / `file` / `gcs` / `http`.
@@ -61,6 +75,21 @@ pub struct PythonScriptSource {
     /// Inline code (when `type: inline`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Credential alias for `gcs` / `http` sources that need auth.
+    /// On GKE, GCS uses workload-identity ADC regardless; this field
+    /// is accepted for forward-compat + parity with the YAML shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// HTTP source endpoint URL (when `type: http`).  When absent, the
+    /// loader falls back to the script's `uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// HTTP method for `type: http` (default `GET`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Per-fetch timeout in seconds for `gcs` / `http` sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// The `script:` block — the richer script-loading shape canonical v10
@@ -112,15 +141,118 @@ fn default_python() -> String {
     std::env::var("PYTHON_PATH").unwrap_or_else(|_| "python3".to_string())
 }
 
+/// Where a Python script's body should come from.  Produced by
+/// [`PythonConfig::resolve_source`]; loaded by
+/// [`PythonTool::load_script_code`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonSource {
+    /// Code is already present (flat `code:` or `script.source.code`).
+    Inline(String),
+    /// Read the body from a local filesystem path.
+    File { path: String },
+    /// Download `gs://bucket/object` via the GCS JSON API.
+    Gcs { uri: String },
+    /// HTTP GET the body from `endpoint` (method default GET).
+    Http {
+        endpoint: String,
+        method: String,
+        timeout_secs: u64,
+    },
+}
+
 impl PythonConfig {
     /// Resolve the effective Python source.
     ///
-    /// Accepts both the flat `code:` field and the nested
-    /// `script.source.code` (inline) shape that canonical v10 fixtures use.
-    /// The flat `code:` wins when both are present.  External script sources
-    /// (`file` / `gcs` / `http`) are not yet loaded — they produce a clear
-    /// error instead of a confusing `missing field code` decode failure
-    /// (noetl/ai-meta#63).
+    /// Accepts the flat `code:` field, the nested `script.source.code`
+    /// (inline) shape, and the three external shapes (`file` / `gcs` /
+    /// `http`).  The flat `code:` wins when both inline forms are
+    /// present.  External sources are loaded by
+    /// [`PythonTool::load_script_code`]; this method only classifies
+    /// the source (it does no I/O).
+    ///
+    /// noetl/ai-meta#65 implemented the external loaders that #63's
+    /// inline-only resolver returned a "not yet supported" error for.
+    pub fn resolve_source(&self) -> Result<PythonSource, ToolError> {
+        if let Some(code) = self.code.as_deref() {
+            return Ok(PythonSource::Inline(code.to_string()));
+        }
+        let script = self.script.as_ref();
+        let source = script.and_then(|s| s.source.as_ref());
+        let kind = source
+            .and_then(|s| s.source_type.as_deref())
+            .unwrap_or("inline");
+
+        match kind {
+            "inline" => source
+                .and_then(|s| s.code.as_deref())
+                .map(|c| PythonSource::Inline(c.to_string()))
+                .ok_or_else(|| {
+                    ToolError::Configuration(
+                        "python script `source.type: inline` has no `code`".to_string(),
+                    )
+                }),
+            "file" => {
+                let path = script.and_then(|s| s.uri.as_deref()).ok_or_else(|| {
+                    ToolError::Configuration(
+                        "python script `source.type: file` requires `script.uri` (the file path)"
+                            .to_string(),
+                    )
+                })?;
+                Ok(PythonSource::File {
+                    path: path.to_string(),
+                })
+            }
+            "gcs" => {
+                let uri = script.and_then(|s| s.uri.as_deref()).ok_or_else(|| {
+                    ToolError::Configuration(
+                        "python script `source.type: gcs` requires `script.uri` (a gs:// URL)"
+                            .to_string(),
+                    )
+                })?;
+                Ok(PythonSource::Gcs {
+                    uri: uri.to_string(),
+                })
+            }
+            "http" => {
+                // The actual URL lives in `source.endpoint`; the script
+                // `uri` is a label in the canonical fixtures.  Fall back
+                // to `uri` when `endpoint` is absent.
+                let endpoint = source
+                    .and_then(|s| s.endpoint.as_deref())
+                    .or_else(|| script.and_then(|s| s.uri.as_deref()))
+                    .ok_or_else(|| {
+                        ToolError::Configuration(
+                            "python script `source.type: http` requires `source.endpoint` \
+                             (the URL to GET) or a `script.uri`"
+                                .to_string(),
+                        )
+                    })?;
+                let method = source
+                    .and_then(|s| s.method.as_deref())
+                    .unwrap_or("GET")
+                    .to_uppercase();
+                let timeout_secs = source
+                    .and_then(|s| s.timeout)
+                    .unwrap_or(DEFAULT_LOADER_TIMEOUT_SECS);
+                Ok(PythonSource::Http {
+                    endpoint: endpoint.to_string(),
+                    method,
+                    timeout_secs,
+                })
+            }
+            other => Err(ToolError::Configuration(format!(
+                "python script `source.type: {other}` is unknown; expected one of \
+                 inline | file | gcs | http"
+            ))),
+        }
+    }
+
+    /// Back-compat accessor for the inline fast path.  Returns the
+    /// borrowed inline code, or an error for external sources (which
+    /// require async I/O — use [`PythonTool::load_script_code`]).
+    ///
+    /// Retained so existing call sites / tests that only ever pass
+    /// inline code keep working without an async context.
     pub fn resolve_code(&self) -> Result<&str, ToolError> {
         if let Some(code) = self.code.as_deref() {
             return Ok(code);
@@ -135,14 +267,52 @@ impl PythonConfig {
                 });
             }
             return Err(ToolError::Configuration(format!(
-                "python script `source.type: {kind}` (external script loading) is not yet \
-                 supported; provide inline code (flat `code:` or `script.source.code`)"
+                "python script `source.type: {kind}` requires async loading; \
+                 call PythonTool::load_script_code"
             )));
         }
         Err(ToolError::Configuration(
             "python config has no code: set `code:` or `script.source.code`".to_string(),
         ))
     }
+}
+
+/// Parse a `gs://bucket/object/path` URI into `(bucket, object)`.
+/// The object key is returned URL-unencoded; the caller is
+/// responsible for percent-encoding it into the GCS JSON API path.
+fn parse_gcs_uri(uri: &str) -> Result<(String, String), ToolError> {
+    let rest = uri.strip_prefix("gs://").ok_or_else(|| {
+        ToolError::Configuration(format!(
+            "gcs script uri must start with `gs://`, got `{uri}`"
+        ))
+    })?;
+    let (bucket, object) = rest.split_once('/').ok_or_else(|| {
+        ToolError::Configuration(format!(
+            "gcs script uri `{uri}` has no object path after the bucket"
+        ))
+    })?;
+    if bucket.is_empty() || object.is_empty() {
+        return Err(ToolError::Configuration(format!(
+            "gcs script uri `{uri}` has an empty bucket or object"
+        )));
+    }
+    Ok((bucket.to_string(), object.to_string()))
+}
+
+/// Percent-encode a GCS object key for the JSON API path segment.
+/// Slashes and other reserved chars must be encoded so the object
+/// name lands in a single path segment.
+fn encode_gcs_object(object: &str) -> String {
+    let mut out = String::with_capacity(object.len() * 2);
+    for byte in object.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Python script execution tool.
@@ -153,6 +323,10 @@ impl PythonConfig {
 /// - Exit code determines success/failure
 pub struct PythonTool {
     template_engine: TemplateEngine,
+    /// HTTP client for `type: http` script loading.
+    http_client: reqwest::Client,
+    /// GCP ADC auth for `type: gcs` script loading.
+    gcp_auth: GcpAuth,
 }
 
 impl PythonTool {
@@ -160,7 +334,93 @@ impl PythonTool {
     pub fn new() -> Self {
         Self {
             template_engine: TemplateEngine::new(),
+            http_client: reqwest::Client::new(),
+            gcp_auth: GcpAuth::new(),
         }
+    }
+
+    /// Load the Python script body from whichever source the config
+    /// names — inline / file / gcs / http.  noetl/ai-meta#65.
+    pub async fn load_script_code(&self, cfg: &PythonConfig) -> Result<String, ToolError> {
+        match cfg.resolve_source()? {
+            PythonSource::Inline(code) => Ok(code),
+            PythonSource::File { path } => self.load_from_file(&path).await,
+            PythonSource::Gcs { uri } => self.load_from_gcs(&uri).await,
+            PythonSource::Http {
+                endpoint,
+                method,
+                timeout_secs,
+            } => self.load_from_http(&endpoint, &method, timeout_secs).await,
+        }
+    }
+
+    /// Read a script body from a local filesystem path.
+    async fn load_from_file(&self, path: &str) -> Result<String, ToolError> {
+        tokio::fs::read_to_string(path).await.map_err(|e| {
+            ToolError::Io(format!("python script file `{path}` could not be read: {e}"))
+        })
+    }
+
+    /// Download a script body from `gs://bucket/object` via the GCS
+    /// JSON API, authenticating with a GCP ADC token.  On GKE this
+    /// rides workload identity; locally it uses
+    /// `GOOGLE_APPLICATION_CREDENTIALS` / `gcloud`.
+    async fn load_from_gcs(&self, uri: &str) -> Result<String, ToolError> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let token = self.gcp_auth.get_token(GCS_READ_SCOPES).await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{bucket}/o/{}?alt=media",
+            encode_gcs_object(&object)
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(DEFAULT_LOADER_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("gcs fetch `{uri}` failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!(
+                "gcs fetch `{uri}` returned HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            )));
+        }
+        resp.text()
+            .await
+            .map_err(|e| ToolError::Http(format!("gcs fetch `{uri}` body read failed: {e}")))
+    }
+
+    /// HTTP GET (or other method) a script body from `endpoint`.
+    async fn load_from_http(
+        &self,
+        endpoint: &str,
+        method: &str,
+        timeout_secs: u64,
+    ) -> Result<String, ToolError> {
+        let req_method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| {
+            ToolError::Configuration(format!("python http script: invalid method `{method}`"))
+        })?;
+        let resp = self
+            .http_client
+            .request(req_method, endpoint)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("http fetch `{endpoint}` failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!(
+                "http fetch `{endpoint}` returned HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            )));
+        }
+        resp.text()
+            .await
+            .map_err(|e| ToolError::Http(format!("http fetch `{endpoint}` body read failed: {e}")))
     }
 
     /// Execute Python code.
@@ -407,7 +667,7 @@ impl Tool for PythonTool {
         ctx: &ExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let python_config = self.parse_config(config, ctx)?;
-        let code = python_config.resolve_code()?;
+        let code = self.load_script_code(&python_config).await?;
 
         let timeout_duration = python_config
             .timeout_seconds
@@ -422,7 +682,7 @@ impl Tool for PythonTool {
         );
 
         self.execute_code(
-            code,
+            &code,
             &python_config.args,
             &python_config.env,
             &python_config.python,
@@ -485,17 +745,152 @@ mod tests {
     }
 
     #[test]
-    fn test_external_script_source_errors_clearly() {
-        // file / gcs / http loading is not implemented yet — must be a clear
-        // error, not a confusing missing-field decode failure.
+    fn test_resolve_source_classifies_file() {
         let json = serde_json::json!({
             "script": { "uri": "scripts/run.py", "source": { "type": "file" } }
         });
         let config: PythonConfig = serde_json::from_value(json).unwrap();
-        let err = config.resolve_code().unwrap_err();
+        assert_eq!(
+            config.resolve_source().unwrap(),
+            PythonSource::File {
+                path: "scripts/run.py".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_classifies_gcs() {
+        let json = serde_json::json!({
+            "script": {
+                "uri": "gs://my-bucket/scripts/run.py",
+                "source": { "type": "gcs", "auth": "gcp_cred" }
+            }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.resolve_source().unwrap(),
+            PythonSource::Gcs {
+                uri: "gs://my-bucket/scripts/run.py".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_classifies_http_endpoint_over_uri() {
+        // The HTTP loader prefers `source.endpoint`; the script `uri`
+        // is just a label in the canonical fixtures.
+        let json = serde_json::json!({
+            "script": {
+                "uri": "hello.py",
+                "source": {
+                    "type": "http",
+                    "endpoint": "https://example.com/hello.py",
+                    "method": "get",
+                    "timeout": 15
+                }
+            }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.resolve_source().unwrap(),
+            PythonSource::Http {
+                endpoint: "https://example.com/hello.py".to_string(),
+                method: "GET".to_string(),
+                timeout_secs: 15,
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_http_falls_back_to_uri() {
+        let json = serde_json::json!({
+            "script": {
+                "uri": "https://example.com/from-uri.py",
+                "source": { "type": "http" }
+            }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.resolve_source().unwrap(),
+            PythonSource::Http {
+                endpoint: "https://example.com/from-uri.py".to_string(),
+                method: "GET".to_string(),
+                timeout_secs: DEFAULT_LOADER_TIMEOUT_SECS,
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_unknown_type_errors() {
+        let json = serde_json::json!({
+            "script": { "uri": "x", "source": { "type": "ftp" } }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        let err = config.resolve_source().unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("file"), "got: {msg}");
-        assert!(msg.contains("not yet supported"), "got: {msg}");
+        assert!(msg.contains("ftp"), "got: {msg}");
+        assert!(msg.contains("inline | file | gcs | http"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_source_file_requires_uri() {
+        let json = serde_json::json!({
+            "script": { "source": { "type": "file" } }
+        });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        let err = config.resolve_source().unwrap_err();
+        assert!(format!("{err}").contains("script.uri"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri() {
+        assert_eq!(
+            parse_gcs_uri("gs://bucket/a/b/c.py").unwrap(),
+            ("bucket".to_string(), "a/b/c.py".to_string()),
+        );
+        assert!(parse_gcs_uri("https://x").is_err());
+        assert!(parse_gcs_uri("gs://bucket-only").is_err());
+        assert!(parse_gcs_uri("gs:///object").is_err());
+    }
+
+    #[test]
+    fn test_encode_gcs_object_percent_encodes_slashes() {
+        assert_eq!(encode_gcs_object("a/b/c.py"), "a%2Fb%2Fc.py");
+        assert_eq!(encode_gcs_object("plain.py"), "plain.py");
+        assert_eq!(encode_gcs_object("with space.py"), "with%20space.py");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_file_reads_body() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        write!(tmp, "result = {{'loaded': 'from_file'}}").unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let tool = PythonTool::new();
+        let code = tool.load_from_file(&path).await.unwrap();
+        assert_eq!(code, "result = {'loaded': 'from_file'}");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_file_missing_path_errors() {
+        let tool = PythonTool::new();
+        let err = tool
+            .load_from_file("/nonexistent/path/to/script.py")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("could not be read"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_script_code_inline_path() {
+        let json = serde_json::json!({ "code": "x = 1" });
+        let config: PythonConfig = serde_json::from_value(json).unwrap();
+        let tool = PythonTool::new();
+        assert_eq!(tool.load_script_code(&config).await.unwrap(), "x = 1");
     }
 
     #[test]
