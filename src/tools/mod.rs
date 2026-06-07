@@ -12,6 +12,7 @@
 //! - `script` - Execute scripts as Kubernetes jobs
 //! - `mcp` - MCP (Model Context Protocol) JSON-RPC bridge
 
+mod artifact;
 mod duckdb;
 mod ducklake;
 mod http;
@@ -29,6 +30,7 @@ mod snowflake;
 mod task_sequence;
 mod transfer;
 
+pub use self::artifact::ArtifactTool;
 pub use self::duckdb::DuckdbTool;
 pub use self::ducklake::DucklakeTool;
 pub use self::http::HttpTool;
@@ -66,6 +68,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(NoopTool::new());
     registry.register(TaskSequenceTool::new());
     registry.register(ResultFetchTool::new());
+    registry.register(ArtifactTool::new());
     registry.register(NatsTool::new());
     registry.register(McpTool::new());
 
