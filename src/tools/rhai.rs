@@ -255,6 +255,7 @@ impl RhaiTool {
                     stderr: None,
                     exit_code: None,
                     duration_ms: Some(duration_ms),
+                    pending_callback: None,
                 })
             }
             Err(e) => {

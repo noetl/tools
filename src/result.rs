@@ -70,6 +70,29 @@ pub struct ToolResult {
     /// Execution duration in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+
+    /// `Tool::Container` (noetl/ai-meta#43 Round 3) sets this to
+    /// `Some(true)` to signal that the tool created a long-running
+    /// external work item (a K8s Job) and the playbook step's
+    /// `call.done` will be emitted asynchronously by a separate
+    /// callback path — the worker MUST NOT emit its own `call.done`
+    /// when this is set.  The current `ToolResult.data` carries the
+    /// in-flight handle (Job name + UID) for forensics + idempotency
+    /// matching on the callback side.  All other tools omit the
+    /// field (default `None`), which the worker treats as "emit
+    /// `call.done` normally" — fully backward compatible.
+    ///
+    /// Worker-side adoption (recognising the marker + skipping the
+    /// emit) is a coordinated follow-up tracked under the same
+    /// umbrella (noetl/ai-meta#43) — until that lands, the worker
+    /// will emit `call.done` immediately, and the watcher's later
+    /// callback will be treated as stale by the server (the call.done
+    /// already arrived; the server's
+    /// `noetl_container_callback_stale_total` counter records the
+    /// race).  That's harmless during the transition — playbooks
+    /// just see early completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_callback: Option<bool>,
 }
 
 impl ToolResult {
@@ -83,6 +106,7 @@ impl ToolResult {
             stderr: None,
             exit_code: None,
             duration_ms: None,
+            pending_callback: None,
         }
     }
 
@@ -96,6 +120,7 @@ impl ToolResult {
             stderr: None,
             exit_code: None,
             duration_ms: None,
+            pending_callback: None,
         }
     }
 
@@ -112,6 +137,7 @@ impl ToolResult {
             stderr: None,
             exit_code: None,
             duration_ms: Some(duration_seconds * 1000),
+            pending_callback: None,
         }
     }
 
@@ -139,6 +165,7 @@ impl ToolResult {
             stderr: Some(stderr),
             exit_code: Some(exit_code),
             duration_ms: None,
+            pending_callback: None,
         }
     }
 
@@ -170,6 +197,7 @@ impl Default for ToolResult {
             stderr: None,
             exit_code: None,
             duration_ms: None,
+            pending_callback: None,
         }
     }
 }

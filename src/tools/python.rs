@@ -369,6 +369,7 @@ except Exception as __noetl_err:
             stderr: Some(stderr),
             exit_code: Some(exit_code),
             duration_ms: Some(duration_ms),
+            pending_callback: None,
         })
     }
 

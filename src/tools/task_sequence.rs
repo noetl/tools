@@ -301,6 +301,7 @@ impl Tool for TaskSequenceTool {
                     stderr: Some(last_stderr),
                     exit_code: Some(total_exit_code),
                     duration_ms: Some(duration_ms),
+                    pending_callback: None,
                 });
             }
         }
@@ -316,6 +317,7 @@ impl Tool for TaskSequenceTool {
             stderr: Some(last_stderr),
             exit_code: Some(total_exit_code),
             duration_ms: Some(duration_ms),
+            pending_callback: None,
         })
     }
 }
