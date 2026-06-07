@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.21.0](https://github.com/noetl/tools/compare/v2.20.0...v2.21.0) (2026-06-07)
+
+### Features
+
+* **tools:** Tool::Container + ToolResult.pending_callback marker (Round 3 of [#43](https://github.com/noetl/tools/issues/43)) ([565bc03](https://github.com/noetl/tools/commit/565bc032c2baaf87a7cf28ea00cb6f9b3de1ec59)), closes [#36](https://github.com/noetl/tools/issues/36)
+
 ## [2.20.0](https://github.com/noetl/tools/compare/v2.19.3...v2.20.0) (2026-06-07)
 
 ### Features
