@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.20.0](https://github.com/noetl/tools/compare/v2.19.3...v2.20.0) (2026-06-07)
+
+### Features
+
+* **tools:** add 'artifact' tool kind as get-only result_fetch alias ([3e8a57e](https://github.com/noetl/tools/commit/3e8a57e1d7d81fe88a974e23030034f889810260)), closes [noetl/tools#34](https://github.com/noetl/tools/issues/34) [noetl/ai-meta#64](https://github.com/noetl/ai-meta/issues/64) [#34](https://github.com/noetl/tools/issues/34) [noetl/ai-meta#64](https://github.com/noetl/ai-meta/issues/64)
+
 ## [2.19.3](https://github.com/noetl/tools/compare/v2.19.2...v2.19.3) (2026-06-06)
 
 ### Bug Fixes
