@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.23.0](https://github.com/noetl/tools/compare/v2.22.0...v2.23.0) (2026-06-07)
+
+### Features
+
+* **python:** support legacy main() function convention ([9f8550c](https://github.com/noetl/tools/commit/9f8550cb0871928a74d66f2f8156a0d77f67c71e)), closes [noetl/ai-meta#65](https://github.com/noetl/ai-meta/issues/65) [#38](https://github.com/noetl/tools/issues/38) [noetl/ai-meta#65](https://github.com/noetl/ai-meta/issues/65)
+
 ## [2.22.0](https://github.com/noetl/tools/compare/v2.21.0...v2.22.0) (2026-06-07)
 
 ### Features
