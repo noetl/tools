@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.22.0](https://github.com/noetl/tools/compare/v2.21.0...v2.22.0) (2026-06-07)
+
+### Features
+
+* **python:** external script loaders for file/gcs/http source types ([834166e](https://github.com/noetl/tools/commit/834166efa97e85bae9354fab0d2c7ecc5e5d56e9)), closes [#63](https://github.com/noetl/tools/issues/63) [noetl/ai-meta#65](https://github.com/noetl/ai-meta/issues/65) [#63](https://github.com/noetl/tools/issues/63) [noetl/ai-meta#65](https://github.com/noetl/ai-meta/issues/65)
+
 ## [2.21.0](https://github.com/noetl/tools/compare/v2.20.0...v2.21.0) (2026-06-07)
 
 ### Features
