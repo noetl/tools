@@ -77,6 +77,18 @@ struct ArtifactConfig {
     /// Required for `action: get`.  Carries the `result_ref` field
     /// alongside any other input the playbook author chose to
     /// attach (which is ignored here — only `result_ref` is read).
+    ///
+    /// noetl/ai-meta#68: accept both `input:` (the YAML form Python
+    /// fixtures write) AND `args:` (the form the Rust server's
+    /// pipeline-render path emits — noetl-server's `ToolSpec`
+    /// normalizes the YAML `input:` field name to its struct's
+    /// `args` field via a serde alias landed in
+    /// [noetl/ai-meta#56](https://github.com/noetl/ai-meta/issues/56), then
+    /// serializes back using the `args` name).  The alias here makes
+    /// the artifact tool's config deserialize regardless of which
+    /// side normalizes the name — Python fixtures + the server
+    /// pipeline path both work.
+    #[serde(alias = "args")]
     input: ArtifactInput,
 
     /// Optional pass-throughs to [`super::ResultFetchTool`] — same
@@ -263,6 +275,28 @@ mod tests {
         assert!(out.get("prefer").is_none());
         assert!(out.get("flight_endpoint").is_none());
         assert!(out.get("bearer_token").is_none());
+    }
+
+    #[test]
+    fn translate_get_accepts_args_alias_for_input() {
+        // noetl/ai-meta#68: when the artifact tool config arrives
+        // from the noetl-server pipeline path, the `input:` field
+        // has been normalized to `args:` (server-side ToolSpec
+        // serde alias from noetl/ai-meta#56).  Confirm the artifact
+        // tool's ArtifactConfig accepts the `args:` form too so
+        // both Python-fixture-native and server-normalized configs
+        // deserialize.
+        let tool = ArtifactTool::new();
+        let raw = json!({
+            "action": "get",
+            "args": { "result_ref": "noetl://execution/777/result/save_step/9" }
+        });
+        let out = tool.translate_config(&raw).expect("translate get with args: alias");
+        assert_eq!(
+            out.get("ref").and_then(|v| v.as_str()),
+            Some("noetl://execution/777/result/save_step/9"),
+            "expected the artifact tool to accept `args:` as an alias for `input:`"
+        );
     }
 
     #[test]
