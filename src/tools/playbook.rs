@@ -86,6 +86,35 @@ impl PlaybookTool {
             serde_json::json!({})
         }
     }
+
+    /// Returns `true` when the status-endpoint payload indicates a terminal
+    /// execution state and the polling loop should stop.
+    ///
+    /// The `/api/executions/{id}/status` endpoint returns a JSON object whose
+    /// shape is:
+    ///
+    /// ```json
+    /// {
+    ///   "execution_id": 12345,
+    ///   "status": "COMPLETED",
+    ///   "current_step": null,
+    ///   "progress": { "total_steps": 4, "completed_steps": 4, ... },
+    ///   "is_cancelled": false
+    /// }
+    /// ```
+    ///
+    /// Terminal states are `COMPLETED`, `FAILED`, and `CANCELLED`.
+    /// The `is_cancelled` flag is also honoured as a secondary signal because
+    /// the `status` field may briefly read `"RUNNING"` while `is_cancelled`
+    /// flips first.
+    pub(crate) fn is_terminal_status(payload: &serde_json::Value) -> bool {
+        let status_str = payload.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let is_cancelled = payload
+            .get("is_cancelled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        matches!(status_str, "COMPLETED" | "FAILED" | "CANCELLED") || is_cancelled
+    }
 }
 
 impl Default for PlaybookTool {
@@ -218,18 +247,112 @@ impl Tool for PlaybookTool {
             };
 
             if let Some(payload) = status_payload {
-                let completed = payload
-                    .get("completed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let failed = payload
-                    .get("failed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if completed || failed {
+                if Self::is_terminal_status(&payload) {
                     return Ok(ToolResult::success(payload));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Terminal-status helper ---
+
+    #[test]
+    fn test_playbook_tool_terminates_on_completed_status() {
+        let payload = serde_json::json!({
+            "execution_id": 1,
+            "status": "COMPLETED",
+            "is_cancelled": false
+        });
+        assert!(
+            PlaybookTool::is_terminal_status(&payload),
+            "COMPLETED should be terminal"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_terminates_on_failed_status() {
+        let payload = serde_json::json!({
+            "execution_id": 2,
+            "status": "FAILED",
+            "is_cancelled": false
+        });
+        assert!(
+            PlaybookTool::is_terminal_status(&payload),
+            "FAILED should be terminal"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_terminates_on_cancelled_status() {
+        let payload = serde_json::json!({
+            "execution_id": 3,
+            "status": "CANCELLED",
+            "is_cancelled": true
+        });
+        assert!(
+            PlaybookTool::is_terminal_status(&payload),
+            "CANCELLED should be terminal"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_terminates_on_is_cancelled_flag() {
+        // status field still reads RUNNING but is_cancelled has already flipped —
+        // the polling loop must honour this secondary signal.
+        let payload = serde_json::json!({
+            "execution_id": 4,
+            "status": "RUNNING",
+            "is_cancelled": true
+        });
+        assert!(
+            PlaybookTool::is_terminal_status(&payload),
+            "is_cancelled=true should be terminal even when status=RUNNING"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_keeps_polling_on_running_status() {
+        let payload = serde_json::json!({
+            "execution_id": 5,
+            "status": "RUNNING",
+            "is_cancelled": false
+        });
+        assert!(
+            !PlaybookTool::is_terminal_status(&payload),
+            "RUNNING should NOT be terminal"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_keeps_polling_when_status_missing() {
+        // A payload with no status key (e.g. unexpected server shape) must not
+        // trigger a spurious terminal exit — keep polling.
+        let payload = serde_json::json!({
+            "execution_id": 6
+        });
+        assert!(
+            !PlaybookTool::is_terminal_status(&payload),
+            "missing status key should NOT be terminal"
+        );
+    }
+
+    #[test]
+    fn test_playbook_tool_keeps_polling_on_started_status() {
+        // STARTED is an intermediate state emitted during command dispatch —
+        // not a terminal state.
+        let payload = serde_json::json!({
+            "execution_id": 7,
+            "status": "STARTED",
+            "is_cancelled": false
+        });
+        assert!(
+            !PlaybookTool::is_terminal_status(&payload),
+            "STARTED should NOT be terminal"
+        );
     }
 }
