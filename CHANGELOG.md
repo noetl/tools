@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.24.1](https://github.com/noetl/tools/compare/v2.24.0...v2.24.1) (2026-06-08)
+
+### Bug Fixes
+
+* **playbook:** terminate polling on status: COMPLETED/FAILED/CANCELLED ([8e94f4b](https://github.com/noetl/tools/commit/8e94f4b73aaf28c133efd031bfb4df5dbe8900eb)), closes [noetl/ai-meta#75](https://github.com/noetl/ai-meta/issues/75)
+
 ## [2.24.0](https://github.com/noetl/tools/compare/v2.23.1...v2.24.0) (2026-06-08)
 
 ### Features
