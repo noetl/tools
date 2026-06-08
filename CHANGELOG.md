@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.23.1](https://github.com/noetl/tools/compare/v2.23.0...v2.23.1) (2026-06-08)
+
+### Bug Fixes
+
+* **artifact:** accept `args:` as alias for `input:` in tool config ([be42bfe](https://github.com/noetl/tools/commit/be42bfed849c5dd9b4b26be9d63c5ffcb4c985d6)), closes [noetl/ai-meta#68](https://github.com/noetl/ai-meta/issues/68) [noetl/ai-meta#56](https://github.com/noetl/ai-meta/issues/56) [noetl/ai-meta#68](https://github.com/noetl/ai-meta/issues/68)
+
 ## [2.23.0](https://github.com/noetl/tools/compare/v2.22.0...v2.23.0) (2026-06-07)
 
 ### Features
