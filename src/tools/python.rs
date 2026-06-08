@@ -28,6 +28,90 @@ const DEFAULT_LOADER_TIMEOUT_SECS: u64 = 30;
 /// parsing side.
 const NOETL_RESULT_MARKER: &str = "@@__NOETL_RESULT__@@";
 
+/// Detect whether `code` contains a top-level `return` statement and,
+/// if so, wrap the entire code body in an implicit
+/// `def __noetl_step__(args, input_data, **kw):` function so the
+/// `return` is syntactically valid Python.  noetl/ai-meta#71.
+///
+/// Detection heuristic (deliberately simple — no AST):
+/// Walk lines in order.  Skip blank lines and comment-only lines
+/// (`#…`).  If the first non-trivial token we see is `return ` (or
+/// `return\n`), treat it as a top-level return.  Stop scanning once
+/// a `def ` or `class ` statement is encountered — those mean the
+/// `return` belongs to a nested function/class, not the top level.
+///
+/// False-negative: a `return` that lives inside a nested
+/// `def`/`class` won't be mis-wrapped (the scan stops).
+/// False-positive: a `return` that is the FIRST statement but is
+/// actually unreachable dead code after a prior def — acceptable
+/// edge case; the wrapper still executes correctly.
+///
+/// When wrapping:
+/// - Every line of `code` is indented by 4 spaces.
+/// - A call `result = __noetl_step__(args, input_data)` is appended
+///   at module level so the return value is captured as `result`.
+fn wrap_top_level_return(code: &str) -> String {
+    // Scan for a top-level `return` before any `def`/`class`.
+    //
+    // A "top-level return" is a `return` statement that is NOT indented
+    // (i.e. the line starts with `return` after stripping leading
+    // whitespace, AND the raw line itself starts with `return` — not
+    // inside a function body whose indentation would reveal it).
+    //
+    // Two conditions must both hold for a `return` to be "top-level":
+    //   1. The raw line is unindented (starts with `return` or optional
+    //      comment-leading whitespace — but we require no indent for
+    //      safety).
+    //   2. No `def ` / `async def ` / `class ` statement has been seen
+    //      yet in the scan (unindented lines only — we stop at the first
+    //      function/class definition).
+    //
+    // This handles `async def main():\n    return X` correctly: the
+    // scan stops at `async def main():` before reaching the indented
+    // `return`.
+
+    let mut found_return = false;
+    for line in code.lines() {
+        // Only consider unindented lines — indented lines are inside a
+        // block and can never be "top-level" by definition.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // An unindented `def `, `async def `, or `class ` opens a
+        // function/class body — stop scanning; any `return` after
+        // this point belongs to that body.
+        if trimmed.starts_with("def ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("class ")
+        {
+            break;
+        }
+        if trimmed.starts_with("return ") || trimmed == "return" {
+            found_return = true;
+            break;
+        }
+    }
+
+    if !found_return {
+        return code.to_string();
+    }
+
+    // Wrap: indent every code line by 4 spaces and add the call.
+    let indented: String = code
+        .lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "def __noetl_step__(args, input_data, **kw):\n{indented}\n\nresult = __noetl_step__(args, input_data)"
+    )
+}
+
 /// Find the wrapper-emitted result line in stdout and return
 /// `(captured_result, cleaned_stdout)`.  If no marker is present
 /// (e.g. the wrapper failed before emit), returns `(None, stdout)`.
@@ -357,7 +441,9 @@ impl PythonTool {
     /// Read a script body from a local filesystem path.
     async fn load_from_file(&self, path: &str) -> Result<String, ToolError> {
         tokio::fs::read_to_string(path).await.map_err(|e| {
-            ToolError::Io(format!("python script file `{path}` could not be read: {e}"))
+            ToolError::Io(format!(
+                "python script file `{path}` could not be read: {e}"
+            ))
         })
     }
 
@@ -455,6 +541,15 @@ impl PythonTool {
         // low enough not to warrant a more complex out-of-band
         // channel (e.g. fd 3) at this stage.  See noetl/ai-meta#60
         // for the surfacing finding.
+        //
+        // Style C (noetl/ai-meta#71): if the user code contains a
+        // top-level `return` statement (and no `def`/`class` precedes
+        // it), wrap it in an implicit function so the return is valid
+        // Python.  The `input_data` global (also injected uniformly
+        // below) is passed as a parameter so the wrapped function body
+        // can reference it even before the globals are merged in.
+        let effective_code = wrap_top_level_return(code);
+
         let wrapper_code = format!(
             r#"
 import sys
@@ -470,7 +565,13 @@ step = context.get('step')
 # Make args available as globals for convenience
 globals().update(args)
 
-# User code
+# Expose args as `input_data` for fixture parity (noetl/ai-meta#71).
+# Legacy Python executor injected args under both the individual
+# key names AND as the dict `input_data` so fixtures that call
+# `input_data.get('foo')` work regardless of which style they use.
+input_data = dict(args)
+
+# User code (possibly wrapped by wrap_top_level_return for Style C)
 {}
 
 # Legacy `main()` convention (noetl/ai-meta#65): the
@@ -518,7 +619,7 @@ except Exception as __noetl_err:
     sys.stdout.write('{marker}null\n')
     sys.stderr.write('noetl result capture failed: ' + repr(__noetl_err) + '\n')
 "#,
-            code,
+            effective_code,
             marker = NOETL_RESULT_MARKER
         );
 
@@ -912,10 +1013,7 @@ mod tests {
             .load_from_file("/nonexistent/path/to/script.py")
             .await
             .unwrap_err();
-        assert!(
-            format!("{err}").contains("could not be read"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("could not be read"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1048,7 +1146,9 @@ def main(name="World", count=1):
         assert_eq!(data.get("status").and_then(|v| v.as_str()), Some("success"));
         assert_eq!(data.get("total").and_then(|v| v.as_i64()), Some(3));
         assert_eq!(
-            data.get("messages").and_then(|v| v.as_array()).map(|a| a.len()),
+            data.get("messages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
             Some(3),
         );
     }
@@ -1308,5 +1408,177 @@ def main(**kwargs):
         let ctx = ExecutionContext::default();
         let result = tool.execute(&config, &ctx).await.unwrap();
         assert!(result.is_success());
+    }
+
+    // ── noetl/ai-meta#71 tests ────────────────────────────────────────────
+
+    /// `wrap_top_level_return` must NOT wrap code that has no top-level return.
+    #[test]
+    fn test_wrap_top_level_return_noop_when_no_return() {
+        let code = "result = {'x': 1}";
+        assert_eq!(wrap_top_level_return(code), code);
+    }
+
+    /// `wrap_top_level_return` must NOT wrap code where `return` lives
+    /// inside a `def` body (the scan stops at `def `).
+    #[test]
+    fn test_wrap_top_level_return_noop_inside_def() {
+        let code = "def main():\n    return {'x': 1}";
+        assert_eq!(wrap_top_level_return(code), code);
+    }
+
+    /// `wrap_top_level_return` must NOT wrap code where `return` lives
+    /// inside an `async def` body (the scan stops at `async def `).
+    #[test]
+    fn test_wrap_top_level_return_noop_inside_async_def() {
+        let code = "async def main():\n    return {'x': 1}";
+        assert_eq!(wrap_top_level_return(code), code);
+    }
+
+    /// `wrap_top_level_return` must wrap code where the first non-comment
+    /// non-blank statement is `return X`.
+    #[test]
+    fn test_wrap_top_level_return_wraps_bare_return() {
+        let code = "return {'x': 1}";
+        let wrapped = wrap_top_level_return(code);
+        assert!(
+            wrapped.contains("def __noetl_step__(args, input_data, **kw):"),
+            "expected wrapper function, got:\n{wrapped}"
+        );
+        assert!(
+            wrapped.contains("result = __noetl_step__(args, input_data)"),
+            "expected call line, got:\n{wrapped}"
+        );
+        assert!(
+            wrapped.contains("    return {'x': 1}"),
+            "expected indented user code, got:\n{wrapped}"
+        );
+    }
+
+    /// `input_data` global is injected — user code can call
+    /// `input_data.get('foo')` (noetl/ai-meta#71, actions_test pattern).
+    #[tokio::test]
+    async fn test_input_data_global_is_injected() {
+        let tool = PythonTool::new();
+        let mut args = HashMap::new();
+        args.insert("foo".to_string(), serde_json::json!("bar"));
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let result = tool
+            .execute_code(
+                "result = {\"got\": input_data.get(\"foo\")}",
+                &args,
+                &env,
+                "python3",
+                None,
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("data should be the captured result");
+        assert_eq!(
+            data.get("got").and_then(|v| v.as_str()),
+            Some("bar"),
+            "input_data.get('foo') must return 'bar'"
+        );
+    }
+
+    /// Top-level `return` is wrapped so it yields the returned value as
+    /// the step result (noetl/ai-meta#71, loop_test pattern).
+    #[tokio::test]
+    async fn test_top_level_return_wraps_user_code() {
+        let tool = PythonTool::new();
+        let mut args = HashMap::new();
+        args.insert("n".to_string(), serde_json::json!(5));
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let result = tool
+            .execute_code(
+                "return {\"echoed\": input_data.get(\"n\", 0) * 2}",
+                &args,
+                &env,
+                "python3",
+                None,
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("return value becomes data");
+        assert_eq!(
+            data.get("echoed").and_then(|v| v.as_i64()),
+            Some(10),
+            "top-level return must yield echoed: 10"
+        );
+    }
+
+    /// Top-level `return` with no args — covers the empty-args path.
+    #[tokio::test]
+    async fn test_top_level_return_with_no_input_data() {
+        let tool = PythonTool::new();
+        let args = HashMap::new();
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let result = tool
+            .execute_code(
+                "return {\"ok\": True}",
+                &args,
+                &env,
+                "python3",
+                None,
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("return value becomes data");
+        assert_eq!(
+            data.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "top-level return with no args must yield ok: true"
+        );
+    }
+
+    /// Style B (main() convention) continues to work alongside the new
+    /// `input_data` global and top-level-return detection.
+    #[tokio::test]
+    async fn test_main_function_convention_still_works_with_input_data_global() {
+        let tool = PythonTool::new();
+        let mut args = HashMap::new();
+        args.insert("value".to_string(), serde_json::json!(7));
+        let env = HashMap::new();
+        let ctx = ExecutionContext::default();
+
+        let code = r#"
+def main(value=0):
+    return {"doubled": value * 2, "from_input_data": input_data.get("value", -1)}
+"#;
+        let result = tool
+            .execute_code(code, &args, &env, "python3", None, None, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_success(), "stderr: {:?}", result.stderr);
+        let data = result.data.expect("main() return becomes data");
+        assert_eq!(
+            data.get("doubled").and_then(|v| v.as_i64()),
+            Some(14),
+            "main() called with value=7"
+        );
+        assert_eq!(
+            data.get("from_input_data").and_then(|v| v.as_i64()),
+            Some(7),
+            "input_data accessible inside main() body via global"
+        );
     }
 }
