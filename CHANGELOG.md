@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.24.0](https://github.com/noetl/tools/compare/v2.23.1...v2.24.0) (2026-06-08)
+
+### Features
+
+* **python:** inject input_data global + support top-level return ([4329e87](https://github.com/noetl/tools/commit/4329e8743a293ab3d59a851932c946279da32176)), closes [#65](https://github.com/noetl/tools/issues/65) [noetl/ai-meta#71](https://github.com/noetl/ai-meta/issues/71)
+
 ## [2.23.1](https://github.com/noetl/tools/compare/v2.23.0...v2.23.1) (2026-06-08)
 
 ### Bug Fixes
