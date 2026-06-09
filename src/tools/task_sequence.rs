@@ -1,6 +1,6 @@
 //! Task sequence tool — runs a list of sub-tasks in order through
-//! the registry, threading each task's result into the context for
-//! the next task to reference.
+//! the registry, using forward-only data propagation via explicit
+//! `input:` / `set:` bindings per the NoETL DSL convention.
 //!
 //! Wire format from noetl-server (`ToolDefinition::Pipeline` after
 //! the `noetl/ai-meta#57` fix): the `config` payload is a JSON
@@ -15,25 +15,28 @@
 //! ]
 //! ```
 //!
-//! Behavior:
+//! Data flow between tool items follows the DSL's established
+//! forward-only convention (noetl_dsl_assignment_and_reference_spec
+//! §7, noetl_dsl_refactoring_spec §4.2):
 //!
-//! - Each task is dispatched through a fresh `default_registry()`
-//!   instance so a sub-task can be any registered tool kind
-//!   (python, postgres, shell, etc.).
-//! - The running map of `{label: result_data}` is exposed under
-//!   the `_results` variable for downstream tasks; the most recent
-//!   task's data is also exposed under `_prev` (the Python
-//!   reference impl's convention).
-//! - Templates inside each task's config are rendered with the
-//!   updated context so `{{ _prev.is_hot }}` etc. resolve to the
-//!   previous task's data.
-//! - The aggregated result data is a JSON object keyed by task
-//!   label.  Status is `Success` if every sub-task succeeded,
-//!   `Error` on the first sub-task failure (the rest are skipped
-//!   so the orchestrator's failure-termination logic — noetl/server
-//!   #63 — emits `playbook.failed` cleanly).
+//! - **`set:`** on a tool item evaluates expressions against the
+//!   tool's `output` after execution, then merges the resolved
+//!   key-value pairs into a running context shared across items.
+//! - **`input:`** on a tool item resolves its values from the
+//!   running context, then injects them as local template
+//!   variables for the tool's own templates (`command:`, `query:`,
+//!   `code:`, etc.).  The resolved `input:` also passes through
+//!   to tools that read it natively (e.g. python's `input_data`).
+//! - **`output`** is available inside `set:` expressions as the
+//!   executed tool's result data (`{{ output.field }}`).
 //!
-//! Tracks noetl/tools#15.
+//! The aggregated result data is a JSON object keyed by task
+//! label.  Status is `Success` if every sub-task succeeded,
+//! `Error` on the first sub-task failure (the rest are skipped
+//! so the orchestrator's failure-termination logic — noetl/server
+//! #63 — emits `playbook.failed` cleanly).
+//!
+//! Tracks noetl/tools#15, noetl/ai-meta#77.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -150,14 +153,15 @@ impl TaskSequenceTool {
             })?
             .to_string();
 
-        // Strip the `kind` field from the inner config so the sub-
-        // tool's deserializer doesn't trip on it as an unknown
-        // field.  Everything else (code, query, input, auth, ...)
-        // passes through verbatim — the sub-tool decodes from its
-        // ToolConfig.config payload exactly as it would for a top-
-        // level step.
+        // Strip `kind` (registry lookup key) and `set` (forward-
+        // propagation directive) from the inner config — they are
+        // not tool config fields.  Everything else (code, query,
+        // input, auth, ...) passes through verbatim — the sub-tool
+        // decodes from its ToolConfig.config payload exactly as it
+        // would for a top-level step.
         let mut inner = spec_obj.clone();
         inner.remove("kind");
+        inner.remove("set");
 
         Ok(ToolConfig {
             kind,
@@ -198,10 +202,13 @@ impl Tool for TaskSequenceTool {
         let registry = crate::tools::create_default_registry();
 
         let mut labeled_results: HashMap<String, serde_json::Value> = HashMap::new();
-        let mut last_data: serde_json::Value = serde_json::Value::Null;
         let mut last_stdout = String::new();
         let mut last_stderr = String::new();
         let mut total_exit_code: i32 = 0;
+
+        // Running context that accumulates `set:` values across
+        // tool items — the forward-only propagation surface.
+        let mut running_ctx = ctx.clone();
 
         tracing::debug!(task_count = tasks.len(), "task_sequence: starting pipeline");
 
@@ -214,30 +221,40 @@ impl Tool for TaskSequenceTool {
             }
             let (label, spec) = task_entry.into_iter().next().unwrap();
 
-            // Augment the execution context with the running results
-            // map + the previous task's data, so the next task's
-            // templates (`{{ _prev.is_hot }}`, `{{ _results.transform.x }}`)
-            // resolve.  The augmentation is per-task — sub-tasks see
-            // the most up-to-date snapshot.
-            let mut task_ctx = ctx.clone();
-            task_ctx
-                .variables
-                .insert("_prev".to_string(), last_data.clone());
-            task_ctx.variables.insert(
-                "_results".to_string(),
-                serde_json::Value::Object(
-                    labeled_results
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                ),
-            );
+            let spec_obj = spec.as_object().ok_or_else(|| {
+                ToolError::Configuration(format!(
+                    "task_sequence: task '{label}' spec must be a JSON object"
+                ))
+            })?;
+
+            // Extract `set:` directive — not a tool config field;
+            // evaluated post-execution for forward propagation.
+            let set_block = spec_obj.get("set").cloned();
+
+            // Build per-tool context from the running context
+            // (includes vars from prior items' `set:` blocks).
+            let mut task_ctx = running_ctx.clone();
+
+            // Resolve `input:` values against the running context,
+            // then inject the resolved key-value pairs as local
+            // template vars so the tool's own templates (command,
+            // query, code) can reference them by name.  The server
+            // emits `input` (renamed from ToolSpec's `args` field);
+            // fall back to `args` for robustness if `input` is
+            // absent.
+            let input_val = spec_obj.get("input").or_else(|| spec_obj.get("args"));
+            if let Some(input_obj) = input_val.and_then(|v| v.as_object()) {
+                let template_ctx = task_ctx.to_template_context();
+                for (key, val) in input_obj {
+                    let rendered = self.template_engine.render_value(val, &template_ctx)?;
+                    task_ctx.variables.insert(key.clone(), rendered);
+                }
+            }
 
             let raw_task_config = Self::build_task_config(&label, &spec)?;
 
             // Render templates in the task config against the
-            // augmented context so `_prev` / `_results` references
-            // resolve before the sub-tool sees them.
+            // augmented context (running vars + resolved input).
             let rendered = self
                 .template_engine
                 .render_value(&raw_task_config.config, &task_ctx.to_template_context())?;
@@ -273,11 +290,26 @@ impl Tool for TaskSequenceTool {
             }
             total_exit_code = task_result.exit_code.unwrap_or(0);
 
-            if let Some(data) = &task_result.data {
-                labeled_results.insert(label, data.clone());
-                last_data = data.clone();
-            } else {
-                last_data = serde_json::Value::Null;
+            let result_data = task_result.data.clone().unwrap_or(serde_json::Value::Null);
+            labeled_results.insert(label.clone(), result_data.clone());
+
+            // Forward propagation: evaluate `set:` expressions
+            // against the running context augmented with `output`
+            // (this tool's result data), then merge the resolved
+            // values into the running context for subsequent items.
+            if let Some(set_val) = set_block {
+                if let Some(set_obj) = set_val.as_object() {
+                    let mut set_eval_ctx = task_ctx.clone();
+                    set_eval_ctx
+                        .variables
+                        .insert("output".to_string(), result_data.clone());
+                    let set_template_ctx = set_eval_ctx.to_template_context();
+                    for (key, expr) in set_obj {
+                        let rendered =
+                            self.template_engine.render_value(expr, &set_template_ctx)?;
+                        set_nested_var(&mut running_ctx.variables, key, rendered);
+                    }
+                }
             }
 
             // Failure short-circuit: the orchestrator's
@@ -320,6 +352,41 @@ impl Tool for TaskSequenceTool {
             duration_ms: Some(duration_ms),
             pending_callback: None,
         })
+    }
+}
+
+/// Insert a value into a context map, supporting dotted keys.
+///
+/// `"foo"` inserts a flat key.  `"a.b.c"` builds nested objects:
+/// `ctx["a"]["b"]["c"] = value`.  This mirrors the DSL's scoped
+/// variable convention (`iter.page`, `ctx.stats_ref`, `step.x`)
+/// where the dot is a namespace separator.
+fn set_nested_var(
+    ctx: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() == 1 {
+        ctx.insert(key.to_string(), value);
+        return;
+    }
+    // Build nested: "a.b.c" → ctx["a"]["b"]["c"] = value
+    let root = parts[0].to_string();
+    let entry = ctx.entry(root).or_insert_with(|| serde_json::json!({}));
+    let mut current = entry;
+    for part in &parts[1..parts.len() - 1] {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        current = current
+            .as_object_mut()
+            .unwrap()
+            .entry(part.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if let Some(obj) = current.as_object_mut() {
+        obj.insert(parts.last().unwrap().to_string(), value);
     }
 }
 
@@ -443,20 +510,48 @@ mod tests {
     }
 
     #[test]
-    fn test_build_task_config_extracts_kind() {
+    fn test_build_task_config_extracts_kind_and_strips_set() {
         let spec = serde_json::json!({
             "kind": "python",
             "code": "result = {'x': 1}",
-            "input": {"y": 2}
+            "input": {"y": 2},
+            "set": {"val": "{{ output.x }}"}
         });
         let cfg = TaskSequenceTool::build_task_config("compute", &spec)
             .expect("build_task_config succeeds");
         assert_eq!(cfg.kind, "python");
-        // `kind` is stripped from inner config so the sub-tool's
-        // deserializer doesn't see it.
+        // `kind` and `set` are stripped from inner config so the
+        // sub-tool's deserializer doesn't see them.
         assert!(cfg.config.get("kind").is_none(), "kind must be stripped");
+        assert!(cfg.config.get("set").is_none(), "set must be stripped");
         assert!(cfg.config.get("code").is_some(), "code preserved");
         assert!(cfg.config.get("input").is_some(), "input preserved");
+    }
+
+    #[test]
+    fn test_set_nested_var_flat_key() {
+        let mut ctx = HashMap::new();
+        set_nested_var(&mut ctx, "name", serde_json::json!("hello"));
+        assert_eq!(ctx.get("name"), Some(&serde_json::json!("hello")));
+    }
+
+    #[test]
+    fn test_set_nested_var_dotted_key() {
+        let mut ctx = HashMap::new();
+        set_nested_var(&mut ctx, "data.id", serde_json::json!(42));
+        set_nested_var(&mut ctx, "data.name", serde_json::json!("test"));
+        let data = ctx.get("data").expect("data key exists");
+        assert_eq!(data.get("id"), Some(&serde_json::json!(42)));
+        assert_eq!(data.get("name"), Some(&serde_json::json!("test")));
+    }
+
+    #[test]
+    fn test_set_nested_var_deep_dotted_key() {
+        let mut ctx = HashMap::new();
+        set_nested_var(&mut ctx, "a.b.c", serde_json::json!(true));
+        let a = ctx.get("a").unwrap();
+        let b = a.get("b").unwrap();
+        assert_eq!(b.get("c"), Some(&serde_json::json!(true)));
     }
 
     #[test]
@@ -468,15 +563,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_sequence_end_to_end_two_python_tasks() {
-        // Two python tasks: first sets `result = {'value': 10}`;
-        // second reads the first task's value via the
-        // `{{ _prev.value }}` template substitution path.  Cross-
-        // task references in v10 pipelines flow through the
-        // template layer, not raw Python globals — the running
-        // results are exposed under `_prev` + `_results` in the
-        // Jinja context, and each task's config is rendered
-        // against that context before dispatch.
+    async fn test_task_sequence_forward_propagation_via_set_and_input() {
+        // Two python tasks: first produces `{'value': 10}` and
+        // publishes it via `set:`.  Second reads it via `input:`
+        // from the running context — forward-only, no `_prev`.
         let tool = TaskSequenceTool::new();
         let config = ToolConfig {
             kind: "task_sequence".to_string(),
@@ -484,13 +574,19 @@ mod tests {
                 {
                     "compute": {
                         "kind": "python",
-                        "code": "result = {'value': 10}"
+                        "code": "result = {'value': 10}",
+                        "set": {
+                            "computed_value": "{{ output.value }}"
+                        }
                     }
                 },
                 {
                     "double": {
                         "kind": "python",
-                        "code": "result = {'doubled': {{ _prev.value }} * 2}"
+                        "code": "result = {'doubled': {{ computed_value }} * 2}",
+                        "input": {
+                            "computed_value": "{{ computed_value }}"
+                        }
                     }
                 },
             ]),
@@ -518,8 +614,92 @@ mod tests {
         assert_eq!(
             doubled,
             Some(20),
-            "second task should see _prev.value = 10 and double it"
+            "second task should see computed_value = 10 via set:/input: and double it"
         );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_set_with_dotted_keys() {
+        // Verify that `set:` with dotted keys like `data.id`
+        // builds nested objects in the running context.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "produce": {
+                        "kind": "python",
+                        "code": "result = {'id': 42, 'name': 'test'}",
+                        "set": {
+                            "data.id": "{{ output.id }}",
+                            "data.name": "{{ output.name }}"
+                        }
+                    }
+                },
+                {
+                    "consume": {
+                        "kind": "python",
+                        "code": "result = {'got_id': {{ data.id }}, 'got_name': '{{ data.name }}'}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+
+        assert!(result.is_success(), "pipeline completes");
+        let data = result.data.expect("data present");
+        let got_id = data
+            .get("consume")
+            .and_then(|v| v.get("got_id"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(got_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_input_as_tool_input_data() {
+        // Verify that `input:` passes through to the python tool
+        // as `input_data` while also making values available as
+        // template vars.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "produce": {
+                        "kind": "python",
+                        "code": "result = {'x': 99}",
+                        "set": {
+                            "x_val": "{{ output.x }}"
+                        }
+                    }
+                },
+                {
+                    "consume": {
+                        "kind": "python",
+                        "input": {
+                            "my_x": "{{ x_val }}"
+                        },
+                        "code": "result = {'from_input': input_data.get('my_x', 'missing')}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+
+        assert!(result.is_success());
+        let data = result.data.expect("data present");
+        let from_input = data
+            .get("consume")
+            .and_then(|v| v.get("from_input"));
+        assert_eq!(from_input, Some(&serde_json::json!(99)));
     }
 
     #[tokio::test]
