@@ -153,15 +153,17 @@ impl TaskSequenceTool {
             })?
             .to_string();
 
-        // Strip `kind` (registry lookup key) and `set` (forward-
-        // propagation directive) from the inner config — they are
-        // not tool config fields.  Everything else (code, query,
-        // input, auth, ...) passes through verbatim — the sub-tool
-        // decodes from its ToolConfig.config payload exactly as it
-        // would for a top-level step.
+        // Strip `kind` (registry lookup key), `set` (forward-
+        // propagation directive), and `spec` (policy rules — handled
+        // by task_sequence, not by the sub-tool) from the inner
+        // config.  Everything else (code, query, input, auth, ...)
+        // passes through verbatim — the sub-tool decodes from its
+        // ToolConfig.config payload exactly as it would for a
+        // top-level step.
         let mut inner = spec_obj.clone();
         inner.remove("kind");
         inner.remove("set");
+        inner.remove("spec");
 
         Ok(ToolConfig {
             kind,
@@ -230,6 +232,16 @@ impl Tool for TaskSequenceTool {
             // Extract `set:` directive — not a tool config field;
             // evaluated post-execution for forward propagation.
             let set_block = spec_obj.get("set").cloned();
+
+            // Extract `spec.policy.rules` — DSL policy rules whose
+            // `then.set` directives are evaluated post-execution,
+            // mirroring the Python server's per-tool policy handling.
+            let policy_rules = spec_obj
+                .get("spec")
+                .and_then(|s| s.get("policy"))
+                .and_then(|p| p.get("rules"))
+                .and_then(|r| r.as_array())
+                .cloned();
 
             // Build per-tool context from the running context
             // (includes vars from prior items' `set:` blocks).
@@ -309,6 +321,112 @@ impl Tool for TaskSequenceTool {
                             self.template_engine.render_value(expr, &set_template_ctx)?;
                         set_nested_var(&mut running_ctx.variables, key, rendered);
                     }
+                }
+            }
+
+            // Policy-rule evaluation: `spec.policy.rules` on a
+            // tool item allows conditional `set:` and `do: fail`
+            // based on the tool output.  The `output` context wraps
+            // the raw result in a `{status, data}` envelope so
+            // templates like `{{ output.data.counter }}` resolve
+            // correctly (matches the Python server's convention).
+            if let Some(ref rules) = policy_rules {
+                // Build the output envelope for policy evaluation
+                let output_envelope = serde_json::json!({
+                    "status": if task_result.status == ToolStatus::Success { "success" } else { "error" },
+                    "data": result_data.clone(),
+                    "error": {
+                        "retryable": false
+                    }
+                });
+                let mut policy_eval_ctx = task_ctx.clone();
+                policy_eval_ctx
+                    .variables
+                    .insert("output".to_string(), output_envelope);
+                let policy_template_ctx = policy_eval_ctx.to_template_context();
+
+                for rule in rules {
+                    let rule_obj = match rule.as_object() {
+                        Some(o) => o,
+                        None => continue,
+                    };
+
+                    // Determine if the rule matches and get the `then:` block.
+                    let (matched, then_block) = if let Some(when_val) = rule_obj.get("when") {
+                        // Conditional rule — render `when:` expression
+                        let condition_str = when_val.as_str().unwrap_or("");
+                        let rendered = self
+                            .template_engine
+                            .render(condition_str, &policy_template_ctx)
+                            .unwrap_or_default();
+                        let is_truthy = !rendered.is_empty()
+                            && rendered != "false"
+                            && rendered != "False"
+                            && rendered != "0"
+                            && rendered != "none"
+                            && rendered != "None"
+                            && rendered != "null";
+                        (is_truthy, rule_obj.get("then"))
+                    } else if let Some(else_val) = rule_obj.get("else") {
+                        // `else:` catch-all — always matches;
+                        // `then:` is nested under the `else` key.
+                        let then_val = else_val
+                            .as_object()
+                            .and_then(|o| o.get("then"));
+                        (true, then_val)
+                    } else {
+                        (false, None)
+                    };
+
+                    if !matched {
+                        continue;
+                    }
+
+                    if let Some(then_val) = then_block {
+                        let then_obj = then_val.as_object();
+
+                        // Apply `set:` mutations from the matching rule
+                        if let Some(set_val) = then_obj.and_then(|o| o.get("set")) {
+                            if let Some(set_obj) = set_val.as_object() {
+                                for (key, expr) in set_obj {
+                                    let rendered = self
+                                        .template_engine
+                                        .render_value(expr, &policy_template_ctx)?;
+                                    set_nested_var(
+                                        &mut running_ctx.variables,
+                                        key,
+                                        rendered,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Handle `do:` action — `fail` short-circuits
+                        // the pipeline; `continue` (and unrecognised
+                        // actions) proceed normally.  `retry` is
+                        // deferred to a follow-up.
+                        if let Some(do_val) = then_obj.and_then(|o| o.get("do")) {
+                            if do_val.as_str() == Some("fail") {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                return Ok(ToolResult {
+                                    status: ToolStatus::Error,
+                                    data: Some(serde_json::json!({
+                                        "labeled_results": labeled_results,
+                                        "failed_task": idx,
+                                    })),
+                                    error: Some(format!(
+                                        "policy rule triggered fail for task[{idx}] '{label}'"
+                                    )),
+                                    stdout: Some(last_stdout),
+                                    stderr: Some(last_stderr),
+                                    exit_code: Some(1),
+                                    duration_ms: Some(duration_ms),
+                                    pending_callback: None,
+                                });
+                            }
+                        }
+                    }
+                    break; // First matching rule wins
                 }
             }
 
@@ -739,6 +857,69 @@ mod tests {
         assert!(
             !labeled.contains_key("never_runs"),
             "third task was skipped after failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_policy_rule_set_else() {
+        // Verify `spec.policy.rules` with an `else` catch-all
+        // applies `set:` mutations using the `output.data.*`
+        // envelope convention.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "produce": {
+                        "kind": "python",
+                        "code": "result = {'counter': 42, 'message': 'works'}",
+                        "spec": {
+                            "policy": {
+                                "rules": [{
+                                    "else": {
+                                        "then": {
+                                            "do": "continue",
+                                            "set": {
+                                                "ctx.counter": "{{ output.data.counter }}",
+                                                "ctx.message": "{{ output.data.message }}"
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                },
+                {
+                    "consume": {
+                        "kind": "python",
+                        "input": {
+                            "counter": "{{ ctx.counter }}",
+                            "msg": "{{ ctx.message }}"
+                        },
+                        "code": "result = {'got_counter': counter, 'got_msg': msg}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+
+        assert!(result.is_success(), "pipeline completes successfully");
+        let data = result.data.expect("aggregated data present");
+        let consume = data.get("consume").expect("consume result present");
+        assert_eq!(
+            consume.get("got_counter").and_then(|v| v.as_i64()),
+            Some(42),
+            "policy-rule set: propagated counter via output.data.counter"
+        );
+        assert_eq!(
+            consume.get("got_msg").and_then(|v| v.as_str()),
+            Some("works"),
+            "policy-rule set: propagated message via output.data.message"
         );
     }
 
