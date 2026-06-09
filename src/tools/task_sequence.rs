@@ -212,6 +212,14 @@ impl Tool for TaskSequenceTool {
         // tool items — the forward-only propagation surface.
         let mut running_ctx = ctx.clone();
 
+        // Track context mutations from policy-rule `set:` so the
+        // server can propagate them to subsequent steps.  Worker-side
+        // task_sequence only sees one step's pipeline; cross-step
+        // propagation requires the server to apply these mutations
+        // to the execution state.  Keyed by the `set:` key exactly
+        // as written in the playbook (e.g. `ctx.counter`).
+        let mut context_updates: HashMap<String, serde_json::Value> = HashMap::new();
+
         tracing::debug!(task_count = tasks.len(), "task_sequence: starting pipeline");
 
         for (idx, task_entry) in tasks.into_iter().enumerate() {
@@ -395,8 +403,13 @@ impl Tool for TaskSequenceTool {
                                     set_nested_var(
                                         &mut running_ctx.variables,
                                         key,
-                                        rendered,
+                                        rendered.clone(),
                                     );
+                                    // Record the mutation for cross-step
+                                    // propagation via `_context_updates`
+                                    // in the result payload.
+                                    context_updates
+                                        .insert(key.clone(), rendered);
                                 }
                             }
                         }
@@ -458,11 +471,24 @@ impl Tool for TaskSequenceTool {
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Merge `_context_updates` into the result data so the
+        // server can apply cross-step variable propagation.  Only
+        // added when policy rules produced mutations — the key is
+        // absent otherwise, so existing consumers are unaffected.
+        let mut result_map: serde_json::Map<String, serde_json::Value> =
+            labeled_results.into_iter().collect();
+        if !context_updates.is_empty() {
+            result_map.insert(
+                "_context_updates".to_string(),
+                serde_json::to_value(&context_updates)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+
         Ok(ToolResult {
             status: ToolStatus::Success,
-            data: Some(serde_json::Value::Object(
-                labeled_results.into_iter().collect(),
-            )),
+            data: Some(serde_json::Value::Object(result_map)),
             error: None,
             stdout: Some(last_stdout),
             stderr: Some(last_stderr),
