@@ -781,8 +781,7 @@ async fn js_consume(
     let batch = cfg
         .batch
         .unwrap_or(JS_CONSUME_BATCH_DEFAULT)
-        .min(JS_CONSUME_BATCH_MAX)
-        .max(1);
+        .clamp(1, JS_CONSUME_BATCH_MAX);
     let timeout_ms = cfg
         .timeout_ms
         .unwrap_or(JS_CONSUME_TIMEOUT_DEFAULT_MS)
@@ -1152,7 +1151,7 @@ mod tests {
     #[test]
     fn js_consume_batch_capping_logic() {
         // Mirrors the inline `min(MAX).max(1)` shape in js_consume.
-        let cap = |b: u32| b.min(JS_CONSUME_BATCH_MAX).max(1);
+        let cap = |b: u32| b.clamp(1, JS_CONSUME_BATCH_MAX);
         assert_eq!(cap(50), 50);
         assert_eq!(cap(0), 1);
         assert_eq!(cap(99_999), JS_CONSUME_BATCH_MAX);
@@ -1172,8 +1171,8 @@ mod tests {
     fn js_consume_defaults_are_under_caps() {
         // Sanity: defaults are within the enforced caps so the
         // bounded-by-default contract holds.
-        assert!(JS_CONSUME_BATCH_DEFAULT <= JS_CONSUME_BATCH_MAX);
-        assert!(JS_CONSUME_TIMEOUT_DEFAULT_MS <= JS_CONSUME_TIMEOUT_MAX_MS);
+        const { assert!(JS_CONSUME_BATCH_DEFAULT <= JS_CONSUME_BATCH_MAX) };
+        const { assert!(JS_CONSUME_TIMEOUT_DEFAULT_MS <= JS_CONSUME_TIMEOUT_MAX_MS) };
     }
 
     // --- Auth resolution ---

@@ -125,7 +125,7 @@ pub struct ArtifactTool {
     /// Delegate that does the actual fetch.  Cheap to hold —
     /// `ResultFetchTool::new()` builds one shared `reqwest::Client`
     /// + `TemplateEngine` at construction; per-call work is the
-    /// per-call HTTP / Flight exchange.
+    ///   per-call HTTP / Flight exchange.
     delegate: ResultFetchTool,
     /// Used to render the raw config (action + input.result_ref)
     /// before deserialising into [`ArtifactConfig`] — same pattern
