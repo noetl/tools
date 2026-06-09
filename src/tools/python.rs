@@ -201,7 +201,9 @@ pub struct PythonConfig {
     pub script: Option<PythonScript>,
 
     /// Arguments passed to the script (available as 'args' dict).
-    #[serde(default)]
+    /// The DSL uses `input:` as the standard key for tool input;
+    /// `args:` is the legacy alias.
+    #[serde(default, alias = "input")]
     pub args: HashMap<String, serde_json::Value>,
 
     /// Python interpreter to use (default: "python3").
