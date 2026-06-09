@@ -196,6 +196,7 @@ pub struct TransferResultData {
 /// Data transfer tool.
 pub struct TransferTool {
     http_client: reqwest::Client,
+    #[allow(dead_code)]
     auth_resolver: AuthResolver,
     template_engine: TemplateEngine,
 }

@@ -47,6 +47,7 @@ use crate::template::TemplateEngine;
 
 /// Task sequence configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TaskSequenceConfig {
     /// Pipeline tasks.  Accepts the bare-array wire shape the
     /// server emits as `config: [{label: spec}, ...]`; the custom

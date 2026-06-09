@@ -244,7 +244,7 @@ impl Tool for McpTool {
         let timeout_secs = resolve_timeout(&mcp_cfg.timeout);
         let request_id = mcp_cfg.request_id.unwrap_or(1);
 
-        let log_level = if method == "health" { "debug" } else { "debug" };
+        let log_level = "debug";
         let _ = log_level; // level selection reserved for tracing macro expansions below
 
         tracing::debug!(
@@ -705,9 +705,7 @@ pub(crate) fn resolve_health_url(endpoint: &str) -> String {
     // Simple approach: parse scheme+host, then decide on path.
     if let Ok(url) = reqwest::Url::parse(endpoint) {
         let path = url.path().trim_end_matches('/');
-        let new_path = if matches!(path, "/mcp" | "/sse" | "/message") {
-            "/healthz".to_string()
-        } else if path.is_empty() {
+        let new_path = if matches!(path, "/mcp" | "/sse" | "/message") || path.is_empty() {
             "/healthz".to_string()
         } else {
             format!("{path}/healthz")

@@ -249,7 +249,7 @@ impl ScriptTool {
         };
 
         // Create and run the job
-        let job = self
+        let _job = self
             .create_job(
                 &client,
                 namespace,

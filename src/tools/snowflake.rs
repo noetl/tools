@@ -95,6 +95,7 @@ pub struct StatementResult {
 
 /// Snowflake SQL API response.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SnowflakeResponse {
     #[serde(default)]
     data: Vec<Vec<serde_json::Value>>,
@@ -108,6 +109,7 @@ struct SnowflakeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ResultSetMetaData {
     #[serde(rename = "rowType")]
     row_type: Option<Vec<RowType>>,
@@ -116,6 +118,7 @@ struct ResultSetMetaData {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RowType {
     name: String,
     #[serde(rename = "type")]
@@ -131,6 +134,7 @@ struct LoginResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct LoginData {
     token: Option<String>,
     #[serde(rename = "masterToken")]
@@ -376,11 +380,7 @@ impl SnowflakeTool {
     /// Get the Snowflake account URL.
     fn get_account_url(&self, account: &str) -> String {
         // Handle both formats: "account" and "account.region"
-        if account.contains('.') {
-            format!("https://{}.snowflakecomputing.com", account)
-        } else {
-            format!("https://{}.snowflakecomputing.com", account)
-        }
+        format!("https://{}.snowflakecomputing.com", account)
     }
 
     /// Get SQL commands from configuration.
