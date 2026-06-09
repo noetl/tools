@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0](https://github.com/noetl/tools/compare/v2.24.2...v3.0.0) (2026-06-09)
+
+### ⚠ BREAKING CHANGES
+
+* playbook YAML that references {{ _prev }} or
+{{ _results }} in multi-tool steps must migrate to the set:/input:
+pattern.
+
+### Features
+
+* replace _prev/_results with set:/input: forward-only data binding ([92716a5](https://github.com/noetl/tools/commit/92716a514bcdd9f60fc728629632016351757ba2)), closes [noetl/ai-meta#77](https://github.com/noetl/ai-meta/issues/77)
+
 ## [2.24.2](https://github.com/noetl/tools/compare/v2.24.1...v2.24.2) (2026-06-09)
 
 ### Bug Fixes
