@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.24.2](https://github.com/noetl/tools/compare/v2.24.1...v2.24.2) (2026-06-09)
+
+### Bug Fixes
+
+* resolve all clippy warnings under -D warnings gate ([524fbc4](https://github.com/noetl/tools/commit/524fbc4c335328c8c938b18925a76333b90898eb)), closes [#42](https://github.com/noetl/tools/issues/42)
+
 ## [2.24.1](https://github.com/noetl/tools/compare/v2.24.0...v2.24.1) (2026-06-08)
 
 ### Bug Fixes
