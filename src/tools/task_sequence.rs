@@ -286,13 +286,6 @@ impl Tool for TaskSequenceTool {
                 auth: raw_task_config.auth,
             };
 
-            tracing::debug!(
-                index = idx,
-                label = %label,
-                kind = %task_config.kind,
-                "task_sequence: dispatching sub-task"
-            );
-
             let task_result = registry
                 .execute_from_config(&task_config, &task_ctx)
                 .await?;
@@ -361,20 +354,28 @@ impl Tool for TaskSequenceTool {
 
                     // Determine if the rule matches and get the `then:` block.
                     let (matched, then_block) = if let Some(when_val) = rule_obj.get("when") {
-                        // Conditional rule — render `when:` expression
-                        let condition_str = when_val.as_str().unwrap_or("");
-                        let rendered = self
-                            .template_engine
-                            .render(condition_str, &policy_template_ctx)
-                            .unwrap_or_default();
-                        let is_truthy = !rendered.is_empty()
-                            && rendered != "false"
-                            && rendered != "False"
-                            && rendered != "0"
-                            && rendered != "none"
-                            && rendered != "None"
-                            && rendered != "null";
-                        (is_truthy, rule_obj.get("then"))
+                        // Conditional rule — render `when:` expression.
+                        // YAML `when: true` / `when: false` arrives as
+                        // a JSON boolean, not a string — handle it
+                        // directly before falling through to template
+                        // rendering for string expressions.
+                        if let Some(b) = when_val.as_bool() {
+                            (b, rule_obj.get("then"))
+                        } else {
+                            let condition_str = when_val.as_str().unwrap_or("");
+                            let rendered = self
+                                .template_engine
+                                .render(condition_str, &policy_template_ctx)
+                                .unwrap_or_default();
+                            let is_truthy = !rendered.is_empty()
+                                && rendered != "false"
+                                && rendered != "False"
+                                && rendered != "0"
+                                && rendered != "none"
+                                && rendered != "None"
+                                && rendered != "null";
+                            (is_truthy, rule_obj.get("then"))
+                        }
                     } else if let Some(else_val) = rule_obj.get("else") {
                         // `else:` catch-all — always matches;
                         // `then:` is nested under the `else` key.
@@ -953,5 +954,145 @@ mod tests {
     fn test_task_sequence_tool_name() {
         let tool = TaskSequenceTool::new();
         assert_eq!(tool.name(), "task_sequence");
+    }
+
+    #[test]
+    fn test_render_value_roundtrip_complex_object() {
+        // Regression test for iterator_save_test: verify that
+        // rendering {{ output.data }} where output.data is a complex
+        // object round-trips correctly through render_value so that
+        // subsequent access to nested fields (.item_name) works.
+        use crate::template::TemplateEngine;
+
+        let engine = TemplateEngine::new();
+
+        // Simulate the output envelope the policy evaluation builds
+        let output = serde_json::json!({
+            "status": "success",
+            "data": {"item_name": "item1", "item_value": 100},
+            "error": {"retryable": false}
+        });
+        let mut ctx: HashMap<String, serde_json::Value> = HashMap::new();
+        ctx.insert("output".to_string(), output);
+        ctx.insert("iter".to_string(), serde_json::json!({
+            "item": {"name": "item1", "value": 100},
+            "_index": 0,
+            "_total": 3,
+        }));
+
+        // Step 1: Render {{ output.data }} — this is what the set: block does
+        let expr = serde_json::json!("{{ output.data }}");
+        let rendered = engine.render_value(&expr, &ctx).expect("render_value ok");
+
+        // The rendered value MUST be a JSON object, not a string
+        assert!(
+            rendered.is_object(),
+            "expected object, got: {:?} (type: {})",
+            rendered,
+            match &rendered {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Null => "null",
+                _ => "other",
+            }
+        );
+
+        // Step 2: Apply the set mutation: iter.processed_item = rendered
+        set_nested_var(&mut ctx, "iter.processed_item", rendered);
+
+        // Step 3: Verify we can access iter.processed_item.item_name
+        let result = engine.render("{{ iter.processed_item.item_name }}", &ctx)
+            .expect("nested field resolves");
+        assert_eq!(result, "item1", "nested field access should work");
+    }
+
+    #[test]
+    fn test_policy_rules_extraction_from_wire_format() {
+        // Reproduce the exact wire format the server produces for
+        // iterator_save_test and verify that parse_tasks + policy
+        // rules extraction works correctly.
+        let tool = TaskSequenceTool::new();
+
+        // This is the wire format: tool_config array wrapped in
+        // a worker envelope with kind injected.
+        let wire_config = serde_json::json!({
+            "kind": "task_sequence",
+            "tool_config": [
+                {
+                    "process_item": {
+                        "kind": "python",
+                        "code": "result = {'item_name': item.get('name', 'unknown'), 'item_value': item.get('value', 0)}",
+                        "input": {"item": "{{ iter.item }}"},
+                        "name": "process_item",
+                        "spec": {
+                            "policy": {
+                                "rules": [
+                                    {
+                                        "when": true,
+                                        "then": {
+                                            "do": "continue",
+                                            "set": {
+                                                "iter.processed_item": "{{ output.data }}"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                {
+                    "save_item": {
+                        "kind": "postgres",
+                        "command": "INSERT INTO test (item_name) VALUES ('{{ iter.processed_item.item_name }}')",
+                        "name": "save_item",
+                        "host": "localhost",
+                        "port": 5432,
+                        "database": "test",
+                        "user": "test",
+                        "password": "test"
+                    }
+                }
+            ]
+        });
+
+        let tool_config = crate::registry::ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!({"tool_config": wire_config["tool_config"].clone()}),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+
+        let tasks = tool.parse_tasks(&tool_config).expect("parse_tasks should work");
+        assert_eq!(tasks.len(), 2, "should have 2 tasks");
+
+        // Check process_item has spec.policy.rules
+        let process_item_entry = &tasks[0];
+        assert_eq!(process_item_entry.len(), 1, "single-entry map");
+        let (label, spec) = process_item_entry.iter().next().unwrap();
+        assert_eq!(label, "process_item");
+
+        let spec_obj = spec.as_object().expect("spec should be object");
+        let policy_rules = spec_obj
+            .get("spec")
+            .and_then(|s| s.get("policy"))
+            .and_then(|p| p.get("rules"))
+            .and_then(|r| r.as_array());
+
+        assert!(
+            policy_rules.is_some(),
+            "process_item should have policy rules; spec_obj keys = {:?}, spec_obj = {}",
+            spec_obj.keys().collect::<Vec<_>>(),
+            serde_json::to_string_pretty(spec_obj).unwrap()
+        );
+        assert_eq!(policy_rules.unwrap().len(), 1, "should have 1 policy rule");
+
+        // Verify the rule has a set block
+        let rule = &policy_rules.unwrap()[0];
+        let set_block = rule
+            .get("then")
+            .and_then(|t| t.get("set"));
+        assert!(set_block.is_some(), "rule should have a set block");
     }
 }
