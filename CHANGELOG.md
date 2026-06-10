@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.0](https://github.com/noetl/tools/compare/v3.0.0...v3.1.0) (2026-06-10)
+
+### Features
+
+* evaluate spec.policy.rules on pipeline tool items in task_sequence ([3c3a919](https://github.com/noetl/tools/commit/3c3a9193a48a656d09cfd17d27e8fdfec177870c))
+* propagate policy-rule set mutations via _context_updates in result data ([5a4ea10](https://github.com/noetl/tools/commit/5a4ea1047a0c36c27a255003a3d444f90c8e660d))
+
+### Bug Fixes
+
+* handle YAML boolean when: true in policy rules + tojson fallback for object templates ([8836f0f](https://github.com/noetl/tools/commit/8836f0f70b95a2a96dc0732ec32a5085a9a52351)), closes [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69) [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69)
+
 ## [3.0.0](https://github.com/noetl/tools/compare/v2.24.2...v3.0.0) (2026-06-09)
 
 ### ⚠ BREAKING CHANGES
