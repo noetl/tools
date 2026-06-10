@@ -19,7 +19,7 @@
 //! wrapped recursively so the proxy applies at every depth.
 
 use minijinja::value::{Enumerator, Object, Value};
-use minijinja::Environment;
+use minijinja::{Environment, UndefinedBehavior};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,6 +35,15 @@ impl TemplateEngine {
     /// Create a new template engine with custom filters.
     pub fn new() -> Self {
         let mut env = Environment::new();
+
+        // Match the server's permissive undefined-variable behavior.
+        // The server uses `Chainable` so `{{ iter.item }}` returns
+        // undefined (rather than throwing) when `iter` is absent or
+        // when an intermediate attribute is undefined.  Without this
+        // the tools-side default (`Lenient`) throws "undefined value"
+        // on attribute access of undefined variables — a mismatch
+        // that breaks pipeline template rendering.
+        env.set_undefined_behavior(UndefinedBehavior::Chainable);
 
         // Register custom filters
         env.add_filter("int", filter_int);
@@ -100,8 +109,39 @@ impl TemplateEngine {
         match value {
             serde_json::Value::String(s) if Self::is_template(s) => {
                 let rendered = self.render(s, context)?;
-                // Try to parse as JSON, otherwise return as string
-                Ok(serde_json::from_str(&rendered).unwrap_or_else(|_| serde_json::json!(rendered)))
+                // Try to parse as JSON first.
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&rendered) {
+                    return Ok(val);
+                }
+                // If the template is a single `{{ expr }}` whose
+                // rendered output isn't valid JSON (minijinja renders
+                // dicts/lists using Python-style repr, not JSON —
+                // e.g. `True` instead of `true`), retry with
+                // `|tojson` appended to produce a JSON-parseable
+                // string.  This keeps `set:` blocks in pipeline
+                // policy rules working: `{{ output.data }}` renders
+                // an object that subsequent tools can traverse.
+                let trimmed = s.trim();
+                if trimmed.starts_with("{{")
+                    && trimmed.ends_with("}}")
+                    && trimmed.matches("{{").count() == 1
+                {
+                    let inner = &trimmed[2..trimmed.len() - 2];
+                    // Only apply if there's no existing filter that
+                    // could conflict (e.g. user already wrote |tojson).
+                    if !inner.contains("|tojson") {
+                        let json_tmpl = format!("{{{{ {} | tojson }}}}", inner.trim());
+                        if let Ok(json_rendered) = self.render(&json_tmpl, context) {
+                            if let Ok(val) =
+                                serde_json::from_str::<serde_json::Value>(&json_rendered)
+                            {
+                                return Ok(val);
+                            }
+                        }
+                    }
+                }
+                // Final fallback: return as a plain string value.
+                Ok(serde_json::json!(rendered))
             }
             serde_json::Value::Object(obj) => {
                 let mut result = serde_json::Map::new();
