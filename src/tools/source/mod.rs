@@ -33,11 +33,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ToolError;
 
+pub mod directives;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod nats;
 #[cfg(feature = "pubsub")]
 pub mod pubsub;
+
+pub use directives::{
+    AppliedDirective, Control, DirectiveRule, DirectiveSpec, DispatchPlan, TraceConfig,
+    TraceContext, TracePropagation,
+};
 
 // ---------------------------------------------------------------------------
 // Bounded-drain limits (shared across every source backend)
