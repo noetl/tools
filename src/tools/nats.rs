@@ -168,15 +168,9 @@ pub struct NatsConfig {
     pub ack: Option<bool>,
 }
 
-/// Maximum value enforced for `js_consume.batch`.
-pub const JS_CONSUME_BATCH_MAX: u32 = 1000;
-/// Default value for `js_consume.batch`.
-pub const JS_CONSUME_BATCH_DEFAULT: u32 = 100;
-/// Maximum value enforced for `js_consume.timeout_ms` — honors the
-/// execution-model "don't hold a worker slot waiting" rule.
-pub const JS_CONSUME_TIMEOUT_MAX_MS: u64 = 5_000;
-/// Default value for `js_consume.timeout_ms`.
-pub const JS_CONSUME_TIMEOUT_DEFAULT_MS: u64 = 1_000;
+// The bounded-drain caps (batch ≤ 1000, timeout ≤ 5000ms) now live with the
+// shared source-client abstraction in `crate::tools::source` (POLL_BATCH_MAX
+// / POLL_TIMEOUT_MAX_MS) — `js_consume` clamps through `PollOptions::new`.
 
 fn default_encoding() -> String {
     "utf-8".to_string()
@@ -225,65 +219,92 @@ impl NatsTool {
         cfg: &NatsConfig,
         ctx: &ExecutionContext,
     ) -> Result<NatsConnParams, ToolError> {
-        // --- Step 1: try credential alias ---
-        if let Some(ref alias) = cfg.auth {
-            if let Some(raw) = ctx.get_secret(alias) {
-                let cred: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-                    ToolError::Auth(format!("Credential '{}' is not valid JSON: {}", alias, e))
-                })?;
-
-                let url = cred["url"]
-                    .as_str()
-                    .or_else(|| cred["nats_url"].as_str())
-                    .ok_or_else(|| {
-                        ToolError::Auth(format!(
-                            "Credential '{}' missing required 'url' field",
-                            alias
-                        ))
-                    })?
-                    .to_string();
-
-                return Ok(NatsConnParams {
-                    url,
-                    user: cred["user"]
-                        .as_str()
-                        .or_else(|| cred["username"].as_str())
-                        .map(str::to_string),
-                    password: cred["password"].as_str().map(str::to_string),
-                    token: cred["token"].as_str().map(str::to_string),
-                });
-            }
-        }
-
-        // --- Step 2: explicit config fields ---
-        let url = cfg.url.clone().ok_or_else(|| {
-            ToolError::Configuration(
-                "NATS tool requires 'url' or an 'auth' credential alias with a 'url' field"
-                    .to_string(),
-            )
-        })?;
-
-        // Password may itself be a secret alias.
-        let password = cfg.password.as_deref().map(|pw| {
-            ctx.get_secret(pw)
-                .map(str::to_string)
-                .unwrap_or_else(|| pw.to_string())
-        });
-
-        // Token may itself be a secret alias.
-        let token = cfg.token.as_deref().map(|tok| {
-            ctx.get_secret(tok)
-                .map(str::to_string)
-                .unwrap_or_else(|| tok.to_string())
-        });
-
-        Ok(NatsConnParams {
-            url,
-            user: cfg.user.clone(),
-            password,
-            token,
-        })
+        resolve_nats_conn(
+            cfg.auth.as_deref(),
+            cfg.url.as_deref(),
+            cfg.user.as_deref(),
+            cfg.password.as_deref(),
+            cfg.token.as_deref(),
+            ctx,
+        )
     }
+}
+
+/// Resolve NATS connection params from a credential alias or explicit
+/// fields.  Shared by the `nats` tool and the `subscription` tool's NATS
+/// source backend (`crate::tools::source::nats`).
+///
+/// Resolution order:
+/// 1. `auth` alias → credential JSON in `ctx.secrets` (`url` required;
+///    optional `user` / `password` / `token`).
+/// 2. Explicit `url` + `user` / `password` / `token`; `password` and
+///    `token` may themselves be secret aliases.
+pub(crate) fn resolve_nats_conn(
+    auth: Option<&str>,
+    url: Option<&str>,
+    user: Option<&str>,
+    password: Option<&str>,
+    token: Option<&str>,
+    ctx: &ExecutionContext,
+) -> Result<NatsConnParams, ToolError> {
+    // --- Step 1: try credential alias ---
+    if let Some(alias) = auth {
+        if let Some(raw) = ctx.get_secret(alias) {
+            let cred: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+                ToolError::Auth(format!("Credential '{}' is not valid JSON: {}", alias, e))
+            })?;
+
+            let cred_url = cred["url"]
+                .as_str()
+                .or_else(|| cred["nats_url"].as_str())
+                .ok_or_else(|| {
+                    ToolError::Auth(format!(
+                        "Credential '{}' missing required 'url' field",
+                        alias
+                    ))
+                })?
+                .to_string();
+
+            return Ok(NatsConnParams {
+                url: cred_url,
+                user: cred["user"]
+                    .as_str()
+                    .or_else(|| cred["username"].as_str())
+                    .map(str::to_string),
+                password: cred["password"].as_str().map(str::to_string),
+                token: cred["token"].as_str().map(str::to_string),
+            });
+        }
+    }
+
+    // --- Step 2: explicit config fields ---
+    let url = url.map(str::to_string).ok_or_else(|| {
+        ToolError::Configuration(
+            "NATS connection requires 'url' or an 'auth' credential alias with a 'url' field"
+                .to_string(),
+        )
+    })?;
+
+    // Password may itself be a secret alias.
+    let password = password.map(|pw| {
+        ctx.get_secret(pw)
+            .map(str::to_string)
+            .unwrap_or_else(|| pw.to_string())
+    });
+
+    // Token may itself be a secret alias.
+    let token = token.map(|tok| {
+        ctx.get_secret(tok)
+            .map(str::to_string)
+            .unwrap_or_else(|| tok.to_string())
+    });
+
+    Ok(NatsConnParams {
+        url,
+        user: user.map(str::to_string),
+        password,
+        token,
+    })
 }
 
 impl Default for NatsTool {
@@ -296,16 +317,21 @@ impl Default for NatsTool {
 // Connection params
 // ---------------------------------------------------------------------------
 
+/// Resolved NATS connection parameters.
+///
+/// `pub(crate)` so the shared source-client backend
+/// (`crate::tools::source::nats`) can reuse the same connection shape the
+/// `nats` tool resolves, rather than duplicating credential handling.
 #[derive(Debug)]
-struct NatsConnParams {
-    url: String,
-    user: Option<String>,
-    password: Option<String>,
-    token: Option<String>,
+pub(crate) struct NatsConnParams {
+    pub(crate) url: String,
+    pub(crate) user: Option<String>,
+    pub(crate) password: Option<String>,
+    pub(crate) token: Option<String>,
 }
 
 impl NatsConnParams {
-    async fn connect(&self) -> Result<async_nats::Client, ToolError> {
+    pub(crate) async fn connect(&self) -> Result<async_nats::Client, ToolError> {
         let opts = self.build_connect_options();
         opts.connect(&self.url).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("NATS connect to '{}' failed: {}", self.url, e))
@@ -778,15 +804,17 @@ async fn js_consume(
         .as_deref()
         .ok_or_else(|| ToolError::Configuration("js_consume requires 'consumer'".into()))?;
 
-    let batch = cfg
-        .batch
-        .unwrap_or(JS_CONSUME_BATCH_DEFAULT)
-        .clamp(1, JS_CONSUME_BATCH_MAX);
-    let timeout_ms = cfg
-        .timeout_ms
-        .unwrap_or(JS_CONSUME_TIMEOUT_DEFAULT_MS)
-        .min(JS_CONSUME_TIMEOUT_MAX_MS);
-    let ack = cfg.ack.unwrap_or(true);
+    // Generalised into the shared source-client drain (noetl/ai-meta#90
+    // Phase 1).  `js_consume` keeps its legacy output shape; the bounded
+    // fetch + normalize + ack loop now lives in
+    // `crate::tools::source::nats::drain_pull_consumer`, which the
+    // `subscription` tool's NATS backend also drives.
+    let ack_mode = if cfg.ack.unwrap_or(true) {
+        crate::tools::source::AckMode::OnSuccess
+    } else {
+        crate::tools::source::AckMode::Manual
+    };
+    let opts = crate::tools::source::PollOptions::new(cfg.batch, cfg.timeout_ms, ack_mode);
 
     let stream = js.get_stream(stream_name).await.map_err(|e| {
         ToolError::ExecutionFailed(format!(
@@ -803,66 +831,27 @@ async fn js_consume(
             ))
         })?;
 
-    // `fetch` returns immediately when either `max_messages` is hit
-    // OR `expires` elapses — whichever comes first.  This is the
-    // bounded behavior the docstring promises.
-    let mut messages = consumer
-        .fetch()
-        .max_messages(batch as usize)
-        .expires(std::time::Duration::from_millis(timeout_ms))
-        .messages()
-        .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("js_consume fetch failed: {}", e)))?;
+    let outcome = crate::tools::source::nats::drain_pull_consumer(&consumer, &opts).await?;
 
-    let mut out_messages: Vec<serde_json::Value> = Vec::with_capacity(batch as usize);
-    while let Some(message_result) = messages.next().await {
-        let message = message_result
-            .map_err(|e| ToolError::ExecutionFailed(format!("js_consume message error: {}", e)))?;
-
-        let payload_bytes = &message.payload;
-        let payload_str = std::str::from_utf8(payload_bytes).unwrap_or("");
-        let data: serde_json::Value = serde_json::from_str(payload_str)
-            .unwrap_or_else(|_| serde_json::Value::String(payload_str.to_string()));
-
-        let info = message.info().map_err(|e| {
-            ToolError::ExecutionFailed(format!("js_consume message info failed: {}", e))
-        })?;
-
-        let mut headers_json = serde_json::Map::new();
-        if let Some(hdrs) = &message.headers {
-            for (k, v) in hdrs.iter() {
-                let values: Vec<serde_json::Value> = v
-                    .iter()
-                    .map(|val| serde_json::Value::String(val.to_string()))
-                    .collect();
-                headers_json.insert(
-                    k.to_string(),
-                    if values.len() == 1 {
-                        values.into_iter().next().unwrap()
-                    } else {
-                        serde_json::Value::Array(values)
-                    },
-                );
-            }
-        }
-
-        out_messages.push(serde_json::json!({
-            "subject": message.subject.to_string(),
-            "stream_seq": info.stream_sequence,
-            "consumer_seq": info.consumer_sequence,
-            "delivered": info.delivered,
-            "pending": info.pending,
-            "data": data,
-            "headers": serde_json::Value::Object(headers_json),
-        }));
-
-        if ack {
-            message
-                .ack()
-                .await
-                .map_err(|e| ToolError::ExecutionFailed(format!("js_consume ack failed: {}", e)))?;
-        }
-    }
+    // Reshape the normalized PolledMessages back into the legacy
+    // `js_consume` per-message shape so existing playbooks/consumers are
+    // unaffected.  The positional fields live in `msg.metadata`.
+    let out_messages: Vec<serde_json::Value> = outcome
+        .messages
+        .iter()
+        .map(|msg| {
+            let m = &msg.metadata;
+            serde_json::json!({
+                "subject": m.get("subject").cloned().unwrap_or(serde_json::Value::Null),
+                "stream_seq": m.get("stream_seq").cloned().unwrap_or(serde_json::Value::Null),
+                "consumer_seq": m.get("consumer_seq").cloned().unwrap_or(serde_json::Value::Null),
+                "delivered": m.get("delivered").cloned().unwrap_or(serde_json::Value::Null),
+                "pending": m.get("pending").cloned().unwrap_or(serde_json::Value::Null),
+                "data": msg.data.clone(),
+                "headers": serde_json::Value::Object(msg.headers.clone()),
+            })
+        })
+        .collect();
 
     Ok(serde_json::json!({
         "status": "success",
@@ -870,7 +859,7 @@ async fn js_consume(
         "consumer": consumer_name,
         "count": out_messages.len(),
         "messages": out_messages,
-        "acked": ack,
+        "acked": outcome.acked,
     }))
 }
 
@@ -1148,32 +1137,9 @@ mod tests {
         assert_eq!(cfg.ack, Some(false));
     }
 
-    #[test]
-    fn js_consume_batch_capping_logic() {
-        // Mirrors the inline `min(MAX).max(1)` shape in js_consume.
-        let cap = |b: u32| b.clamp(1, JS_CONSUME_BATCH_MAX);
-        assert_eq!(cap(50), 50);
-        assert_eq!(cap(0), 1);
-        assert_eq!(cap(99_999), JS_CONSUME_BATCH_MAX);
-    }
-
-    #[test]
-    fn js_consume_timeout_capping_logic() {
-        // Mirrors `.min(MAX)` in js_consume so we never wait past
-        // the execution-model contract.
-        let cap = |t: u64| t.min(JS_CONSUME_TIMEOUT_MAX_MS);
-        assert_eq!(cap(500), 500);
-        assert_eq!(cap(JS_CONSUME_TIMEOUT_MAX_MS), JS_CONSUME_TIMEOUT_MAX_MS);
-        assert_eq!(cap(60_000), JS_CONSUME_TIMEOUT_MAX_MS);
-    }
-
-    #[test]
-    fn js_consume_defaults_are_under_caps() {
-        // Sanity: defaults are within the enforced caps so the
-        // bounded-by-default contract holds.
-        const { assert!(JS_CONSUME_BATCH_DEFAULT <= JS_CONSUME_BATCH_MAX) };
-        const { assert!(JS_CONSUME_TIMEOUT_DEFAULT_MS <= JS_CONSUME_TIMEOUT_MAX_MS) };
-    }
+    // The bounded-drain clamp logic moved to `crate::tools::source` and is
+    // exercised by its own unit tests (`clamp_batch_bounds`,
+    // `clamp_timeout_bounds`, `defaults_within_caps`).
 
     // --- Auth resolution ---
 
