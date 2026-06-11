@@ -52,7 +52,7 @@ pub use self::rhai::RhaiTool;
 pub use self::script::ScriptTool;
 pub use self::shell::ShellTool;
 pub use self::snowflake::SnowflakeTool;
-pub use self::subscription::SubscriptionTool;
+pub use self::subscription::{build_source, SubscriptionConfig, SubscriptionTool};
 pub use self::task_sequence::TaskSequenceTool;
 pub use self::transfer::TransferTool;
 

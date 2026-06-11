@@ -151,83 +151,100 @@ impl SubscriptionTool {
             .map_err(|e| ToolError::Configuration(format!("Invalid subscription config: {}", e)))
     }
 
-    /// Build the source-client for the configured backend.
+    /// Build the source-client for the configured backend (instance method —
+    /// delegates to the public [`build_source`] factory).
     fn build_source(
         &self,
         cfg: &SubscriptionConfig,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn SourceClient>, ToolError> {
-        match cfg.source.as_str() {
-            "nats" => {
-                let conn = crate::tools::nats::resolve_nats_conn(
-                    cfg.auth.as_deref(),
-                    cfg.url.as_deref(),
-                    cfg.user.as_deref(),
-                    cfg.password.as_deref(),
-                    cfg.token.as_deref(),
-                    ctx,
-                )?;
-                let stream = cfg.stream.clone().ok_or_else(|| {
-                    ToolError::Configuration("subscription[nats] requires 'stream'".into())
-                })?;
-                let consumer = cfg.consumer.clone().ok_or_else(|| {
-                    ToolError::Configuration("subscription[nats] requires 'consumer'".into())
-                })?;
-                Ok(Box::new(super::source::nats::NatsSource::new(
-                    conn, stream, consumer,
-                )))
-            }
+        build_source(cfg, ctx)
+    }
+}
 
-            #[cfg(feature = "pubsub")]
-            "pubsub" => {
-                let subscription = cfg.subscription.clone().ok_or_else(|| {
-                    ToolError::Configuration(
-                        "subscription[pubsub] requires 'subscription' \
-                         (projects/<p>/subscriptions/<s>)"
-                            .into(),
-                    )
-                })?;
-                // A bearer token may be carried in the credential alias.
-                let bearer = cfg.auth.as_deref().and_then(|alias| {
-                    ctx.get_secret(alias).and_then(|raw| {
-                        serde_json::from_str::<serde_json::Value>(raw)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("token")
-                                    .or_else(|| v.get("access_token"))
-                                    .and_then(|t| t.as_str())
-                                    .map(str::to_string)
-                            })
-                    })
-                });
-                Ok(Box::new(super::source::pubsub::PubSubSource::new(
-                    subscription,
-                    cfg.endpoint.clone(),
-                    bearer,
-                )?))
-            }
-
-            #[cfg(feature = "kafka")]
-            "kafka" => {
-                let brokers = parse_brokers(cfg)?;
-                let topic = cfg.topic.clone().ok_or_else(|| {
-                    ToolError::Configuration("subscription[kafka] requires 'topic'".into())
-                })?;
-                let group = cfg.group.clone().ok_or_else(|| {
-                    ToolError::Configuration("subscription[kafka] requires 'group'".into())
-                })?;
-                Ok(Box::new(super::source::kafka::KafkaSource::new(
-                    brokers, topic, group,
-                )))
-            }
-
-            other => Err(ToolError::Configuration(format!(
-                "Unknown or unavailable subscription source '{}'. \
-                 Available: {}",
-                other,
-                available_sources()
-            ))),
+/// Build a [`SourceClient`] for the configured backend.
+///
+/// Public so the **continuous subscription runtime** (RFC Mode B, Phase 2 —
+/// `noetl/worker` run-mode) can construct the same source the bounded-drain
+/// tool uses and call [`SourceClient::poll`] in a loop.  Connection fields
+/// (`url` / `user` / `password` / `brokers` / `endpoint`) may be supplied
+/// inline on `cfg` (the runtime resolves the credential up front and merges
+/// the connection fields in, exactly as the worker's `apply_credential` does)
+/// or via a credential alias resolved from `ctx`.
+pub fn build_source(
+    cfg: &SubscriptionConfig,
+    ctx: &ExecutionContext,
+) -> Result<Box<dyn SourceClient>, ToolError> {
+    match cfg.source.as_str() {
+        "nats" => {
+            let conn = crate::tools::nats::resolve_nats_conn(
+                cfg.auth.as_deref(),
+                cfg.url.as_deref(),
+                cfg.user.as_deref(),
+                cfg.password.as_deref(),
+                cfg.token.as_deref(),
+                ctx,
+            )?;
+            let stream = cfg.stream.clone().ok_or_else(|| {
+                ToolError::Configuration("subscription[nats] requires 'stream'".into())
+            })?;
+            let consumer = cfg.consumer.clone().ok_or_else(|| {
+                ToolError::Configuration("subscription[nats] requires 'consumer'".into())
+            })?;
+            Ok(Box::new(super::source::nats::NatsSource::new(
+                conn, stream, consumer,
+            )))
         }
+
+        #[cfg(feature = "pubsub")]
+        "pubsub" => {
+            let subscription = cfg.subscription.clone().ok_or_else(|| {
+                ToolError::Configuration(
+                    "subscription[pubsub] requires 'subscription' \
+                     (projects/<p>/subscriptions/<s>)"
+                        .into(),
+                )
+            })?;
+            // A bearer token may be carried in the credential alias.
+            let bearer = cfg.auth.as_deref().and_then(|alias| {
+                ctx.get_secret(alias).and_then(|raw| {
+                    serde_json::from_str::<serde_json::Value>(raw)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("token")
+                                .or_else(|| v.get("access_token"))
+                                .and_then(|t| t.as_str())
+                                .map(str::to_string)
+                        })
+                })
+            });
+            Ok(Box::new(super::source::pubsub::PubSubSource::new(
+                subscription,
+                cfg.endpoint.clone(),
+                bearer,
+            )?))
+        }
+
+        #[cfg(feature = "kafka")]
+        "kafka" => {
+            let brokers = parse_brokers(cfg)?;
+            let topic = cfg.topic.clone().ok_or_else(|| {
+                ToolError::Configuration("subscription[kafka] requires 'topic'".into())
+            })?;
+            let group = cfg.group.clone().ok_or_else(|| {
+                ToolError::Configuration("subscription[kafka] requires 'group'".into())
+            })?;
+            Ok(Box::new(super::source::kafka::KafkaSource::new(
+                brokers, topic, group,
+            )))
+        }
+
+        other => Err(ToolError::Configuration(format!(
+            "Unknown or unavailable subscription source '{}'. \
+             Available: {}",
+            other,
+            available_sources()
+        ))),
     }
 }
 
