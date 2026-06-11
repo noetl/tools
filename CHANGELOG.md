@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.2.0](https://github.com/noetl/tools/compare/v3.1.1...v3.2.0) (2026-06-11)
+
+### Features
+
+* **subscription:** bounded-drain subscription tool + source-client abstraction ([#50](https://github.com/noetl/tools/issues/50)) ([438b1b4](https://github.com/noetl/tools/commit/438b1b4dc14b14ed6fd2669e90763c9cbd0335b6)), closes [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [3.1.1](https://github.com/noetl/tools/compare/v3.1.0...v3.1.1) (2026-06-11)
 
 ### Bug Fixes
