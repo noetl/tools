@@ -11,6 +11,9 @@
 //! - `transfer` - Transfer data between sources
 //! - `script` - Execute scripts as Kubernetes jobs
 //! - `mcp` - MCP (Model Context Protocol) JSON-RPC bridge
+//! - `subscription` - Bounded-drain message subscription poll (NATS /
+//!   Pub/Sub / Kafka) behind the [`source`] source-client abstraction
+//!   (noetl/ai-meta#90 Phase 1)
 
 mod artifact;
 mod container;
@@ -28,6 +31,8 @@ mod rhai;
 mod script;
 mod shell;
 mod snowflake;
+pub mod source;
+mod subscription;
 mod task_sequence;
 mod transfer;
 
@@ -47,6 +52,7 @@ pub use self::rhai::RhaiTool;
 pub use self::script::ScriptTool;
 pub use self::shell::ShellTool;
 pub use self::snowflake::SnowflakeTool;
+pub use self::subscription::SubscriptionTool;
 pub use self::task_sequence::TaskSequenceTool;
 pub use self::transfer::TransferTool;
 
@@ -74,6 +80,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(ContainerTool::new());
     registry.register(NatsTool::new());
     registry.register(McpTool::new());
+    registry.register(SubscriptionTool::new());
 
     registry
 }
