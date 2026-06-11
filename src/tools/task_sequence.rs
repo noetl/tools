@@ -306,6 +306,35 @@ impl Tool for TaskSequenceTool {
             let result_data = task_result.data.clone().unwrap_or(serde_json::Value::Null);
             labeled_results.insert(label.clone(), result_data.clone());
 
+            // noetl/ai-meta#87: expose this sub-tool's result under its
+            // label in the running context so a LATER sibling sub-tool
+            // in the same multi-tool step can reference it via
+            // `{{ <label>.<field> }}`.  Before this, only
+            // `set:`-propagated values and the immediately-preceding
+            // `output` were visible; a direct sibling reference rendered
+            // empty — e.g. `{{ generate_large.metadata.record_count }}`
+            // collapsed to `VALUES ('large_payload_test', , ...)` and
+            // DuckDB raised `syntax error at or near ","`.  The bug was
+            // masked wherever the reference sat in a quoted position (an
+            // empty render is a valid `''`).
+            //
+            // Mirror the server's `build_context` shape (state.rs): when
+            // the result is an object without its own `data` key, add a
+            // synthetic `data` self-reference so both `{{ label.field }}`
+            // and `{{ label.data.field }}` resolve — matching how a
+            // single-tool step's result is exposed to next.arcs /
+            // step.when downstream.  The result is also visible to a
+            // later python sub-tool via the stdin `variables` map.
+            let sibling_value = match &result_data {
+                serde_json::Value::Object(map) if !map.contains_key("data") => {
+                    let mut m = map.clone();
+                    m.insert("data".to_string(), result_data.clone());
+                    serde_json::Value::Object(m)
+                }
+                _ => result_data.clone(),
+            };
+            running_ctx.variables.insert(label.clone(), sibling_value);
+
             // Forward propagation: evaluate `set:` expressions
             // against the running context augmented with `output`
             // (this tool's result data), then merge the resolved
@@ -761,6 +790,109 @@ mod tests {
             Some(20),
             "second task should see computed_value = 10 via set:/input: and double it"
         );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_sibling_reference_without_set() {
+        // noetl/ai-meta#87: a later sub-tool references an earlier
+        // sibling's output directly by label — `{{ <label>.<field> }}`
+        // — with NO `set:` and NO `input:` plumbing.  Before the fix
+        // the reference rendered empty; here `record_count` collapsing
+        // to nothing would make the consumer's `result = {'count': }`
+        // a Python syntax error (the same failure shape as the
+        // unquoted-SQL `VALUES (..., , ...)` in save_edge_cases).
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "generate_large": {
+                        "kind": "python",
+                        "code": "result = {'metadata': {'record_count': 100}, 'records': []}"
+                    }
+                },
+                {
+                    "save_large_payload": {
+                        "kind": "python",
+                        // Unquoted numeric position — mirrors the DuckDB
+                        // `VALUES ('x', {{ generate_large.metadata.record_count }}, ...)`.
+                        "code": "result = {'count': {{ generate_large.metadata.record_count }}}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+
+        assert!(
+            result.is_success(),
+            "sibling reference must resolve; pipeline failed: {:?}",
+            result.error,
+        );
+        let data = result.data.expect("data present");
+        let count = data
+            .get("save_large_payload")
+            .and_then(|v| v.get("count"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(
+            count,
+            Some(100),
+            "later sub-tool must read the earlier sibling's nested field",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_sibling_reference_synthetic_data_accessor() {
+        // The sibling result is exposed under both `{{ label.field }}`
+        // and `{{ label.data.field }}` (the synthetic `.data`
+        // self-reference mirrors the server's build_context shape), and
+        // a producer that already returns a `data` key keeps its real
+        // nested shape under `{{ label.data.field }}`.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "flat_producer": {
+                        "kind": "python",
+                        "code": "result = {'n': 7}"
+                    }
+                },
+                {
+                    "wrapped_producer": {
+                        "kind": "python",
+                        // Already carries its own `data` key.
+                        "code": "result = {'status': 'ok', 'data': {'m': 9}}"
+                    }
+                },
+                {
+                    "consume": {
+                        "kind": "python",
+                        // Synthetic `.data` on the flat producer +
+                        // real `.data` on the wrapped one.
+                        "code": "result = {'flat': {{ flat_producer.data.n }}, 'wrapped': {{ wrapped_producer.data.m }}}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+
+        assert!(
+            result.is_success(),
+            "both data accessors must resolve; failed: {:?}",
+            result.error,
+        );
+        let data = result.data.expect("data present");
+        let consume = data.get("consume").expect("consume result");
+        assert_eq!(consume.get("flat").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(consume.get("wrapped").and_then(|v| v.as_i64()), Some(9));
     }
 
     #[tokio::test]
