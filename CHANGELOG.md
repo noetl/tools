@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.1](https://github.com/noetl/tools/compare/v3.1.0...v3.1.1) (2026-06-11)
+
+### Bug Fixes
+
+* **task_sequence:** expose sibling sub-tool results to later sub-tools ([#48](https://github.com/noetl/tools/issues/48)) ([e931ca0](https://github.com/noetl/tools/commit/e931ca0e1f3f58dd997090487246b6ff67fa6a1f)), closes [noetl/ai-meta#87](https://github.com/noetl/ai-meta/issues/87)
+
 ## [3.1.0](https://github.com/noetl/tools/compare/v3.0.0...v3.1.0) (2026-06-10)
 
 ### Features
