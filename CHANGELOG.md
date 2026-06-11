@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.3.0](https://github.com/noetl/tools/compare/v3.2.0...v3.3.0) (2026-06-11)
+
+### Features
+
+* header-directive engine + public build_source factory ([#90](https://github.com/noetl/tools/issues/90) Phase 2) ([#52](https://github.com/noetl/tools/issues/52)) ([49ddbe4](https://github.com/noetl/tools/commit/49ddbe4528c4510f58d6ef82e653935cd54a6b39))
+
 ## [3.2.0](https://github.com/noetl/tools/compare/v3.1.1...v3.2.0) (2026-06-11)
 
 ### Features
