@@ -539,6 +539,434 @@ struct GcsObject {
     size: String,
 }
 
+// ---------------------------------------------------------------------------
+// s3 backend
+// ---------------------------------------------------------------------------
+
+/// AWS S3 (and any S3-compatible store: MinIO, Cloudflare R2, Backblaze B2)
+/// spool backend (noetl/ai-meta#94) — the durable buffer for runtimes that
+/// use an S3 bucket instead of GCS or NATS Object Store.
+///
+/// Mirrors [`GcsBackend`]: one bucket holds many subscriptions' spools,
+/// separated by `prefix` (`subscriptions/orders/spool/` for the live buffer,
+/// `subscriptions/orders/dlq/` for the dead-letter sibling). Items are stored
+/// under `{prefix}{object_key}` where `object_key` is the zero-padded
+/// `recv_seq`, so a `prefix`-scoped `ListObjectsV2` returns them in receive
+/// order — the cheap path for `ordering: global`.
+///
+/// Authentication is **hand-rolled AWS Signature Version 4** over the crate's
+/// existing `reqwest` client + `hmac`/`sha2` — no AWS SDK, no new heavy
+/// dependency, the same lean shape the `gcs` backend takes with the GCS JSON
+/// API. Credentials (access key / secret / region / endpoint) resolve from
+/// the NoETL keychain by alias (`spool.credential`) per
+/// `data-access-boundary.md` — an external system, so keychain/Wallet-auth,
+/// never a worker env var.
+///
+/// Path-style addressing (`{endpoint}/{bucket}/{key}`) is used — required by
+/// MinIO and still honored by AWS for existing buckets; virtual-host style is
+/// a future extension the constructor can grow.
+#[cfg(feature = "s3")]
+#[derive(Clone)]
+pub struct S3Backend {
+    client: reqwest::Client,
+    bucket: String,
+    /// Object-name prefix (ends with `/` unless empty).
+    prefix: String,
+    /// API endpoint base, no trailing slash. Real S3:
+    /// `https://s3.<region>.amazonaws.com`; MinIO: `http://minio.minio:9000`.
+    endpoint: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    /// Temporary-credential session token (STS / IRSA). `None` for static
+    /// access-key pairs (MinIO, long-lived IAM users).
+    session_token: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+impl S3Backend {
+    /// Build an S3 spool backend from explicit credentials + endpoint. The
+    /// bucket is assumed to already exist (provisioning is an admin op, not a
+    /// runtime op — same contract as the GCS backend).
+    pub fn new(
+        bucket: &str,
+        prefix: &str,
+        endpoint: &str,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+        session_token: Option<String>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            bucket: bucket.to_string(),
+            prefix: Self::norm_prefix(prefix),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            region: region.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token,
+        }
+    }
+
+    fn norm_prefix(prefix: &str) -> String {
+        if prefix.is_empty() || prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/")
+        }
+    }
+
+    fn name_for(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
+    }
+
+    /// Host authority of the endpoint (what the signed `host` header + the
+    /// `Host` reqwest sends must agree on).
+    fn host(&self) -> String {
+        self.endpoint
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
+    }
+
+    /// Percent-encode a URI path, preserving `/` (S3 canonical URIs are
+    /// single-encoded with slashes kept). Our keys are object-store-safe
+    /// (`sanitize_key` restricts to alnum/`-`/`_`/`.`), so in practice this is
+    /// an identity transform — which also sidesteps the reqwest URL
+    /// re-encoding pitfall.
+    fn uri_encode_path(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// Percent-encode a query component (no `/` exemption — SigV4 requires
+    /// every reserved char encoded).
+    fn uri_encode_query(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// Sign one request with AWS SigV4 and send it. `object_path` is the
+    /// object name within the bucket (already `name_for`'d, unencoded; empty
+    /// for a bucket-level `ListObjectsV2`); `query` is the unsorted/unencoded
+    /// `(key, value)` list; `body` is the request body (empty for
+    /// GET/DELETE/LIST). Payload is signed (not `UNSIGNED-PAYLOAD`).
+    async fn signed_request(
+        &self,
+        method: reqwest::Method,
+        object_path: &str,
+        query: &[(&str, String)],
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<reqwest::Response, ToolError> {
+        let (amzdate, datestamp) = amz_dates();
+        let host = self.host();
+        let payload_hash = super::item::sha256_hex(&body);
+
+        // Canonical URI (path-style): /{bucket}[/{object_path}].
+        let canonical_path = if object_path.is_empty() {
+            format!("/{}", self.bucket)
+        } else {
+            format!("/{}/{}", self.bucket, object_path)
+        };
+        let canonical_uri = Self::uri_encode_path(&canonical_path);
+
+        // Canonical query string: encode each pair, then sort by encoded key.
+        let mut q: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| (Self::uri_encode_query(k), Self::uri_encode_query(v)))
+            .collect();
+        q.sort();
+        let canonical_query = q
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        // Canonical headers — sign host + the x-amz-* set (sorted, lowercased).
+        let mut signed: Vec<(String, String)> = vec![
+            ("host".to_string(), host.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-date".to_string(), amzdate.clone()),
+        ];
+        if let Some(tok) = &self.session_token {
+            signed.push(("x-amz-security-token".to_string(), tok.clone()));
+        }
+        signed.sort();
+        let canonical_headers = signed
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}\n"))
+            .collect::<String>();
+        let signed_headers = signed
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            canonical_uri,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        );
+
+        let scope = format!("{datestamp}/{}/s3/aws4_request", self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amzdate,
+            scope,
+            super::item::sha256_hex(canonical_request.as_bytes()),
+        );
+
+        let key = sigv4_signing_key(&self.secret_key, &datestamp, &self.region, "s3");
+        let signature = hex_lower(&hmac_sha256(&key, string_to_sign.as_bytes()));
+
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            self.access_key, scope, signed_headers, signature,
+        );
+
+        // Build the request URL with the already-encoded canonical query (the
+        // `url` crate leaves valid %XX / unreserved / `=` / `&` verbatim, so
+        // the signed query and the wire query stay byte-identical).
+        let mut url = format!("{}{}", self.endpoint, canonical_uri);
+        if !canonical_query.is_empty() {
+            url.push('?');
+            url.push_str(&canonical_query);
+        }
+
+        let mut req = self
+            .client
+            .request(method, &url)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("x-amz-date", &amzdate)
+            .header("Authorization", authorization);
+        if let Some(tok) = &self.session_token {
+            req = req.header("x-amz-security-token", tok);
+        }
+        if let Some(ct) = content_type {
+            req = req.header("Content-Type", ct);
+        }
+        if !body.is_empty() {
+            req = req.body(body);
+        }
+        req.send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("spool s3 request to '{}' failed: {e}", self.bucket)))
+    }
+}
+
+#[cfg(feature = "s3")]
+#[async_trait]
+impl SpoolBackend for S3Backend {
+    fn kind(&self) -> &'static str {
+        "s3"
+    }
+
+    async fn put(&self, item: &SpoolItem) -> Result<(), ToolError> {
+        let name = self.name_for(&item.object_key());
+        let resp = self
+            .signed_request(
+                reqwest::Method::PUT,
+                &name,
+                &[],
+                item.to_bytes(),
+                Some("application/json"),
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "spool s3 put '{name}' to '{}' returned {status}: {body}",
+                self.bucket
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<SpoolMeta>, ToolError> {
+        let mut metas = Vec::new();
+        let mut cont: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, String)> = vec![
+                ("list-type", "2".to_string()),
+                ("prefix", self.prefix.clone()),
+            ];
+            if let Some(c) = &cont {
+                query.push(("continuation-token", c.clone()));
+            }
+            let resp = self
+                .signed_request(reqwest::Method::GET, "", &query, Vec::new(), None)
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ToolError::ExecutionFailed(format!(
+                    "spool s3 list '{}' returned {status}: {body}",
+                    self.bucket
+                )));
+            }
+            let xml = resp.text().await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("spool s3 list '{}' read failed: {e}", self.bucket))
+            })?;
+            let (objects, next) = parse_list_v2(&xml);
+            for (key, size) in objects {
+                // Strip the prefix so SpoolMeta.key is the bare object_key the
+                // engine orders/gets/deletes by.
+                let Some(bare) = key.strip_prefix(&self.prefix) else {
+                    continue;
+                };
+                if bare.is_empty() {
+                    continue;
+                }
+                metas.push(SpoolMeta {
+                    key: bare.to_string(),
+                    size,
+                });
+            }
+            match next {
+                Some(t) if !t.is_empty() => cont = Some(t),
+                _ => break,
+            }
+        }
+        metas.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(metas)
+    }
+
+    async fn get(&self, key: &str) -> Result<SpoolItem, ToolError> {
+        let name = self.name_for(key);
+        let resp = self
+            .signed_request(reqwest::Method::GET, &name, &[], Vec::new(), None)
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "spool s3 get '{name}' returned {status}: {body}"
+            )));
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("spool s3 get '{name}' read failed: {e}"))
+        })?;
+        SpoolItem::from_bytes(&bytes)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ToolError> {
+        let name = self.name_for(key);
+        let resp = self
+            .signed_request(reqwest::Method::DELETE, &name, &[], Vec::new(), None)
+            .await?;
+        // S3 DELETE is 204 on success and also 204 for a missing key; treat
+        // 404 as already-gone too → idempotent, like the other backends.
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(ToolError::ExecutionFailed(format!(
+                "spool s3 delete '{name}' returned {status}: {body}"
+            )))
+        }
+    }
+}
+
+/// Minimal `ListObjectsV2` XML extractor — pulls `(key, size)` per
+/// `<Contents>` block and the `<NextContinuationToken>`. Our object keys are
+/// object-store-safe (alnum/`-`/`_`/`.` + prefix slashes), so no XML entity
+/// decoding is needed. Avoids pulling an XML crate into the lean spool crate.
+#[cfg(feature = "s3")]
+fn parse_list_v2(xml: &str) -> (Vec<(String, u64)>, Option<String>) {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Contents>") {
+        let after = &rest[start + "<Contents>".len()..];
+        let Some(end) = after.find("</Contents>") else {
+            break;
+        };
+        let block = &after[..end];
+        if let Some(key) = xml_tag(block, "Key") {
+            let size = xml_tag(block, "Size")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push((key, size));
+        }
+        rest = &after[end + "</Contents>".len()..];
+    }
+    let next = xml_tag(xml, "NextContinuationToken");
+    (out, next)
+}
+
+/// Extract the inner text of the first `<tag>…</tag>` in `haystack`.
+#[cfg(feature = "s3")]
+fn xml_tag(haystack: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = haystack.find(&open)? + open.len();
+    let end = haystack[start..].find(&close)? + start;
+    Some(haystack[start..end].to_string())
+}
+
+/// HMAC-SHA256 of `data` under `key`.
+#[cfg(feature = "s3")]
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Derive the AWS SigV4 signing key (the four-step HMAC chain).
+#[cfg(feature = "s3")]
+fn sigv4_signing_key(secret: &str, datestamp: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), datestamp.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+/// Lower-case hex of `bytes`.
+#[cfg(feature = "s3")]
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Current UTC as the SigV4 `(x-amz-date, datestamp)` pair.
+#[cfg(feature = "s3")]
+fn amz_dates() -> (String, String) {
+    let now = chrono::Utc::now();
+    (
+        now.format("%Y%m%dT%H%M%SZ").to_string(),
+        now.format("%Y%m%d").to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +1098,120 @@ mod tests {
         backend.delete(&metas[0].key).await.unwrap();
 
         // clean up the remaining items so reruns start clean
+        for m in backend.list().await.unwrap() {
+            backend.delete(&m.key).await.unwrap();
+        }
+        assert!(backend.is_empty().await.unwrap());
+    }
+
+    // ---- s3 backend ----
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_sigv4_signing_key_matches_aws_reference_vector() {
+        // The documented AWS SigV4 signing-key derivation example
+        // (secret/date/region/service → signing key). Locks the HMAC chain.
+        let key = sigv4_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20120215",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex_lower(&key),
+            "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
+        );
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_prefix_normalized_and_name_joined() {
+        let b = S3Backend::new(
+            "bkt", "sub/spool", "http://minio:9000", "us-east-1", "ak", "sk", None,
+        );
+        assert_eq!(b.prefix, "sub/spool/");
+        assert_eq!(
+            b.name_for("00000000000000000001-abc"),
+            "sub/spool/00000000000000000001-abc"
+        );
+        assert_eq!(b.host(), "minio:9000");
+        assert_eq!(S3Backend::norm_prefix(""), "");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_uri_encoders() {
+        // path keeps '/', query encodes it; both encode reserved chars.
+        assert_eq!(S3Backend::uri_encode_path("a/b-c.d_e~f"), "a/b-c.d_e~f");
+        assert_eq!(S3Backend::uri_encode_query("a/b=c"), "a%2Fb%3Dc");
+        // a base64 continuation token round-trips through query encoding
+        assert_eq!(S3Backend::uri_encode_query("aGVsbG8+/w=="), "aGVsbG8%2B%2Fw%3D%3D");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_parse_list_v2_extracts_keys_sizes_and_token() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bkt</Name>
+  <Prefix>sub/spool/</Prefix>
+  <IsTruncated>true</IsTruncated>
+  <Contents><Key>sub/spool/00000000000000000001-a</Key><Size>120</Size><StorageClass>STANDARD</StorageClass></Contents>
+  <Contents><Key>sub/spool/00000000000000000002-b</Key><Size>240</Size></Contents>
+  <NextContinuationToken>1ueGcxLPRx1Tr/XYExampleToken</NextContinuationToken>
+</ListBucketResult>"#;
+        let (objs, next) = parse_list_v2(xml);
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0], ("sub/spool/00000000000000000001-a".to_string(), 120));
+        assert_eq!(objs[1].1, 240);
+        assert_eq!(next.as_deref(), Some("1ueGcxLPRx1Tr/XYExampleToken"));
+
+        // last page (no token)
+        let (objs2, next2) = parse_list_v2("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
+        assert!(objs2.is_empty());
+        assert!(next2.is_none());
+    }
+
+    /// Live round-trip against a real S3 / S3-compatible endpoint (MinIO).
+    /// Gated on env so it never runs in CI without a bucket. Run e.g.:
+    /// `NOETL_S3_TEST_BUCKET=spool NOETL_S3_ENDPOINT=http://localhost:9000 \
+    ///  NOETL_S3_ACCESS_KEY=minioadmin NOETL_S3_SECRET_KEY=minioadmin \
+    ///  cargo test --features s3 s3_live -- --ignored --nocapture`.
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    #[ignore]
+    async fn s3_live_put_list_get_delete_roundtrip() {
+        let Ok(bucket) = std::env::var("NOETL_S3_TEST_BUCKET") else {
+            eprintln!("skipping: NOETL_S3_TEST_BUCKET unset");
+            return;
+        };
+        let endpoint = std::env::var("NOETL_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.us-east-1.amazonaws.com".to_string());
+        let region = std::env::var("NOETL_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let access = std::env::var("NOETL_S3_ACCESS_KEY").expect("NOETL_S3_ACCESS_KEY");
+        let secret = std::env::var("NOETL_S3_SECRET_KEY").expect("NOETL_S3_SECRET_KEY");
+        let prefix = format!("noetl-spool-test/{}", std::process::id());
+        let backend = S3Backend::new(&bucket, &prefix, &endpoint, &region, &access, &secret, None);
+
+        assert!(backend.is_empty().await.unwrap(), "test prefix must start empty");
+
+        backend.put(&item(2, "b", serde_json::json!({"v": 2}))).await.unwrap();
+        backend.put(&item(1, "a", serde_json::json!({"v": 1}))).await.unwrap();
+        backend.put(&item(3, "c", serde_json::json!({"v": 3}))).await.unwrap();
+
+        let metas = backend.list().await.unwrap();
+        assert_eq!(metas.len(), 3, "all three items listed");
+        // list is in receive order despite insert order
+        assert_eq!(backend.get(&metas[0].key).await.unwrap().recv_seq, 1);
+        assert_eq!(backend.get(&metas[2].key).await.unwrap().recv_seq, 3);
+        assert!(backend.total_bytes().await.unwrap() > 0);
+
+        let got = backend.get(&metas[0].key).await.unwrap();
+        assert_eq!(got.message_id, "a");
+
+        backend.delete(&metas[0].key).await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 2);
+        backend.delete(&metas[0].key).await.unwrap(); // idempotent
+
         for m in backend.list().await.unwrap() {
             backend.delete(&m.key).await.unwrap();
         }
