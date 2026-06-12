@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.6.0](https://github.com/noetl/tools/compare/v3.5.0...v3.6.0) (2026-06-12)
+
+### Features
+
+* s3 store-and-forward spool backend (SigV4, S3-compatible) ([2d4b5f1](https://github.com/noetl/tools/commit/2d4b5f1616de3f9b2585c267ab688028a6ed4608)), closes [noetl/ai-meta#94](https://github.com/noetl/ai-meta/issues/94) [noetl/ai-meta#94](https://github.com/noetl/ai-meta/issues/94)
+
 ## [3.5.0](https://github.com/noetl/tools/compare/v3.4.0...v3.5.0) (2026-06-12)
 
 ### Features
