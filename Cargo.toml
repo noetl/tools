@@ -13,12 +13,18 @@ description = "NoETL Tool Library - Shared tool implementations for workflow exe
 # Kafka are feature-gated per RFC OQ11 so a minimal build can opt out of the
 # extra dependency weight; both are on by default so the shipped worker
 # supports all three sources.
-default = ["pubsub", "kafka"]
+default = ["pubsub", "kafka", "gcs"]
 # Pub/Sub pull backend — reuses the existing reqwest client + gcp_auth ADC
 # provider, so it adds no new dependency, only the source module.
 pubsub = []
 # Kafka bounded-poll backend — pulls the pure-Rust `kafka` crate.
 kafka = ["dep:kafka"]
+# GCS store-and-forward spool backend (noetl/ai-meta#90 Phase 5).  Reuses the
+# existing reqwest client + gcp_auth ADC provider (the same pair the `pubsub`
+# source uses), so it adds no new dependency — only the backend module.  On
+# by default so the shipped worker can spool to a GCS bucket out-of-cluster
+# (Cloud Run / Workload Identity); opt out for a minimal NATS-only build.
+gcs = []
 
 [dependencies]
 # Async runtime

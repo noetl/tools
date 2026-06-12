@@ -44,6 +44,8 @@ pub mod item;
 pub mod probe;
 
 pub use backend::{LocalDiskBackend, NatsObjectBackend, SpoolBackend, SpoolMeta};
+#[cfg(feature = "gcs")]
+pub use backend::GcsBackend;
 pub use circuit::{
     CircuitBreaker, CircuitConfig, CircuitDecision, CircuitPhase, CircuitRegistry, CircuitState,
     DownstreamSpec, ProbeKind,
