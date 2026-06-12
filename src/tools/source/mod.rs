@@ -181,7 +181,7 @@ impl PollOptions {
 /// Every backend produces this same shape so the dispatched playbook (and
 /// later the directive engine, RFC §7) sees a uniform envelope regardless
 /// of source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolledMessage {
     /// Source message id — JetStream stream sequence, Pub/Sub `messageId`,
     /// or Kafka `partition:offset`.  Stable for idempotency keying.

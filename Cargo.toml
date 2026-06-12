@@ -1,6 +1,6 @@
 [package]
 name = "noetl-tools"
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -30,6 +30,10 @@ async-nats = "0.38"
 
 # Byte buffer used by async-nats object_store put stream.
 bytes = "1"
+
+# SHA-256 integrity hashing for the store-and-forward spool item envelope
+# (RFC #90 Phase 4 — spool payload-ref + sha256 in the event log).
+sha2 = "0.10"
 
 # Async stream combinators (object_list, kv_keys).
 futures = "0.3"

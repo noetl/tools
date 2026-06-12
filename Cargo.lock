@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "3.3.0"
+version = "3.4.0"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2482,6 +2482,7 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
