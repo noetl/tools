@@ -1,0 +1,19 @@
+[package]
+name = "noetl-directives"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/noetl/noetl"
+homepage = "https://noetl.io"
+description = "NoETL header/attribute directive engine — the lean, serde-only allowlist + value-allowlist logic shared by the internet-facing gateway and the worker/tools subscription runtime (noetl/ai-meta#90 §7)."
+keywords = ["noetl", "directives", "subscription", "routing"]
+categories = ["parsing"]
+
+# Deliberately lean: serde + thiserror only.  This crate is consumed by the
+# internet-facing noetl-gateway, which must NOT pull duckdb/kube/tokio — so
+# the security-sensitive directive allowlist has ONE implementation without
+# dragging the heavy noetl-tools dependency graph onto the edge.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

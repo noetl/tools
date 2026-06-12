@@ -60,6 +60,17 @@ impl From<std::io::Error> for ToolError {
     }
 }
 
+/// Bridge the lean `noetl-directives` error (noetl/ai-meta#92) into the
+/// tool-execution channel so a `DirectiveSpec::parse(...)?` inside a
+/// `Result<_, ToolError>` context maps cleanly.
+impl From<noetl_directives::DirectiveError> for ToolError {
+    fn from(e: noetl_directives::DirectiveError) -> Self {
+        match e {
+            noetl_directives::DirectiveError::Configuration(m) => ToolError::Configuration(m),
+        }
+    }
+}
+
 impl From<serde_json::Error> for ToolError {
     fn from(e: serde_json::Error) -> Self {
         ToolError::Json(e.to_string())

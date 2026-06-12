@@ -2466,6 +2466,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-directives"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "noetl-tools"
 version = "3.7.1"
 dependencies = [
@@ -2488,6 +2497,7 @@ dependencies = [
  "kube",
  "minijinja",
  "noetl-arrow-flight-client",
+ "noetl-directives",
  "regex",
  "reqwest",
  "rhai",

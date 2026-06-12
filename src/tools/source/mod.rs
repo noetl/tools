@@ -33,16 +33,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ToolError;
 
-pub mod directives;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod nats;
 #[cfg(feature = "pubsub")]
 pub mod pubsub;
 
-pub use directives::{
-    AppliedDirective, Control, DirectiveRule, DirectiveSpec, DispatchPlan, TraceConfig,
-    TraceContext, TracePropagation,
+// The header/attribute directive engine now lives in the standalone, lean
+// `noetl-directives` crate (noetl/ai-meta#92) so the internet-facing
+// noetl-gateway can consume the same security-sensitive allowlist without
+// pulling noetl-tools' heavy graph.  Re-exported here so existing
+// `noetl_tools::tools::source::{DirectiveSpec, DispatchPlan, …}` call sites
+// (the worker subscription runtime) are unchanged.
+pub use noetl_directives::{
+    extract_w3c_trace, normalize_http_headers, AppliedDirective, Control, DirectiveError,
+    DirectiveRule, DirectiveSpec, DispatchPlan, TraceConfig, TraceContext, TracePropagation,
 };
 
 // ---------------------------------------------------------------------------
