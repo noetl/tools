@@ -141,6 +141,19 @@ pub fn spool_ref(subscription: &str, recv_seq: u64, message_id: &str) -> String 
     format!("noetl://spool/{subscription}/{recv_seq}/{message_id}")
 }
 
+/// Parse the `recv_seq` back out of a backend object key (the zero-padded
+/// prefix before the first `-`). Used on runtime startup to recover the
+/// receive-sequence high-water mark from a surviving spool so new items
+/// continue the monotone sequence rather than colliding with the backlog
+/// (noetl/ai-meta#93). Returns `None` for a key that isn't in the
+/// [`SpoolItem::object_key`] shape.
+pub fn recv_seq_from_object_key(key: &str) -> Option<u64> {
+    if key.len() < RECV_SEQ_WIDTH {
+        return None;
+    }
+    key[..RECV_SEQ_WIDTH].parse::<u64>().ok()
+}
+
 /// Lower-case hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -251,5 +264,16 @@ mod tests {
     fn sanitize_key_strips_unsafe_chars() {
         let i = SpoolItem::new("s", "nats", msg("a/b c:d", serde_json::json!(1)), None, 1, None, "d", "circuit_open", 0);
         assert!(i.object_key().ends_with("a_b_c_d"));
+    }
+
+    #[test]
+    fn recv_seq_round_trips_through_object_key() {
+        for seq in [1u64, 7, 42, 1000, u64::MAX] {
+            let i = SpoolItem::new("s", "nats", msg("m", serde_json::json!(1)), None, seq, None, "d", "circuit_open", 0);
+            assert_eq!(recv_seq_from_object_key(&i.object_key()), Some(seq));
+        }
+        // not an object key
+        assert_eq!(recv_seq_from_object_key("garbage"), None);
+        assert_eq!(recv_seq_from_object_key(""), None);
     }
 }

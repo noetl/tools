@@ -143,6 +143,24 @@ impl SpoolEngine {
         self.backend.is_empty().await
     }
 
+    /// The highest `recv_seq` currently in the spool, or 0 when empty.
+    ///
+    /// Derived cheaply from the backend object-key listing (no payload
+    /// fetch). On runtime startup the spool runtime seeds its `recv_seq`
+    /// counter from this so items spooled after a restart continue the
+    /// monotone sequence — otherwise a fresh `recv_seq = 1` would sort
+    /// ahead of surviving backlog and corrupt `ordering: global` replay
+    /// (noetl/ai-meta#93).
+    pub async fn high_water_recv_seq(&self) -> Result<u64, ToolError> {
+        let mut max = 0u64;
+        for meta in self.backend.list().await? {
+            if let Some(seq) = super::recv_seq_from_object_key(&meta.key) {
+                max = max.max(seq);
+            }
+        }
+        Ok(max)
+    }
+
     /// Decide whether one more item (`incoming_bytes`) fits under the
     /// retention ceiling, applying `retention.on_full`.
     pub async fn admit(&self, now_ms: u64, incoming_bytes: u64) -> Result<Admission, ToolError> {
@@ -565,6 +583,17 @@ mod tests {
         assert_eq!(report.expired.len(), 1);
         assert_eq!(report.expired[0].reason, "retention_expired");
         assert!(eng.is_empty().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn high_water_recv_seq_recovers_max_from_backlog() {
+        let mut eng = engine(spec_with(OrderingMode::Global, 3));
+        assert_eq!(eng.high_water_recv_seq().await.unwrap(), 0); // empty → 0
+        for (seq, id) in [(3, "c"), (1, "a"), (42, "z"), (2, "b")] {
+            eng.spool(&item(seq, id, None)).await.unwrap();
+        }
+        // max recv_seq across the surviving spool, regardless of insert order.
+        assert_eq!(eng.high_water_recv_seq().await.unwrap(), 42);
     }
 
     #[tokio::test]
