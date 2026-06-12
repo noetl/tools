@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.8.0](https://github.com/noetl/tools/compare/v3.7.1...v3.8.0) (2026-06-12)
+
+### Features
+
+* extract shared noetl-directives crate (de-vendor directive engine) ([85bb725](https://github.com/noetl/tools/commit/85bb7250b75a02ab622b1c04bd6d4fb70e77a738)), closes [noetl/ai-meta#92](https://github.com/noetl/ai-meta/issues/92)
+
 ## [3.7.1](https://github.com/noetl/tools/compare/v3.7.0...v3.7.1) (2026-06-12)
 
 ### Bug Fixes
