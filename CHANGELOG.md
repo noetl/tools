@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.0](https://github.com/noetl/tools/compare/v3.4.0...v3.5.0) (2026-06-12)
+
+### Features
+
+* **spool:** GCS store-and-forward backend (gcs feature) ([033b726](https://github.com/noetl/tools/commit/033b7266ece109c9f0d49d41afc421841311b3fc)), closes [noetl/tools#55](https://github.com/noetl/tools/issues/55) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [3.4.0](https://github.com/noetl/tools/compare/v3.3.0...v3.4.0) (2026-06-12)
 
 ### Features
