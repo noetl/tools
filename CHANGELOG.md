@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.4.0](https://github.com/noetl/tools/compare/v3.3.0...v3.4.0) (2026-06-12)
+
+### Features
+
+* store-and-forward spool engine + per-downstream circuit breaker ([#90](https://github.com/noetl/tools/issues/90) Phase 4) ([#54](https://github.com/noetl/tools/issues/54)) ([cf70960](https://github.com/noetl/tools/commit/cf70960e8e1a8b4c210daabed14e5fffe1ef7b0f))
+
 ## [3.3.0](https://github.com/noetl/tools/compare/v3.2.0...v3.3.0) (2026-06-11)
 
 ### Features
