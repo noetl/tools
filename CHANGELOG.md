@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.7.1](https://github.com/noetl/tools/compare/v3.7.0...v3.7.1) (2026-06-12)
+
+### Bug Fixes
+
+* pin time =0.3.47 to unblock async-nats build under rustc 1.92 ([a4fd883](https://github.com/noetl/tools/commit/a4fd883dee90d2a2ab99e808ce57e076e8687534)), closes [noetl/ai-meta#94](https://github.com/noetl/ai-meta/issues/94) [noetl/ai-meta#93](https://github.com/noetl/ai-meta/issues/93)
+
 ## [3.7.0](https://github.com/noetl/tools/compare/v3.6.0...v3.7.0) (2026-06-12)
 
 ### Features
