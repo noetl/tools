@@ -53,7 +53,7 @@ pub use circuit::{
     DownstreamSpec, ProbeKind,
 };
 pub use engine::{Admission, DeadLetter, DrainReport, GcReport, SpoolEngine, SpooledRef};
-pub use item::{sha256_hex, spool_ref, SpoolItem};
+pub use item::{recv_seq_from_object_key, sha256_hex, spool_ref, SpoolItem};
 pub use probe::probe_downstream;
 
 use serde::{Deserialize, Serialize};
