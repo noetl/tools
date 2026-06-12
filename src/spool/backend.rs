@@ -266,6 +266,279 @@ impl SpoolBackend for NatsObjectBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// gcs backend
+// ---------------------------------------------------------------------------
+
+/// Google Cloud Storage spool backend — the durable buffer for the
+/// out-of-cluster Cloud Run runtime (RFC #90 Phase 5) and any in-cluster
+/// runtime that prefers an object store over NATS.
+///
+/// Reuses the crate's existing dependencies: [`crate::auth::GcpAuth`] for
+/// Application Default Credentials (Workload Identity on Cloud Run, the
+/// gcloud ADC file locally, or `GOOGLE_APPLICATION_CREDENTIALS`) and
+/// `reqwest` against the GCS JSON API — **no new dependency, no gRPC**, the
+/// same shape the `pubsub` source backend uses.
+///
+/// One bucket holds many subscriptions' spools, separated by `prefix`
+/// (e.g. `subscriptions/orders/spool/` for the live buffer and
+/// `subscriptions/orders/dlq/` for the dead-letter sibling). Items are
+/// stored under `{prefix}{object_key}` where `object_key` is the
+/// zero-padded `recv_seq` (no slashes), so a `prefix`-scoped list returns
+/// them in receive order — the cheap path for `ordering: global`.
+///
+/// On Cloud Run the credential is the runtime service account via Workload
+/// Identity — "already-in-place trust" per `execution-model.md` (no key
+/// file, no keychain hop). The keychain-alias path for a *tenant-owned*
+/// external bucket is a future extension (the config carries the alias; ADC
+/// is the platform-bucket default).
+#[cfg(feature = "gcs")]
+#[derive(Clone)]
+pub struct GcsBackend {
+    client: reqwest::Client,
+    /// `None` when pointed at a no-auth emulator (fake-gcs-server); else the
+    /// ADC token provider.
+    auth: Option<crate::auth::GcpAuth>,
+    bucket: String,
+    /// Object-name prefix (ends with `/` unless empty) so one bucket serves
+    /// many subscriptions + the live/dlq split.
+    prefix: String,
+    /// API base URL with no trailing slash (`https://storage.googleapis.com`
+    /// for real GCS; an emulator base for tests).
+    endpoint: String,
+}
+
+#[cfg(feature = "gcs")]
+impl GcsBackend {
+    /// Open the GCS spool backend against the real API using ADC.
+    ///
+    /// `prefix` is normalized to end with `/` (unless empty). The bucket is
+    /// assumed to already exist (ops provisions it — GCS bucket creation is
+    /// a project-admin op, not a runtime op).
+    pub async fn open(bucket: &str, prefix: &str) -> Result<Self, ToolError> {
+        Ok(Self {
+            client: reqwest::Client::new(),
+            auth: Some(crate::auth::GcpAuth::new()),
+            bucket: bucket.to_string(),
+            prefix: Self::norm_prefix(prefix),
+            endpoint: "https://storage.googleapis.com".to_string(),
+        })
+    }
+
+    /// Open against an explicit endpoint (a fake-gcs-server emulator) with an
+    /// optional ADC provider — the seam the integration test + dev recipe use.
+    pub fn with_endpoint(bucket: &str, prefix: &str, endpoint: &str, use_adc: bool) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            auth: use_adc.then(crate::auth::GcpAuth::new),
+            bucket: bucket.to_string(),
+            prefix: Self::norm_prefix(prefix),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+        }
+    }
+
+    fn norm_prefix(prefix: &str) -> String {
+        if prefix.is_empty() || prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/")
+        }
+    }
+
+    /// Full object name for a bare key.
+    fn name_for(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
+    }
+
+    /// Percent-encode an object name for use in a URL path segment — GCS
+    /// requires the full name (slashes included) encoded in the `o/{name}`
+    /// path. Encodes everything outside the unreserved set.
+    fn enc_path(name: &str) -> String {
+        let mut out = String::with_capacity(name.len() * 3);
+        for b in name.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// Resolve the `Authorization` header value, if auth is configured.
+    async fn auth_header(&self) -> Result<Option<String>, ToolError> {
+        match &self.auth {
+            Some(gcp) => {
+                let token = gcp
+                    .get_token(&["https://www.googleapis.com/auth/devstorage.read_write"])
+                    .await?;
+                Ok(Some(format!("Bearer {token}")))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(feature = "gcs")]
+#[async_trait]
+impl SpoolBackend for GcsBackend {
+    fn kind(&self) -> &'static str {
+        "gcs"
+    }
+
+    async fn put(&self, item: &SpoolItem) -> Result<(), ToolError> {
+        let name = self.name_for(&item.object_key());
+        let url = format!("{}/upload/storage/v1/b/{}/o", self.endpoint, self.bucket);
+        let mut req = self
+            .client
+            .post(&url)
+            .query(&[("uploadType", "media"), ("name", name.as_str())])
+            .header("Content-Type", "application/json")
+            .body(item.to_bytes());
+        if let Some(auth) = self.auth_header().await? {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req.send().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("spool gcs put '{name}' failed: {e}"))
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "spool gcs put '{name}' to '{}' returned {status}: {body}",
+                self.bucket
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<SpoolMeta>, ToolError> {
+        let url = format!("{}/storage/v1/b/{}/o", self.endpoint, self.bucket);
+        let mut metas = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, String)> = vec![("prefix", self.prefix.clone())];
+            if let Some(tok) = &page_token {
+                query.push(("pageToken", tok.clone()));
+            }
+            let mut req = self.client.get(&url).query(&query);
+            if let Some(auth) = self.auth_header().await? {
+                req = req.header("Authorization", auth);
+            }
+            let resp = req.send().await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("spool gcs list '{}' failed: {e}", self.bucket))
+            })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ToolError::ExecutionFailed(format!(
+                    "spool gcs list '{}' returned {status}: {body}",
+                    self.bucket
+                )));
+            }
+            let page: GcsListResponse = resp.json().await.map_err(|e| {
+                ToolError::Json(format!("spool gcs list decode failed: {e}"))
+            })?;
+            for obj in page.items {
+                // Strip the prefix so SpoolMeta.key is the bare object_key the
+                // engine orders/gets/deletes by.
+                let Some(key) = obj.name.strip_prefix(&self.prefix) else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue; // the prefix "directory" placeholder, if any
+                }
+                let size = obj.size.parse::<u64>().unwrap_or(0);
+                metas.push(SpoolMeta {
+                    key: key.to_string(),
+                    size,
+                });
+            }
+            match page.next_page_token {
+                Some(tok) if !tok.is_empty() => page_token = Some(tok),
+                _ => break,
+            }
+        }
+        metas.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(metas)
+    }
+
+    async fn get(&self, key: &str) -> Result<SpoolItem, ToolError> {
+        let name = self.name_for(key);
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            Self::enc_path(&name)
+        );
+        let mut req = self.client.get(&url).query(&[("alt", "media")]);
+        if let Some(auth) = self.auth_header().await? {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req.send().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("spool gcs get '{name}' failed: {e}"))
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "spool gcs get '{name}' returned {status}: {body}"
+            )));
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("spool gcs get '{name}' read failed: {e}"))
+        })?;
+        SpoolItem::from_bytes(&bytes)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ToolError> {
+        let name = self.name_for(key);
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            Self::enc_path(&name)
+        );
+        let mut req = self.client.delete(&url);
+        if let Some(auth) = self.auth_header().await? {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req.send().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("spool gcs delete '{name}' failed: {e}"))
+        })?;
+        // 404 == already gone → idempotent, like the other backends.
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(ToolError::ExecutionFailed(format!(
+                "spool gcs delete '{name}' returned {status}: {body}"
+            )))
+        }
+    }
+}
+
+/// GCS JSON-API object-list response (the fields the spool needs).
+#[cfg(feature = "gcs")]
+#[derive(serde::Deserialize)]
+struct GcsListResponse {
+    #[serde(default)]
+    items: Vec<GcsObject>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[cfg(feature = "gcs")]
+#[derive(serde::Deserialize)]
+struct GcsObject {
+    name: String,
+    /// GCS reports object size as a decimal string.
+    #[serde(default)]
+    size: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +604,75 @@ mod tests {
         backend.put(&item(7, "same", serde_json::json!(2))).await.unwrap();
         assert_eq!(backend.len().await.unwrap(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- gcs backend ----
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn gcs_prefix_is_normalized_to_trailing_slash() {
+        assert_eq!(GcsBackend::norm_prefix("subscriptions/orders"), "subscriptions/orders/");
+        assert_eq!(GcsBackend::norm_prefix("subscriptions/orders/"), "subscriptions/orders/");
+        assert_eq!(GcsBackend::norm_prefix(""), "");
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn gcs_name_for_joins_prefix_and_key() {
+        let b = GcsBackend::with_endpoint("bkt", "sub/spool", "http://x", false);
+        assert_eq!(b.name_for("00000000000000000001-abc"), "sub/spool/00000000000000000001-abc");
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn gcs_enc_path_encodes_slashes_and_reserved() {
+        // slashes in the prefix must be percent-encoded for the o/{name} path
+        assert_eq!(GcsBackend::enc_path("a/b-c.d_e~f"), "a%2Fb-c.d_e~f");
+        assert_eq!(GcsBackend::enc_path("k=1&v"), "k%3D1%26v");
+        // unreserved set passes through untouched
+        assert_eq!(GcsBackend::enc_path("AZaz09-._~"), "AZaz09-._~");
+    }
+
+    /// Live round-trip against a real GCS bucket. Gated on
+    /// `NOETL_GCS_TEST_BUCKET` (set to a bucket the ambient ADC can write).
+    /// Run: `NOETL_GCS_TEST_BUCKET=my-bucket cargo test --features gcs gcs_live -- --ignored --nocapture`.
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    #[ignore]
+    async fn gcs_live_put_list_get_delete_roundtrip() {
+        let Ok(bucket) = std::env::var("NOETL_GCS_TEST_BUCKET") else {
+            eprintln!("skipping: NOETL_GCS_TEST_BUCKET unset");
+            return;
+        };
+        let prefix = format!("noetl-spool-test/{}", std::process::id());
+        let backend = GcsBackend::open(&bucket, &prefix).await.unwrap();
+
+        assert!(backend.is_empty().await.unwrap(), "test prefix must start empty");
+
+        backend.put(&item(2, "b", serde_json::json!({"v": 2}))).await.unwrap();
+        backend.put(&item(1, "a", serde_json::json!({"v": 1}))).await.unwrap();
+        backend.put(&item(3, "c", serde_json::json!({"v": 3}))).await.unwrap();
+
+        let metas = backend.list().await.unwrap();
+        assert_eq!(metas.len(), 3, "all three items listed");
+        // list is in receive order despite insert order
+        assert_eq!(backend.get(&metas[0].key).await.unwrap().recv_seq, 1);
+        assert_eq!(backend.get(&metas[2].key).await.unwrap().recv_seq, 3);
+        assert!(backend.total_bytes().await.unwrap() > 0);
+
+        // payload integrity survives the round-trip
+        let got = backend.get(&metas[0].key).await.unwrap();
+        assert_eq!(got.message_id, "a");
+
+        backend.delete(&metas[0].key).await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 2);
+        // delete is idempotent (404 → Ok)
+        backend.delete(&metas[0].key).await.unwrap();
+
+        // clean up the remaining items so reruns start clean
+        for m in backend.list().await.unwrap() {
+            backend.delete(&m.key).await.unwrap();
+        }
+        assert!(backend.is_empty().await.unwrap());
     }
 }
