@@ -1,33 +1,34 @@
-//! Header / attribute directive engine.
+//! Header / attribute directive engine — the shared, lean implementation.
 //!
-//! Phase 2 of the subscription/listener RFC
-//! ([noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90), RFC §7).
+//! Phase 2/3 of the subscription/listener RFC
+//! ([noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90), RFC §7);
+//! extracted into a standalone crate by
+//! [noetl/ai-meta#92](https://github.com/noetl/ai-meta/issues/92) so the
+//! security-sensitive directive allowlist has ONE home consumed by both the
+//! `noetl-tools` worker/tools runtime AND the internet-facing `noetl-gateway`
+//! (which must not pull `duckdb`/`kube`/`tokio`). It was previously a serde-only
+//! port vendored into the gateway — the drift risk that motivated this crate.
 //!
 //! ### What this is
 //!
 //! Every message source carries a metadata channel alongside the payload —
 //! Pub/Sub **attributes**, Kafka/NATS **headers**, HTTP **headers** for
-//! webhook/push ingress.  Phase 1 already normalizes all of them into one
-//! uniform [`PolledMessage::headers`](super::PolledMessage::headers) map
-//! (lowercased keys, RFC §7.1) via [`normalize_headers`](super::normalize_headers).
-//!
-//! This module is the **dispatch-layer** half of RFC §7: it turns selected,
-//! **allowlisted** headers into *instructions* that influence how the
-//! continuous runtime (RFC Mode B) dispatches a message — redirect to a
-//! different target playbook, route to a different worker pool / command
-//! segment, supply an idempotency key, hint the content type, and carry a
-//! W3C distributed-trace context into the execution.
+//! webhook/push ingress — normalized into one uniform `headers` map
+//! (lowercased keys, RFC §7.1). This module turns selected, **allowlisted**
+//! headers into *instructions* that influence how a message is dispatched:
+//! redirect to a different target playbook, route to a different worker pool /
+//! command segment, supply an idempotency key, hint the content type, and
+//! carry a W3C distributed-trace context into the execution.
 //!
 //! ### Untrusted by default (RFC §7.5)
 //!
-//! Nothing here trusts an arbitrary inbound header.  A header acts as a
+//! Nothing here trusts an arbitrary inbound header. A header acts as a
 //! directive **only** if its key appears in the configured
 //! [`DirectiveSpec::directives`] allowlist, and even then a value allowlist
-//! (`allowed:` / `map:`) constrains what target it may select.  A header not
-//! in the allowlist is data — it stays in `message.headers` and can never
-//! drive routing.  (Auth-gated directive trust for *push* ingress is Phase 3;
-//! this engine is the same in every runtime, and the gateway simply runs it
-//! only after verification succeeds.)
+//! (`allowed:` / `map:`) constrains what target it may select. A header not in
+//! the allowlist is data — it stays in `message.headers` and can never drive
+//! routing. (Auth-gated directive trust for *push* ingress is the gateway's
+//! concern: it runs this engine only after verification succeeds.)
 //!
 //! ### Output
 //!
@@ -40,7 +41,18 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ToolError;
+/// Error type for directive parsing. Lean (no dependency on the noetl-tools
+/// `ToolError` or `anyhow`) so both consumers can map it into their own error
+/// channel via `Display` — the worker maps it into `anyhow`, the gateway logs
+/// it and falls back to a no-op plan, and noetl-tools converts it via the
+/// `From<DirectiveError>` impl on its `ToolError`.
+#[derive(Debug, thiserror::Error)]
+pub enum DirectiveError {
+    /// The `headers:` directive block was malformed or violated §7.5
+    /// (a routing control without its required value constraint).
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+}
 
 // ---------------------------------------------------------------------------
 // Controls — what a directive header may bind to (RFC §7.2 table)
@@ -51,7 +63,7 @@ use crate::error::ToolError;
 #[serde(rename_all = "snake_case")]
 pub enum Control {
     /// Redirect — run a different target playbook than the subscription
-    /// default.  Constrained by an `allowed:` list (no arbitrary playbooks).
+    /// default. Constrained by an `allowed:` list (no arbitrary playbooks).
     #[serde(rename = "dispatch.playbook")]
     DispatchPlaybook,
     /// Route the run to a different worker pool / command segment.
@@ -60,12 +72,12 @@ pub enum Control {
     DispatchExecutionPool,
     /// Map a priority class to a pool/segment via `map:` (value → pool).
     Priority,
-    /// Feed the dedup window + the spool item key.  Free value (a key, not a
+    /// Feed the dedup window + the spool item key. Free value (a key, not a
     /// target).
     IdempotencyKey,
-    /// Tell the dispatched playbook how to parse the body.  Free hint.
+    /// Tell the dispatched playbook how to parse the body. Free hint.
     ContentType,
-    /// Schema hint for the body.  Free hint.
+    /// Schema hint for the body. Free hint.
     SchemaHint,
 }
 
@@ -96,7 +108,7 @@ pub struct DirectiveRule {
     /// The dispatch concern this header controls.
     pub controls: Control,
     /// Value allowlist for routing controls — only these values may be
-    /// selected (`dispatch.playbook` / `dispatch.execution_pool`).  A value
+    /// selected (`dispatch.playbook` / `dispatch.execution_pool`). A value
     /// not on the list is ignored (the directive does not apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
@@ -119,10 +131,10 @@ pub enum TracePropagation {
 /// Trace-propagation configuration (the `headers.trace` block).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceConfig {
-    /// Propagation mode.  Default `none`.
+    /// Propagation mode. Default `none`.
     #[serde(default)]
     pub propagate: TracePropagation,
-    /// Baggage keys allowed to cross the boundary.  Empty → no baggage.
+    /// Baggage keys allowed to cross the boundary. Empty → no baggage.
     #[serde(default)]
     pub baggage_allowlist: Vec<String>,
 }
@@ -140,7 +152,7 @@ impl TraceConfig {
 /// Phase 1.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DirectiveSpec {
-    /// Build `message.headers` from the source channel.  Phase 1 always
+    /// Build `message.headers` from the source channel. Phase 1 always
     /// normalizes at the source client, so this is informational; the
     /// directive engine operates on the already-normalized map regardless.
     #[serde(default)]
@@ -151,7 +163,7 @@ pub struct DirectiveSpec {
     /// Distributed-trace propagation config.
     #[serde(default)]
     pub trace: TraceConfig,
-    /// What to do with non-allowlisted headers.  Always `data` in Phase 2
+    /// What to do with non-allowlisted headers. Always `data` in Phase 2
     /// (they stay in `message.headers`); kept for forward-compat with a
     /// future `drop`.
     #[serde(default = "default_passthrough")]
@@ -169,7 +181,7 @@ fn default_passthrough() -> String {
 /// W3C trace context extracted from a message's headers (RFC §7.4).
 ///
 /// `execution_id` stays the primary NoETL trace key; this is the *external*
-/// join so cross-system traces stitch together.  It rides in the execution's
+/// join so cross-system traces stitch together. It rides in the execution's
 /// event `meta.trace` and is never a metric label (Observability P4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TraceContext {
@@ -253,11 +265,11 @@ impl DirectiveSpec {
     ///
     /// Validates that routing controls carry the value constraint they
     /// require: `dispatch.playbook` / `dispatch.execution_pool` need an
-    /// `allowed:` list, `priority` needs a `map:`.  Without it an allowlisted
+    /// `allowed:` list, `priority` needs a `map:`. Without it an allowlisted
     /// header could select an arbitrary target, defeating §7.5.
-    pub fn parse(value: &serde_json::Value) -> Result<DirectiveSpec, ToolError> {
+    pub fn parse(value: &serde_json::Value) -> Result<DirectiveSpec, DirectiveError> {
         let mut spec: DirectiveSpec = serde_json::from_value(value.clone()).map_err(|e| {
-            ToolError::Configuration(format!("Invalid subscription 'headers' block: {e}"))
+            DirectiveError::Configuration(format!("Invalid subscription 'headers' block: {e}"))
         })?;
 
         for rule in spec.directives.iter_mut() {
@@ -268,7 +280,7 @@ impl DirectiveSpec {
                 Control::DispatchPlaybook | Control::DispatchExecutionPool => {
                     let ok = rule.allowed.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
                     if !ok {
-                        return Err(ToolError::Configuration(format!(
+                        return Err(DirectiveError::Configuration(format!(
                             "directive header '{}' controls '{}' but declares no non-empty \
                              'allowed:' value list — a routing directive must constrain its \
                              targets (RFC §7.5)",
@@ -280,7 +292,7 @@ impl DirectiveSpec {
                 Control::Priority => {
                     let ok = rule.map.as_ref().map(|m| !m.is_empty()).unwrap_or(false);
                     if !ok {
-                        return Err(ToolError::Configuration(format!(
+                        return Err(DirectiveError::Configuration(format!(
                             "directive header '{}' controls 'priority' but declares no non-empty \
                              'map:' (value → pool) — a priority directive must map to allowed \
                              pools (RFC §7.5)",
@@ -299,10 +311,9 @@ impl DirectiveSpec {
     /// the [`DispatchPlan`] the runtime applies before dispatch.
     ///
     /// Only allowlisted keys are honored; routing controls are further
-    /// constrained by their `allowed:` / `map:` value lists.  Multi-value
-    /// headers (Kafka allows duplicate keys; the array shape from
-    /// [`normalize_headers`](super::normalize_headers)) are **last-wins** for
-    /// directives (RFC §10 OQ7).
+    /// constrained by their `allowed:` / `map:` value lists. Multi-value
+    /// headers (Kafka allows duplicate keys; the array shape from the source
+    /// normalizer) are **last-wins** for directives (RFC §10 OQ7).
     pub fn resolve(&self, headers: &serde_json::Map<String, serde_json::Value>) -> DispatchPlan {
         let mut plan = DispatchPlan::default();
 
@@ -359,7 +370,7 @@ impl DirectiveSpec {
         }
 
         // Precedence fix-up: a `dispatch.execution_pool` directive must win
-        // over a `priority` map even when priority was declared first.  Re-run
+        // over a `priority` map even when priority was declared first. Re-run
         // the explicit-pool rules last.
         for rule in &self.directives {
             if rule.controls == Control::DispatchExecutionPool {
@@ -388,7 +399,7 @@ impl DirectiveSpec {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Pull the effective string value from a normalized header value.  A
+/// Pull the effective string value from a normalized header value. A
 /// single-value header is a `String`; a multi-value header is an `Array` —
 /// last-wins for directives (RFC §10 OQ7).
 fn last_value(raw: &serde_json::Value) -> Option<String> {
@@ -404,7 +415,7 @@ fn last_value(raw: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// True when `value` is permitted by the (optional) value allowlist.  A
+/// True when `value` is permitted by the (optional) value allowlist. A
 /// routing control always carries one (enforced at parse); a free control
 /// passes any value.
 fn value_allowed(allowed: Option<&Vec<String>>, value: &str) -> bool {
@@ -425,10 +436,10 @@ fn applied(rule: &DirectiveRule, value: &str) -> AppliedDirective {
 /// Extract a W3C trace context from the normalized headers map.
 ///
 /// Reads `traceparent` + `tracestate`, and parses the W3C `baggage` header
-/// (`k1=v1,k2=v2`) keeping only allowlisted keys.  Validation of
-/// `traceparent` is loose — a malformed value is still carried (it is an
-/// external join, not a NoETL-authoritative id), but an obviously non-W3C
-/// shape is dropped so it never pollutes the join.
+/// (`k1=v1,k2=v2`) keeping only allowlisted keys. Validation of `traceparent`
+/// is loose — a malformed value is still carried (it is an external join, not
+/// a NoETL-authoritative id), but an obviously non-W3C shape is dropped so it
+/// never pollutes the join.
 pub fn extract_w3c_trace(
     headers: &serde_json::Map<String, serde_json::Value>,
     baggage_allowlist: &[String],
@@ -468,7 +479,7 @@ fn last_value_ref(raw: &serde_json::Value) -> Option<String> {
 }
 
 /// Loose W3C `traceparent` shape check: 4 hyphen-delimited hex fields
-/// (`version-traceid-spanid-flags`), trace-id 32 hex, span-id 16 hex.  We do
+/// (`version-traceid-spanid-flags`), trace-id 32 hex, span-id 16 hex. We do
 /// not reject an all-zero id here (that is the caller's concern) — only an
 /// obviously non-W3C string.
 fn is_plausible_traceparent(s: &str) -> bool {
@@ -479,6 +490,29 @@ fn is_plausible_traceparent(s: &str) -> bool {
         && parts[2].len() == 16
         && parts[3].len() == 2
         && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Normalize an HTTP header set into the uniform lowercased `message.headers`
+/// map (RFC §7.1). Multi-value headers collapse to an array. This is the
+/// HTTP-channel normalizer the gateway uses for push/webhook ingress, the
+/// counterpart of the noetl-tools source-client `normalize_headers`.
+pub fn normalize_http_headers(
+    raw: &[(String, String)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut acc: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, v) in raw {
+        acc.entry(k.to_ascii_lowercase()).or_default().push(v.clone());
+    }
+    let mut out = serde_json::Map::new();
+    for (k, mut vals) in acc {
+        let value = if vals.len() == 1 {
+            serde_json::Value::String(vals.pop().unwrap())
+        } else {
+            serde_json::Value::Array(vals.into_iter().map(serde_json::Value::String).collect())
+        };
+        out.insert(k, value);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -672,5 +706,17 @@ mod tests {
         assert_eq!(plan.playbook_override.as_deref(), Some("domain/handle_fraud"));
         assert_eq!(plan.execution_pool_override.as_deref(), Some("priority"));
         assert_eq!(plan.applied.len(), 2);
+    }
+
+    #[test]
+    fn normalize_http_headers_lowercases_and_groups() {
+        let raw = vec![
+            ("X-Noetl-Route".to_string(), "domain/x".to_string()),
+            ("Accept".to_string(), "a".to_string()),
+            ("Accept".to_string(), "b".to_string()),
+        ];
+        let m = normalize_http_headers(&raw);
+        assert_eq!(m.get("x-noetl-route").unwrap(), "domain/x");
+        assert_eq!(m.get("accept").unwrap(), &json!(["a", "b"]));
     }
 }

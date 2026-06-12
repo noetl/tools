@@ -1,3 +1,12 @@
+# Workspace: the noetl-tools registry crate (root package) + the lean
+# `noetl-directives` member (noetl/ai-meta#92).  The directive engine lives in
+# `directives/` and is published independently so the internet-facing
+# noetl-gateway can consume the security-sensitive allowlist WITHOUT pulling
+# noetl-tools' heavy graph (duckdb/kube/tokio).  noetl-tools re-exports it.
+[workspace]
+members = ["directives"]
+resolver = "2"
+
 [package]
 name = "noetl-tools"
 version = "3.7.1"
@@ -35,6 +44,14 @@ gcs = []
 s3 = ["dep:hmac"]
 
 [dependencies]
+# Shared header/attribute directive engine (noetl/ai-meta#92).  The lean,
+# serde-only allowlist logic, extracted so it has ONE implementation across
+# noetl-tools (this crate) and the internet-facing noetl-gateway.  Re-exported
+# from `tools::source` so existing `noetl_tools::tools::source::DirectiveSpec`
+# call sites are unchanged.  Path dep within the workspace; the published
+# `version` is what external consumers resolve.
+noetl-directives = { version = "0.1", path = "directives" }
+
 # Async runtime
 tokio = { version = "1", features = ["process", "fs", "sync", "time", "io-util", "rt-multi-thread"] }
 

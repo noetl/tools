@@ -56,11 +56,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish crate
+      # Publish the workspace member `noetl-directives` FIRST — noetl-tools
+      # depends on it, so `cargo publish` of the root crate needs it resolvable
+      # from crates.io (noetl/ai-meta#92).  Idempotent: skip if this version is
+      # already published (a re-run, or a release that didn't bump the member).
+      - name: Publish noetl-directives (if changed)
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
-        run: cargo publish
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version = ' directives/Cargo.toml | head -1 | cut -d'"' -f2)"
+          if cargo search noetl-directives 2>/dev/null | grep -q "noetl-directives = \"${VER}\""; then
+            echo "noetl-directives ${VER} already on crates.io; skipping."
+          else
+            OUTPUT="$(cargo publish -p noetl-directives 2>&1)" || {
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
+            }
+            echo "$OUTPUT"
+            # Give the sparse index a moment so the root crate's publish resolves it.
+            sleep 20
+          fi
+      - name: Publish noetl-tools crate
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
+        run: cargo publish -p noetl-tools
       - name: Skip publish (no token)
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
