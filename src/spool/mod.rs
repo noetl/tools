@@ -46,6 +46,8 @@ pub mod probe;
 pub use backend::{LocalDiskBackend, NatsObjectBackend, SpoolBackend, SpoolMeta};
 #[cfg(feature = "gcs")]
 pub use backend::GcsBackend;
+#[cfg(feature = "s3")]
+pub use backend::S3Backend;
 pub use circuit::{
     CircuitBreaker, CircuitConfig, CircuitDecision, CircuitPhase, CircuitRegistry, CircuitState,
     DownstreamSpec, ProbeKind,

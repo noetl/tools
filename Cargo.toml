@@ -13,7 +13,7 @@ description = "NoETL Tool Library - Shared tool implementations for workflow exe
 # Kafka are feature-gated per RFC OQ11 so a minimal build can opt out of the
 # extra dependency weight; both are on by default so the shipped worker
 # supports all three sources.
-default = ["pubsub", "kafka", "gcs"]
+default = ["pubsub", "kafka", "gcs", "s3"]
 # Pub/Sub pull backend — reuses the existing reqwest client + gcp_auth ADC
 # provider, so it adds no new dependency, only the source module.
 pubsub = []
@@ -25,6 +25,14 @@ kafka = ["dep:kafka"]
 # by default so the shipped worker can spool to a GCS bucket out-of-cluster
 # (Cloud Run / Workload Identity); opt out for a minimal NATS-only build.
 gcs = []
+# S3 (and S3-compatible: MinIO, Cloudflare R2, Backblaze B2) store-and-forward
+# spool backend (noetl/ai-meta#94).  Hand-rolled AWS SigV4 over the existing
+# `reqwest` client + `hmac`/`sha2` — no AWS SDK, no new heavy dependency — the
+# same lean shape the `gcs` backend takes.  Credentials (access key / secret /
+# region / endpoint) resolve from the NoETL keychain by alias per
+# `data-access-boundary.md`.  On by default so the shipped worker can spool to
+# an S3 bucket; opt out for a minimal NATS-only build.
+s3 = ["dep:hmac"]
 
 [dependencies]
 # Async runtime
@@ -40,6 +48,11 @@ bytes = "1"
 # SHA-256 integrity hashing for the store-and-forward spool item envelope
 # (RFC #90 Phase 4 — spool payload-ref + sha256 in the event log).
 sha2 = "0.10"
+
+# HMAC-SHA256 for the S3 spool backend's AWS SigV4 request signing
+# (noetl/ai-meta#94).  Feature-gated behind `s3` so a NATS-only build pulls
+# neither.  `sha2` (already a dependency) supplies the hash half.
+hmac = { version = "0.12", optional = true }
 
 # Async stream combinators (object_list, kv_keys).
 futures = "0.3"
