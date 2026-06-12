@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.7.0](https://github.com/noetl/tools/compare/v3.6.0...v3.7.0) (2026-06-12)
+
+### Features
+
+* spool cross-restart recovery helpers (recv_seq high-water) ([3fbc287](https://github.com/noetl/tools/commit/3fbc2877417ba5b98b3f74da895aad1b6c15c315)), closes [noetl/ai-meta#93](https://github.com/noetl/ai-meta/issues/93)
+
 ## [3.6.0](https://github.com/noetl/tools/compare/v3.5.0...v3.6.0) (2026-06-12)
 
 ### Features
