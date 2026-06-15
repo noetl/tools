@@ -189,6 +189,43 @@ impl SnowflakeTool {
         }
     }
 
+    /// Run the config's command(s) and return the parsed rows + column names
+    /// of the last statement that produced a result set.
+    ///
+    /// Used by the `transfer` tool to read a Snowflake source without going
+    /// through the `statement_N`-keyed envelope of [`execute_commands`].  The
+    /// rows are column-keyed objects (the same shape `execute_commands`
+    /// exposes), so a downstream INSERT can index them by column name.
+    pub async fn query_rows(
+        &self,
+        config: &SnowflakeConfig,
+    ) -> Result<(Vec<serde_json::Value>, Vec<String>), ToolError> {
+        let commands = self.get_commands(config)?;
+        if commands.is_empty() {
+            return Err(ToolError::Configuration(
+                "No SQL command provided for Snowflake source".to_string(),
+            ));
+        }
+        let token = self.authenticate(config).await?;
+        let account_url = self.get_account_url(&config.account);
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut columns: Vec<String> = Vec::new();
+        for command in &commands {
+            let response = self
+                .execute_statement(&account_url, &token, command, config)
+                .await?;
+            let (r, c, _) = self.parse_response(&response);
+            if let Some(c) = c {
+                columns = c;
+            }
+            if let Some(r) = r {
+                rows = r;
+            }
+        }
+        Ok((rows, columns))
+    }
+
     /// Execute SQL commands against Snowflake.
     pub async fn execute_commands(
         &self,
