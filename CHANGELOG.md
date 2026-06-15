@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.9.0](https://github.com/noetl/tools/compare/v3.8.0...v3.9.0) (2026-06-15)
+
+### Features
+
+* **snowflake:** key-pair (JWT) authentication ([#62](https://github.com/noetl/tools/issues/62)) ([bb72792](https://github.com/noetl/tools/commit/bb7279206ac65e33bbdca26e35c0173d6d48383a)), closes [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98)
+
 ## [3.8.0](https://github.com/noetl/tools/compare/v3.7.1...v3.8.0) (2026-06-12)
 
 ### Features
