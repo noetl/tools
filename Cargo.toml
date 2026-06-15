@@ -65,6 +65,10 @@ bytes = "1"
 # SHA-256 integrity hashing for the store-and-forward spool item envelope
 # (RFC #90 Phase 4 — spool payload-ref + sha256 in the event log).
 sha2 = "0.10"
+# Snowflake key-pair (JWT) auth: RS256-sign a JWT with the account private
+# key + the public-key SHA256 fingerprint, bypassing password/MFA login.
+jsonwebtoken = "9"
+pem = "3"
 
 # HMAC-SHA256 for the S3 spool backend's AWS SigV4 request signing
 # (noetl/ai-meta#94).  Feature-gated behind `s3` so a NATS-only build pulls
