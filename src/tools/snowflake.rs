@@ -76,6 +76,27 @@ fn default_schema() -> String {
     "PUBLIC".to_string()
 }
 
+/// Split a SQL block into individual statements on `;`.
+///
+/// The Snowflake SQL REST API executes one statement per request by default
+/// (`MULTI_STATEMENT_COUNT=1`); a multi-statement block sent whole fails with
+/// code 000008.  Trim each piece, drop empties, and drop statements that are
+/// only line comments (so a trailing `-- note` or a stray `;` doesn't become
+/// an empty request).  A leading `-- comment` line on an otherwise-real
+/// statement is preserved (Snowflake accepts it).
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    sql.split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            s.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--")
+            })
+        })
+        .collect()
+}
+
 /// Result from a single SQL statement execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatementResult {
@@ -193,29 +214,20 @@ impl SnowflakeTool {
         // Build base URL
         let account_url = self.get_account_url(&config.account);
 
-        // Execute setup commands first
-        let mut setup_commands = Vec::new();
-        setup_commands.push(format!("USE WAREHOUSE {}", config.warehouse));
-        if let Some(ref db) = config.database {
-            setup_commands.push(format!("USE DATABASE {}", db));
-        }
-        setup_commands.push(format!("USE SCHEMA {}", config.schema));
-        if let Some(ref role) = config.role {
-            setup_commands.push(format!("USE ROLE {}", role));
-        }
-
-        // Execute setup commands (ignore errors)
-        for setup_cmd in setup_commands {
-            let _ = self
-                .execute_statement(&account_url, &token, &setup_cmd)
-                .await;
-        }
+        // NOTE: the Snowflake SQL REST API does NOT support `USE` statements
+        // (code 391911 "Command not supported by SQL API: USE").  Session
+        // context (warehouse / database / schema / role) is set per-request in
+        // the body instead — see `execute_statement`.  We therefore issue no
+        // setup statements.
 
         // Execute user commands
         for (idx, command) in commands.iter().enumerate() {
             let key = format!("statement_{}", idx);
 
-            match self.execute_statement(&account_url, &token, command).await {
+            match self
+                .execute_statement(&account_url, &token, command, config)
+                .await
+            {
                 Ok(response) => {
                     let (rows, columns, row_count) = self.parse_response(&response);
 
@@ -377,16 +389,37 @@ impl SnowflakeTool {
         account_url: &str,
         token: &str,
         statement: &str,
+        config: &SnowflakeConfig,
     ) -> Result<SnowflakeResponse, ToolError> {
         let sql_url = format!("{}/api/v2/statements", account_url);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "statement": statement,
             "timeout": 60,
             "resultSetMetaData": {
                 "format": "jsonv2"
             }
         });
+
+        // Set session context in the request body (the SQL API rejects `USE`).
+        // `warehouse` + `role` are always safe.  `database` / `schema` are
+        // skipped for `CREATE DATABASE` / `DROP DATABASE`, where pinning a
+        // (possibly absent) database in the body fails with "Object does not
+        // exist" — those statements operate at the account level.
+        let obj = body.as_object_mut().expect("body is an object");
+        obj.insert("warehouse".into(), config.warehouse.clone().into());
+        if let Some(ref role) = config.role {
+            obj.insert("role".into(), role.clone().into());
+        }
+        let upper = statement.trim_start().to_uppercase();
+        let is_database_ddl =
+            upper.starts_with("CREATE DATABASE") || upper.starts_with("DROP DATABASE");
+        if !is_database_ddl {
+            if let Some(ref db) = config.database {
+                obj.insert("database".into(), db.clone().into());
+            }
+            obj.insert("schema".into(), config.schema.clone().into());
+        }
 
         let response = self
             .http_client
@@ -472,16 +505,18 @@ impl SnowflakeTool {
             let sql = String::from_utf8(decoded)
                 .map_err(|e| ToolError::Configuration(format!("Invalid UTF-8: {}", e)))?;
             // Split by semicolon for multiple statements
-            return Ok(sql
-                .split(';')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect());
+            return Ok(split_sql_statements(&sql));
         }
 
-        // Check for plain command
+        // Check for plain command.  Split on `;` into individual statements
+        // (same as the command_b64 path) — the Snowflake SQL REST API runs
+        // one statement per request by default (MULTI_STATEMENT_COUNT=1), so a
+        // multi-statement `command:` block must be split or it fails with
+        // code 000008 "Actual statement count N did not match the desired
+        // statement count 1".  Comment-only lines (`-- ...`) are dropped so a
+        // trailing comment doesn't become an empty statement.
         if let Some(ref cmd) = config.command {
-            return Ok(vec![cmd.clone()]);
+            return Ok(split_sql_statements(cmd));
         }
 
         // Check for multiple commands
@@ -542,6 +577,30 @@ impl Tool for SnowflakeTool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn split_sql_handles_multi_statement_and_comments() {
+        // The create_sf_database shape: 3 statements, trailing newline.
+        let ddl = "CREATE DATABASE IF NOT EXISTS TEST_DB;\nUSE DATABASE TEST_DB;\nUSE SCHEMA PUBLIC;\n";
+        let stmts = split_sql_statements(ddl);
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert!(stmts[0].starts_with("CREATE DATABASE"));
+        assert_eq!(stmts[2], "USE SCHEMA PUBLIC");
+
+        // A statement preceded by a line comment is kept (one real statement).
+        let with_comment = "-- Insert test data\nINSERT INTO t SELECT 1;";
+        let s = split_sql_statements(with_comment);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].contains("INSERT INTO t"));
+
+        // A trailing comment-only chunk + stray semicolons produce no empties.
+        let trailing = "SELECT 1;\n-- done\n;";
+        let t = split_sql_statements(trailing);
+        assert_eq!(t, vec!["SELECT 1".to_string()]);
+
+        // Single statement, no semicolon.
+        assert_eq!(split_sql_statements("SELECT 1"), vec!["SELECT 1".to_string()]);
+    }
 
     #[test]
     fn keypair_jwt_has_snowflake_claims() {
