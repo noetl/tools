@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.10.0](https://github.com/noetl/tools/compare/v3.9.2...v3.10.0) (2026-06-15)
+
+### Features
+
+* **transfer:** Snowflake<->Postgres directions + credential-alias resolution ([#65](https://github.com/noetl/tools/issues/65)) ([8dd0d70](https://github.com/noetl/tools/commit/8dd0d7002c9ee2656a38b137faa31713a1a8473d)), closes [noetl/ai-meta#99](https://github.com/noetl/ai-meta/issues/99) [noetl/ai-meta#99](https://github.com/noetl/ai-meta/issues/99)
+
 ## [3.9.2](https://github.com/noetl/tools/compare/v3.9.1...v3.9.2) (2026-06-15)
 
 ### Bug Fixes
