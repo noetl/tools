@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.9.1](https://github.com/noetl/tools/compare/v3.9.0...v3.9.1) (2026-06-15)
+
+### Bug Fixes
+
+* **snowflake:** set User-Agent header on the HTTP client ([#63](https://github.com/noetl/tools/issues/63)) ([c0e71f3](https://github.com/noetl/tools/commit/c0e71f307d619f0dd187d5135cbb7ee05d79ed68)), closes [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98)
+
 ## [3.9.0](https://github.com/noetl/tools/compare/v3.8.0...v3.9.0) (2026-06-15)
 
 ### Features
