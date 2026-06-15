@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::auth::AuthResolver;
 use crate::context::ExecutionContext;
 use crate::error::ToolError;
-use crate::registry::{AuthConfig, Tool, ToolConfig};
+use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
 
@@ -45,6 +45,15 @@ pub enum TransferMode {
 }
 
 /// Source configuration for data transfer.
+///
+/// Credential fields (Snowflake `account`/`user`/`private_key`/`public_key`/…,
+/// Postgres `host`/`port`/`user`/`password`/`database`) are NOT declared
+/// explicitly — the worker's credential-alias resolver injects them into the
+/// `source` object before this deserializes, and `#[serde(flatten)] extra`
+/// captures whatever it injected.  Each per-backend transfer arm reads what it
+/// needs from `extra` (e.g. by building a `SnowflakeConfig` / connection
+/// string).  A leftover `auth:` / `credential:` key (if resolution was skipped)
+/// also lands in `extra` and is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     /// Source type (snowflake, postgres, http, duckdb).
@@ -53,11 +62,8 @@ pub struct SourceConfig {
     pub source_type: SourceType,
 
     /// SQL query to fetch data from source.
+    #[serde(default)]
     pub query: String,
-
-    /// Authentication configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthConfig>,
 
     /// URL for HTTP sources.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,26 +85,118 @@ pub struct SourceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
 
-    /// Snowflake-specific configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warehouse: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
+    /// Resolver-injected credential fields + any other backend-specific keys.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_http_method() -> String {
     "GET".to_string()
 }
 
-/// Target configuration for data transfer.
+/// Render a JSON value as a SQL literal for an inlined `INSERT ... VALUES`
+/// (used writing to Snowflake, whose SQL API statements are generated rather
+/// than parameterised).  Strings are single-quoted with `'` doubled; objects /
+/// arrays are emitted as quoted JSON text (Snowflake parses these into VARIANT
+/// on insert).
+fn sql_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+/// Coerce a Snowflake SQL-API cell (always a JSON string, or null) into the
+/// text param the typed `$n::text::<udt>` cast expects.  Snowflake timestamps
+/// arrive in an internal `<epoch_seconds>.<nanos> <tz_offset_minutes>` shape
+/// that Postgres can't parse, so for timestamp columns we reformat to RFC3339
+/// first.  Non-string values (from non-Snowflake callers) are stringified.
+fn coerce_snowflake_value(udt: Option<&String>, value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::String(s) => {
+            if udt.map(|u| u.starts_with("timestamp")).unwrap_or(false) {
+                if let Some(iso) = snowflake_timestamp_to_rfc3339(&s) {
+                    return serde_json::Value::String(iso);
+                }
+            }
+            serde_json::Value::String(s)
+        }
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
+/// Convert Snowflake's internal timestamp string (`"<epoch_seconds>.<nanos>
+/// <tz_offset_minutes>"`, e.g. `"1781494755.203000000 1020"`) to an RFC3339
+/// UTC string a Postgres `timestamptz` accepts.  Returns `None` when the input
+/// doesn't match that shape (already-ISO values pass through unchanged).
+fn snowflake_timestamp_to_rfc3339(s: &str) -> Option<String> {
+    let first = s.split_whitespace().next()?;
+    let (secs_str, nanos_str) = match first.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (first, ""),
+    };
+    let secs: i64 = secs_str.parse().ok()?;
+    let nanos: u32 = if nanos_str.is_empty() {
+        0
+    } else {
+        let take = nanos_str.len().min(9);
+        format!("{:0<9}", &nanos_str[..take]).parse().ok()?
+    };
+    chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
+}
+
+/// Build a Postgres connection string for a transfer endpoint from the explicit
+/// `connection` string, an injected `connection_string`, or the discrete
+/// host/port/user/password/database fields the credential resolver injects
+/// (`apply_postgres` in the worker).  Mirrors `PostgresTool`'s own
+/// connection-string shape.
+fn pg_connection_string(
+    connection: Option<&String>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, ToolError> {
+    if let Some(conn) = connection {
+        return Ok(conn.clone());
+    }
+    let s = |k: &str| extra.get(k).and_then(|v| v.as_str());
+    if let Some(conn) = s("connection_string") {
+        return Ok(conn.to_string());
+    }
+    let host = s("host").ok_or_else(|| {
+        ToolError::Configuration(
+            "Postgres target requires a host or a connection string".to_string(),
+        )
+    })?;
+    let user =
+        s("user").ok_or_else(|| ToolError::Configuration("Postgres target requires a user".to_string()))?;
+    let database = s("database")
+        .or_else(|| s("dbname"))
+        .ok_or_else(|| ToolError::Configuration("Postgres target requires a database".to_string()))?;
+    // `port` may arrive as a JSON number or a string (keychain values are strings).
+    let port = extra
+        .get("port")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(5432);
+    let conn = match s("password") {
+        Some(pw) if !pw.is_empty() => {
+            format!("postgresql://{}:{}@{}:{}/{}", user, pw, host, port, database)
+        }
+        _ => format!("postgresql://{}@{}:{}/{}", user, host, port, database),
+    };
+    Ok(conn)
+}
+
+/// Target configuration for data transfer.  See [`SourceConfig`] for how
+/// resolver-injected credential fields flow through `extra`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetConfig {
     /// Target type (snowflake, postgres, duckdb).
@@ -114,10 +212,6 @@ pub struct TargetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
-    /// Authentication configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthConfig>,
-
     /// Column mapping from source to target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<HashMap<String, String>>,
@@ -126,19 +220,9 @@ pub struct TargetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
 
-    /// Snowflake-specific configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warehouse: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
+    /// Resolver-injected credential fields + any other backend-specific keys.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Transfer tool configuration.
@@ -235,6 +319,12 @@ impl TransferTool {
             }
             (SourceType::Postgres, TargetType::DuckDb) => {
                 self.transfer_postgres_to_duckdb(config, ctx).await?
+            }
+            (SourceType::Snowflake, TargetType::Postgres) => {
+                self.transfer_snowflake_to_postgres(config, ctx).await?
+            }
+            (SourceType::Postgres, TargetType::Snowflake) => {
+                self.transfer_postgres_to_snowflake(config, ctx).await?
             }
             _ => {
                 return Err(ToolError::Configuration(format!(
@@ -536,6 +626,268 @@ impl TransferTool {
         })
     }
 
+    /// Transfer data from Snowflake to PostgreSQL.
+    ///
+    /// Reads the source via the Snowflake tool (key-pair JWT auth + the SQL
+    /// REST API), then writes the rows to Postgres with the shared chunked
+    /// INSERT writer.  Credentials for both ends are injected into
+    /// `source.extra` / `target.extra` by the worker's alias resolver.
+    async fn transfer_snowflake_to_postgres(
+        &self,
+        config: &TransferConfig,
+        _ctx: &ExecutionContext,
+    ) -> Result<TransferResultData, ToolError> {
+        use crate::tools::postgres::PostgresTool;
+        use crate::tools::snowflake::{SnowflakeConfig, SnowflakeTool};
+
+        // Build a SnowflakeConfig from the resolver-injected source fields +
+        // the source query as the command.
+        let mut sf_map = config.source.extra.clone();
+        sf_map.insert(
+            "command".to_string(),
+            serde_json::Value::String(config.source.query.clone()),
+        );
+        let sf_config: SnowflakeConfig =
+            serde_json::from_value(serde_json::Value::Object(sf_map)).map_err(|e| {
+                ToolError::Configuration(format!("invalid Snowflake source config: {e}"))
+            })?;
+
+        let (rows, columns) = SnowflakeTool::new().query_rows(&sf_config).await?;
+
+        let target_table = config
+            .target
+            .table
+            .as_ref()
+            .ok_or_else(|| ToolError::Configuration("Target table name required".to_string()))?;
+        let conn = pg_connection_string(config.target.connection.as_ref(), &config.target.extra)?;
+        let pg_tool = PostgresTool::new();
+
+        let mut result = TransferResultData {
+            direction: "snowflake_to_postgres".to_string(),
+            source_type: "snowflake".to_string(),
+            target_type: "postgres".to_string(),
+            mode: format!("{:?}", config.mode).to_lowercase(),
+            rows_transferred: 0,
+            chunks_processed: 0,
+            target_table: Some(target_table.clone()),
+            columns: Some(columns.clone()),
+        };
+
+        // Snowflake's SQL API returns every cell as a STRING.  Look up the
+        // target column types so the INSERT can coerce each value with an
+        // explicit `$n::text::<udt>` cast (text -> int4 / numeric / jsonb /
+        // timestamptz, etc.); Snowflake timestamps need a Rust-side reformat
+        // first (their internal `<epoch>.<nanos> <tzmin>` shape doesn't parse
+        // as a Postgres timestamptz literal).
+        let col_types = self
+            .fetch_pg_column_types(&pg_tool, &conn, target_table)
+            .await?;
+
+        if matches!(config.mode, TransferMode::Replace) {
+            let truncate_query = format!("TRUNCATE TABLE {}", target_table);
+            pg_tool
+                .execute_query(&truncate_query, &[], &conn, None, false)
+                .await?;
+        }
+
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| match col_types.get(&col.to_lowercase()) {
+                    Some(udt) => format!("${}::text::{}", i + 1, udt),
+                    None => format!("${}", i + 1),
+                })
+                .collect();
+            let insert_query = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                target_table,
+                columns.join(", "),
+                placeholders.join(", ")
+            );
+
+            let mapping = config.target.mapping.as_ref();
+            for chunk in rows.chunks(config.chunk_size.max(1)) {
+                for row in chunk {
+                    let params: Vec<serde_json::Value> = columns
+                        .iter()
+                        .map(|col| {
+                            let source_field = mapping
+                                .and_then(|m| m.get(col))
+                                .map(|s| s.as_str())
+                                .unwrap_or(col);
+                            let raw =
+                                row.get(source_field).cloned().unwrap_or(serde_json::Value::Null);
+                            coerce_snowflake_value(col_types.get(&col.to_lowercase()), raw)
+                        })
+                        .collect();
+                    pg_tool
+                        .execute_query(&insert_query, &params, &conn, None, false)
+                        .await?;
+                    result.rows_transferred += 1;
+                }
+                result.chunks_processed += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Look up `column_name -> udt_name` (the Postgres internal type name, e.g.
+    /// `int4` / `numeric` / `timestamptz` / `jsonb`) for a target table, so the
+    /// Snowflake->Postgres writer can build typed casts.  Returns an empty map
+    /// if the lookup yields nothing (the writer then falls back to plain `$n`).
+    async fn fetch_pg_column_types(
+        &self,
+        pg_tool: &crate::tools::postgres::PostgresTool,
+        conn: &str,
+        target_table: &str,
+    ) -> Result<HashMap<String, String>, ToolError> {
+        let (schema, table) = match target_table.split_once('.') {
+            Some((s, t)) => (
+                Some(s.trim().trim_matches('"').to_string()),
+                t.trim().trim_matches('"').to_string(),
+            ),
+            None => (None, target_table.trim().trim_matches('"').to_string()),
+        };
+        // Table/schema names are config values inlined the same way the INSERT
+        // inlines `target_table`; single-quote-escape for safety.
+        let esc = |s: &str| s.replace('\'', "''");
+        let query = format!(
+            "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = '{}'{}",
+            esc(&table),
+            schema
+                .as_ref()
+                .map(|s| format!(" AND table_schema = '{}'", esc(s)))
+                .unwrap_or_default(),
+        );
+        let res = pg_tool.execute_query(&query, &[], conn, None, true).await?;
+        let mut map = HashMap::new();
+        if let Some(data) = res.data {
+            if let Some(rows) = data["rows"].as_array() {
+                for r in rows {
+                    if let (Some(c), Some(u)) =
+                        (r["column_name"].as_str(), r["udt_name"].as_str())
+                    {
+                        map.insert(c.to_lowercase(), u.to_string());
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Transfer data from PostgreSQL to Snowflake.
+    ///
+    /// Reads the source via the Postgres tool, then writes each row to
+    /// Snowflake as an `INSERT ... VALUES (...)` with SQL-escaped literals
+    /// (the Snowflake SQL REST API runs one statement per request and the
+    /// statements are generated, not parameterised).  Credentials for both
+    /// ends are injected into `source.extra` / `target.extra` by the worker.
+    async fn transfer_postgres_to_snowflake(
+        &self,
+        config: &TransferConfig,
+        _ctx: &ExecutionContext,
+    ) -> Result<TransferResultData, ToolError> {
+        use crate::tools::postgres::PostgresTool;
+        use crate::tools::snowflake::{SnowflakeConfig, SnowflakeTool};
+
+        let conn =
+            pg_connection_string(config.source.connection.as_ref(), &config.source.extra)?;
+        let pg_tool = PostgresTool::new();
+        let res = pg_tool
+            .execute_query(&config.source.query, &[], &conn, None, true)
+            .await?;
+        let data = res
+            .data
+            .ok_or_else(|| ToolError::Database("No data from Postgres source".to_string()))?;
+        let rows = data["rows"].as_array().cloned().unwrap_or_default();
+        let columns: Vec<String> = data["columns"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let target_table = config
+            .target
+            .table
+            .as_ref()
+            .ok_or_else(|| ToolError::Configuration("Target table name required".to_string()))?;
+
+        let mut result = TransferResultData {
+            direction: "postgres_to_snowflake".to_string(),
+            source_type: "postgres".to_string(),
+            target_type: "snowflake".to_string(),
+            mode: format!("{:?}", config.mode).to_lowercase(),
+            rows_transferred: 0,
+            chunks_processed: 0,
+            target_table: Some(target_table.clone()),
+            columns: Some(columns.clone()),
+        };
+
+        if rows.is_empty() {
+            return Ok(result);
+        }
+
+        // Generate one INSERT per row with SQL-escaped literals.
+        let mapping = config.target.mapping.as_ref();
+        let col_list = columns.join(", ");
+        let statements: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let values: Vec<String> = columns
+                    .iter()
+                    .map(|col| {
+                        let source_field = mapping
+                            .and_then(|m| m.get(col))
+                            .map(|s| s.as_str())
+                            .unwrap_or(col);
+                        sql_literal(row.get(source_field).unwrap_or(&serde_json::Value::Null))
+                    })
+                    .collect();
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    target_table,
+                    col_list,
+                    values.join(", ")
+                )
+            })
+            .collect();
+        let count = statements.len();
+
+        // Build a SnowflakeConfig from the resolver-injected target fields +
+        // the generated INSERTs, and run them.
+        let mut sf_map = config.target.extra.clone();
+        sf_map.insert(
+            "commands".to_string(),
+            serde_json::Value::Array(
+                statements.into_iter().map(serde_json::Value::String).collect(),
+            ),
+        );
+        let sf_config: SnowflakeConfig =
+            serde_json::from_value(serde_json::Value::Object(sf_map)).map_err(|e| {
+                ToolError::Configuration(format!("invalid Snowflake target config: {e}"))
+            })?;
+        let sf_result = SnowflakeTool::new().execute_commands(&sf_config).await?;
+        if let Some(err) = sf_result.error {
+            return Err(ToolError::Database(format!(
+                "Snowflake write failed: {} ({})",
+                err,
+                sf_result
+                    .data
+                    .map(|d| d.to_string())
+                    .unwrap_or_default()
+            )));
+        }
+
+        result.rows_transferred = count;
+        result.chunks_processed = 1;
+        Ok(result)
+    }
+
     /// Transfer data from DuckDB to PostgreSQL.
     async fn transfer_duckdb_to_postgres(
         &self,
@@ -805,6 +1157,36 @@ impl Tool for TransferTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snowflake_timestamp_converts_to_rfc3339() {
+        // The exact shape Snowflake's SQL API returns for TIMESTAMP_TZ(9).
+        let iso = snowflake_timestamp_to_rfc3339("1781494755.203000000 1020").unwrap();
+        assert!(iso.starts_with("2026-"), "{iso}");
+        assert!(iso.contains("T"));
+        // Fewer fractional digits still parse (right-padded to 9).
+        assert!(snowflake_timestamp_to_rfc3339("1781494755.5").is_some());
+        // No fractional / no offset.
+        assert!(snowflake_timestamp_to_rfc3339("1781494755").is_some());
+        // Non-Snowflake input falls through (caller keeps the original string).
+        assert!(snowflake_timestamp_to_rfc3339("2026-06-15T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn coerce_snowflake_value_casts_by_type() {
+        let ts = "timestamptz".to_string();
+        // timestamp string is reformatted
+        let v = coerce_snowflake_value(Some(&ts), serde_json::json!("1781494755.203000000 1020"));
+        assert!(v.as_str().unwrap().starts_with("2026-"));
+        // numeric/text strings pass through unchanged
+        let num = "numeric".to_string();
+        assert_eq!(
+            coerce_snowflake_value(Some(&num), serde_json::json!("100.50")),
+            serde_json::json!("100.50")
+        );
+        // null stays null
+        assert!(coerce_snowflake_value(Some(&num), serde_json::Value::Null).is_null());
+    }
 
     #[test]
     fn test_transfer_config_deserialization() {
