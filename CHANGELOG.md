@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.9.2](https://github.com/noetl/tools/compare/v3.9.1...v3.9.2) (2026-06-15)
+
+### Bug Fixes
+
+* **snowflake:** SQL-API session context in body; split multi-statement commands ([#64](https://github.com/noetl/tools/issues/64)) ([07d4d7d](https://github.com/noetl/tools/commit/07d4d7d9939e5a70ae79668df357f8af5ea5fd85)), closes [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98) [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98)
+
 ## [3.9.1](https://github.com/noetl/tools/compare/v3.9.0...v3.9.1) (2026-06-15)
 
 ### Bug Fixes
