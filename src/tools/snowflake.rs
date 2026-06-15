@@ -155,8 +155,15 @@ pub struct SnowflakeTool {
 impl SnowflakeTool {
     /// Create a new Snowflake tool.
     pub fn new() -> Self {
+        // Snowflake's SQL REST API rejects requests without a User-Agent
+        // (error 391903 "Invalid or empty User-Agent header set: null").
+        // reqwest doesn't set one by default, so pin it on the client.
+        let http_client = Client::builder()
+            .user_agent(concat!("noetl-tools/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            http_client: Client::new(),
+            http_client,
             template_engine: TemplateEngine::new(),
         }
     }
