@@ -149,6 +149,19 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                     i += 1;
                 }
             }
+            // `-- line comment` (outside a string / dollar block): copy the
+            // comment verbatim through end-of-line WITHOUT interpreting its
+            // characters.  Without this, an apostrophe in a comment (e.g.
+            // `-- reset this facility's rows`) flips `in_single` and every
+            // later `;` is swallowed as if inside a string literal, merging
+            // statements into one — which then fails the extended protocol
+            // with "cannot insert multiple commands into a prepared statement".
+            '-' if !in_single && chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+            }
             ';' if !in_single => {
                 if !current.trim().is_empty() {
                     statements.push(current.trim().to_string());
@@ -585,6 +598,16 @@ mod tests {
         // A positional parameter `$1` is not a dollar-quote opener.
         let s = split_sql_statements("UPDATE t SET a = $1 WHERE id = 2; SELECT 1");
         assert_eq!(s.len(), 2);
+        // A `--` line comment with an apostrophe must NOT flip string state —
+        // otherwise the trailing `;` are swallowed and statements merge (the
+        // PFT setup_facility_work failure).  noetl/ai-meta#100.
+        let s = split_sql_statements(
+            "INSERT INTO t VALUES (1);\n-- reset this facility's rows\nDELETE FROM t;\nSELECT count(*) FROM t;",
+        );
+        assert_eq!(s.len(), 3, "{s:?}");
+        assert!(s[0].starts_with("INSERT"));
+        assert!(s[1].contains("DELETE FROM t"));
+        assert!(s[2].starts_with("-- reset") || s[2].contains("SELECT count"));
     }
 
     #[test]
