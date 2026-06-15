@@ -46,6 +46,11 @@ pub struct SnowflakeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key_passphrase: Option<String>,
 
+    /// Public key in PEM format (for the key-pair JWT fingerprint).  Optional —
+    /// only needed when using key-pair auth; carried alongside `private_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+
     /// Warehouse name.
     #[serde(default = "default_warehouse")]
     pub warehouse: String,
@@ -247,6 +252,14 @@ impl SnowflakeTool {
 
     /// Authenticate with Snowflake and get a session token.
     async fn authenticate(&self, config: &SnowflakeConfig) -> Result<String, ToolError> {
+        // Prefer key-pair (JWT) auth when a private key is present — it skips
+        // the password login-request entirely, so MFA-enforced accounts work.
+        // The JWT is used directly as a KEYPAIR_JWT bearer token by
+        // `execute_statement`.
+        if let Some(ref private_key) = config.private_key {
+            return self.generate_keypair_jwt(config, private_key);
+        }
+
         let password = config.password.clone().ok_or_else(|| {
             ToolError::Configuration(
                 "Password is required for Snowflake authentication".to_string(),
@@ -292,6 +305,65 @@ impl SnowflakeTool {
             .ok_or_else(|| ToolError::Auth("No token in login response".to_string()))
     }
 
+    /// Build a Snowflake key-pair (JWT) auth token.
+    ///
+    /// Snowflake JWT auth: an RS256-signed JWT whose `iss` is
+    /// `<ACCOUNT>.<USER>.SHA256:<public-key-fingerprint>` and whose `sub` is
+    /// `<ACCOUNT>.<USER>` (both uppercase).  The fingerprint is
+    /// `base64(SHA256(public-key DER))`.  This bypasses the password
+    /// login-request, so it works on MFA-enforced accounts.
+    fn generate_keypair_jwt(
+        &self,
+        config: &SnowflakeConfig,
+        private_key_pem: &str,
+    ) -> Result<String, ToolError> {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use sha2::{Digest, Sha256};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Account identifier: uppercase, drop any region segment (after a dot).
+        let account = config
+            .account
+            .split('.')
+            .next()
+            .unwrap_or(&config.account)
+            .to_uppercase();
+        let user = config.user.to_uppercase();
+        let qualified = format!("{}.{}", account, user);
+
+        // Public-key fingerprint from the provided public_key PEM.
+        let public_pem = config.public_key.as_ref().ok_or_else(|| {
+            ToolError::Configuration(
+                "key-pair auth requires the public_key (PEM) to build the JWT fingerprint"
+                    .to_string(),
+            )
+        })?;
+        let der = pem::parse(public_pem.as_bytes())
+            .map_err(|e| ToolError::Configuration(format!("invalid public_key PEM: {e}")))?;
+        let fingerprint =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(der.contents()));
+        let iss = format!("{}.SHA256:{}", qualified, fingerprint);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| ToolError::Configuration(format!("system clock error: {e}")))?
+            .as_secs();
+        let claims = serde_json::json!({
+            "iss": iss,
+            "sub": qualified,
+            "iat": now,
+            "exp": now + 3600,
+        });
+
+        let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|e| {
+            ToolError::Auth(format!(
+                "invalid Snowflake private key (PKCS8 PEM expected): {e}"
+            ))
+        })?;
+        encode(&Header::new(Algorithm::RS256), &claims, &key)
+            .map_err(|e| ToolError::Auth(format!("Snowflake JWT signing failed: {e}")))
+    }
+
     /// Execute a single SQL statement.
     async fn execute_statement(
         &self,
@@ -314,7 +386,7 @@ impl SnowflakeTool {
             .post(&sql_url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Authorization", format!("Snowflake Token=\"{}\"", token))
+            .header("Authorization", format!("Bearer {}", token))
             .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT")
             .json(&body)
             .send()
@@ -463,6 +535,34 @@ impl Tool for SnowflakeTool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn keypair_jwt_has_snowflake_claims() {
+        use base64::Engine;
+        // Throwaway 2048-bit test keypair.
+        let priv_pem = "-----BEGIN PRIVATE KEY-----\nMIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCYjTcmUPS5BPb6\nAU/Vx99Yv3HQXGARXlaZxMVIUC7HhRVMJicCZtnpeWGu88FMN+sPnLFAtu+M1duc\noGdx3S+EjB9CbZcFcoPGgIEA28CKtc73pQ2nTrXEIuGiEEyOGyHEj+1aGVtdfm0D\n8MjvEqS62YlEgXokRbGCt9A31CjLobeBBwhoghvHwJav+dzN0O2Fao4EVEZxTsDj\nN2q1qnbVCNStOti5OGlbjZf5DT89ia/V8nQwCyXiGB8jqSZ7pan/+5aRihZzniu7\nGHjNvWD62X9IzJy4gNRrxxGDnTXSvcX9geW/rWhHY0VDjKm98/2o1jXp9o/CJo4G\nDsS/xuuxAgMBAAECgf93YP9o4QuhiehZSwezHNfVi3uMub1LTpf5emQQ9y511GU9\nghfwfwlRJIGuYCDlq5y3YjS2rnHKy8TUlEN2pJla4gDgAkiIPDaOrXh0/bGlCXAm\nJIsgj4q9Kv1Ytyt3VQE8PjESrJPALxajcbRvVqM+Mm9sAoPolfi67lShoabQ7MLp\nz9hnm6VuCf9Mbv7tw/LYcrsf8S8PEEHb8prmFjRiAwdyxyR2QnkLQJ0LOfbCC2T7\n/nPoYpgiNUg2sbYfjPRtBtaTjGYNeJ8siQcQgEhtQZGuFFtescC9Z5KsAiMMHCQk\nh32VYboZ5kYBWrfHB45ey+9im96efHx9Uf5g3mECgYEAygkNGgCMLeq00KBgzc/X\nWJ4zkEJ+PGhbTIdiK4JH3+rKtm2kdylL07RF94FhzbLY2WZA5t4lb8pKlkNjPu1r\nkkcA8HhjOTzFcdcltX622tEvhVlhZuBDaBJbV2eeStRxtZiT21RBSmElv9nLrFQn\nWQNnNj2X16KngBf3+Hp06dECgYEAwUyFyZ+KssAfbxzZgwvmnTDhsrpNtJdryy15\nTSJH7z/fevr0AZN57A0IKD0mo1Uy4fkGPVqzcaGIte0W18s6sn1XvX99Me6WwG2g\nJ/cOYuGnmaPktHQd3yZyTf8Nj1hGJTqMy/j/17nkFgjMzt1IKW6Qn8pX7oaIlWRi\nuKVOe+ECgYEAma0M1Cx6dCrFYrO7LpHbocKkQiTx1I0kdS+9ko7EkSQNEXqQ0TsO\nPHgxiDRX6pkRrTvEPlfXbhMXbPjRMvpxCpELu942y0DYhuE6A7Xg7MyVMv9rwU7w\ntubPp8pfc1fpLlJilUCfcS44Apht/iT80Q5voah0KUfF1P9mVREAgSECgYB+xhdA\novguP77d+sfVIKsBERwVQgbQmDbELHDP29nd2cBSQeBiYDyoSeu9qE189dXHSrGC\n78eckNq+pl5C7TDz+yzeRYzwgJAyaDOPwoKW63QmWc0XZMhqoCZ7bPmRt81ZgUry\nQ75X17z1jpP0YECBm9gSVHzTHTza7dmpTBFrQQKBgHgHMBA2qpzdmrf/c1W4l+7T\nWGIXCqqH06sCXYiPmeZrp+1OwvaEK5Ap/EV7xwKCoZlIBrzlBYFs4CGLgkAmuvgD\nA9yfszT3CkV31mnkQmY2s0qcsUnlgjIH5RE+WBKG3JNZVAKOalCQOL+GrbPLSBpq\nIW6J9J2iOLEoNfzuWA4v\n-----END PRIVATE KEY-----";
+        let pub_pem = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmI03JlD0uQT2+gFP1cff\nWL9x0FxgEV5WmcTFSFAux4UVTCYnAmbZ6XlhrvPBTDfrD5yxQLbvjNXbnKBncd0v\nhIwfQm2XBXKDxoCBANvAirXO96UNp061xCLhohBMjhshxI/tWhlbXX5tA/DI7xKk\nutmJRIF6JEWxgrfQN9Qoy6G3gQcIaIIbx8CWr/nczdDthWqOBFRGcU7A4zdqtap2\n1QjUrTrYuThpW42X+Q0/PYmv1fJ0MAsl4hgfI6kme6Wp//uWkYoWc54ruxh4zb1g\n+tl/SMycuIDUa8cRg5010r3F/YHlv61oR2NFQ4ypvfP9qNY16faPwiaOBg7Ev8br\nsQIDAQAB\n-----END PUBLIC KEY-----";
+        let tool = SnowflakeTool::new();
+        let cfg: SnowflakeConfig = serde_json::from_value(serde_json::json!({
+            "account": "MYACCT.us-east-1", "user": "noetl",
+            "private_key": priv_pem, "public_key": pub_pem,
+            "command": "SELECT 1",
+        })).unwrap();
+        let jwt = tool.generate_keypair_jwt(&cfg, priv_pem).expect("jwt");
+        // Three base64url segments.
+        assert_eq!(jwt.split('.').count(), 3, "jwt shape");
+        // Decode the claims and check the Snowflake-specific iss/sub.
+        let claims_b64 = jwt.split('.').nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims_b64)
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // account region segment dropped, uppercased.
+        assert_eq!(claims["sub"], "MYACCT.NOETL");
+        let iss = claims["iss"].as_str().unwrap();
+        assert!(iss.starts_with("MYACCT.NOETL.SHA256:"), "iss = {iss}");
+        assert!(claims["iat"].is_number() && claims["exp"].is_number());
+    }
     use super::*;
 
     #[test]
@@ -513,6 +613,7 @@ mod tests {
             password: Some("test".to_string()),
             private_key: None,
             private_key_passphrase: None,
+            public_key: None,
             warehouse: "COMPUTE_WH".to_string(),
             database: None,
             schema: "PUBLIC".to_string(),
