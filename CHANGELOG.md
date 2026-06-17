@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.11.0](https://github.com/noetl/tools/compare/v3.10.1...v3.11.0) (2026-06-17)
+
+### Features
+
+* **locator:** shared Resource Locator + cell/shard derivation (v3.11.0) ([#68](https://github.com/noetl/tools/issues/68)) ([230a42e](https://github.com/noetl/tools/commit/230a42e6090262566c906f31546a59ae04422753)), closes [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+
 ## [3.10.1](https://github.com/noetl/tools/compare/v3.10.0...v3.10.1) (2026-06-15)
 
 ### Bug Fixes
