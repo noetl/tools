@@ -186,7 +186,14 @@ impl fmt::Display for ResourceLocator {
 // ---------------------------------------------------------------------------
 
 /// The execution-scoped coordinates that address one result, collision-free
-/// across fan-out (`frame`) and retries (`attempt`).
+/// across the two-level cursor fan-out (`frame`, `row`) and retries (`attempt`).
+///
+/// A `mode: cursor` loop fans out twice: the orchestrator claims a **frame** of
+/// rows, then dispatches one body command per **row** in that frame
+/// (`metadata.cursor = {frame, row}` on the body command). Each body command
+/// produces one result, so `(frame, row)` is the coordinate that makes a
+/// result's name unique within its step — `frame` alone collides across the
+/// rows of a frame. Both default to `0` for a step that does not fan out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultCoordinates {
     pub tenant: String,
@@ -194,8 +201,10 @@ pub struct ResultCoordinates {
     pub execution_id: i64,
     pub step: String,
     /// Cursor frame / claim index — `0` when the step does not fan out.
-    /// Mandatory for fan-out: without it, row 0 and row 5 collide on one key.
     pub frame: u64,
+    /// Row index within the frame (the body command's `cursor.row`) — `0` when
+    /// the frame holds a single result or the step does not fan out.
+    pub row: u64,
     /// 1-based retry attempt.
     pub attempt: u32,
 }
@@ -203,12 +212,14 @@ pub struct ResultCoordinates {
 impl ResultCoordinates {
     /// Construct coordinates, defaulting tenant/project for single-tenant
     /// deployments that have not assigned them.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant: Option<&str>,
         project: Option<&str>,
         execution_id: i64,
         step: impl Into<String>,
         frame: u64,
+        row: u64,
         attempt: u32,
     ) -> Self {
         Self {
@@ -217,20 +228,21 @@ impl ResultCoordinates {
             execution_id,
             step: step.into(),
             frame,
+            row,
             attempt,
         }
     }
 
     /// The stable logical locator for this result:
-    /// `noetl://<tenant>/<project>/results/<execution_id>/<step>/<frame>/<attempt>`.
+    /// `noetl://<tenant>/<project>/results/<execution_id>/<step>/<frame>/<row>/<attempt>`.
     pub fn to_locator(&self) -> ResourceLocator {
         ResourceLocator::new(
             self.tenant.clone(),
             self.project.clone(),
             KIND_RESULTS,
             format!(
-                "{}/{}/{}/{}",
-                self.execution_id, self.step, self.frame, self.attempt
+                "{}/{}/{}/{}/{}",
+                self.execution_id, self.step, self.frame, self.row, self.attempt
             ),
             None,
         )
@@ -259,7 +271,7 @@ impl ResultCoordinates {
         format!(
             "noetl/env={env}/region={region}/cell={cell}/shard={shard}/\
              tenant={tenant}/project={project}/date={date}/execution={eid}/\
-             results/{step}/{frame}/{attempt}.{ext}",
+             results/{step}/{frame}/{row}/{attempt}.{ext}",
             env = placement.env,
             region = placement.region,
             cell = placement.cell,
@@ -270,6 +282,7 @@ impl ResultCoordinates {
             eid = self.execution_id,
             step = self.step,
             frame = self.frame,
+            row = self.row,
             attempt = self.attempt,
             ext = ext,
         )
@@ -431,55 +444,58 @@ mod tests {
 
     #[test]
     fn result_coordinates_build_the_logical_uri() {
-        let c = ResultCoordinates::new(Some("t_acme"), Some("p_gen"), 325, "load_next_facility", 0, 1);
+        // frame 2, row 4 — a cursor body result.
+        let c = ResultCoordinates::new(Some("t_acme"), Some("p_gen"), 325, "load_next_facility", 2, 4, 1);
         assert_eq!(
             c.logical_uri(),
-            "noetl://t_acme/p_gen/results/325/load_next_facility/0/1"
+            "noetl://t_acme/p_gen/results/325/load_next_facility/2/4/1"
         );
         // Round-trips back through the generic parser.
         let loc = ResourceLocator::parse(&c.logical_uri()).unwrap();
         assert_eq!(loc.kind, "results");
-        assert_eq!(loc.logical_path, "325/load_next_facility/0/1");
+        assert_eq!(loc.logical_path, "325/load_next_facility/2/4/1");
     }
 
     #[test]
     fn result_coordinates_default_tenant_project() {
-        let c = ResultCoordinates::new(None, None, 7, "s", 0, 1);
+        // No fan-out: frame 0, row 0.
+        let c = ResultCoordinates::new(None, None, 7, "s", 0, 0, 1);
         assert_eq!(c.tenant, "default");
         assert_eq!(c.project, "default");
-        assert_eq!(c.logical_uri(), "noetl://default/default/results/7/s/0/1");
+        assert_eq!(c.logical_uri(), "noetl://default/default/results/7/s/0/0/1");
     }
 
     #[test]
     fn physical_key_matches_blueprint_layout() {
-        let c = ResultCoordinates::new(Some("t_acme"), Some("p_gen"), 325, "align_reads", 3, 2);
+        let c = ResultCoordinates::new(Some("t_acme"), Some("p_gen"), 325, "align_reads", 3, 7, 2);
         let placement = CellPlacement::new("prod", "usw2", "usw2-a", 42);
         let key = c.physical_key(&placement, "2026-06-16", "feather");
         assert_eq!(
             key,
             "noetl/env=prod/region=usw2/cell=usw2-a/shard=s0042/\
              tenant=t_acme/project=p_gen/date=2026-06-16/execution=325/\
-             results/align_reads/3/2.feather"
+             results/align_reads/3/7/2.feather"
         );
     }
 
     #[test]
-    fn frame_and_attempt_are_collision_free() {
-        let base = ResultCoordinates::new(Some("t"), Some("p"), 1, "s", 0, 1);
+    fn frame_row_and_attempt_are_collision_free() {
+        let base = ResultCoordinates::new(Some("t"), Some("p"), 1, "s", 0, 0, 1);
         let other_frame = ResultCoordinates { frame: 5, ..base.clone() };
+        let other_row = ResultCoordinates { row: 3, ..base.clone() };
         let other_attempt = ResultCoordinates { attempt: 2, ..base.clone() };
-        // Distinct frame / attempt → distinct logical names AND physical keys.
+        // Distinct frame / row / attempt → distinct logical names AND keys —
+        // two rows of the same frame (the cursor case) must not collide.
         assert_ne!(base.logical_uri(), other_frame.logical_uri());
+        assert_ne!(base.logical_uri(), other_row.logical_uri());
         assert_ne!(base.logical_uri(), other_attempt.logical_uri());
         let pl = CellPlacement::new("prod", "usw2", "usw2-a", 0);
-        assert_ne!(
-            base.physical_key(&pl, "d", "feather"),
-            other_frame.physical_key(&pl, "d", "feather")
-        );
-        assert_ne!(
-            base.physical_key(&pl, "d", "feather"),
-            other_attempt.physical_key(&pl, "d", "feather")
-        );
+        for other in [&other_frame, &other_row, &other_attempt] {
+            assert_ne!(
+                base.physical_key(&pl, "d", "feather"),
+                other.physical_key(&pl, "d", "feather")
+            );
+        }
     }
 
     #[test]
