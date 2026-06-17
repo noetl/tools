@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.12.0](https://github.com/noetl/tools/compare/v3.11.0...v3.12.0) (2026-06-17)
+
+### Features
+
+* **locator:** two-level cursor fan-out coordinate (frame, row) (v3.12.0) ([#70](https://github.com/noetl/tools/issues/70)) ([dcee629](https://github.com/noetl/tools/commit/dcee6299fefd40a88ae3af8076e67c23c76a31a1)), closes [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+
 ## [3.11.0](https://github.com/noetl/tools/compare/v3.10.1...v3.11.0) (2026-06-17)
 
 ### Features
