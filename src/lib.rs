@@ -12,6 +12,7 @@
 
 pub mod arrow_codec;
 pub mod auth;
+pub mod locator;
 pub mod context;
 pub mod error;
 pub mod registry;
