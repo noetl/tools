@@ -25,7 +25,8 @@ use crate::auth::GcpAuth;
 use crate::error::ToolError;
 
 use super::{
-    decode_payload, normalize_headers, PollOptions, PollOutcome, PolledMessage, SourceClient,
+    decode_payload, normalize_headers, AckDisposition, AckReport, PollOptions, PollOutcome,
+    PolledMessage, SourceClient,
 };
 
 /// Pub/Sub scope (covered by the broader cloud-platform scope ADC returns).
@@ -266,8 +267,64 @@ impl SourceClient for PubSubSource {
         Ok(PollOutcome {
             messages,
             acked,
-            // Surface ack ids only when we did NOT ack (manual mode).
+            // Surface ack ids only when we did NOT ack (manual / defer mode).
             ack_ids: if acked { Vec::new() } else { ack_ids },
+        })
+    }
+
+    /// Dispose deferred ack ids out of band (the back half of the
+    /// deferred-ack capability for Pub/Sub).
+    ///
+    /// - `Ack` → `subscriptions:acknowledge` (cursor advances; never
+    ///   redelivered).
+    /// - `Nack` → `subscriptions:modifyAckDeadline` with `ackDeadlineSeconds`
+    ///   = `delay_ms/1000` (0 = redeliver now) — Pub/Sub's redelivery knob.
+    /// - `Term` → best-effort `acknowledge` (removes the message from the
+    ///   subscription). True dead-lettering needs a DLQ policy on the
+    ///   subscription; Pub/Sub has no out-of-band terminate verb.
+    async fn ack(
+        &self,
+        ack_ids: &[String],
+        disposition: AckDisposition,
+    ) -> Result<AckReport, ToolError> {
+        if ack_ids.is_empty() {
+            return Ok(AckReport::default());
+        }
+        let bearer = self.bearer().await?;
+
+        let (verb, payload): (&str, serde_json::Value) = match disposition {
+            AckDisposition::Ack | AckDisposition::Term => (
+                "acknowledge",
+                serde_json::json!({ "ackIds": ack_ids }),
+            ),
+            AckDisposition::Nack { delay_ms } => {
+                let secs = delay_ms.map(|ms| (ms / 1000) as i64).unwrap_or(0);
+                (
+                    "modifyAckDeadline",
+                    serde_json::json!({ "ackIds": ack_ids, "ackDeadlineSeconds": secs }),
+                )
+            }
+        };
+
+        let url = format!("{}/v1/{}:{}", self.endpoint, self.subscription, verb);
+        let mut req = self.client.post(&url).json(&payload);
+        if let Some(ref auth) = bearer {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req.send().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("subscription[pubsub] {} failed: {}", verb, e))
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "subscription[pubsub] {} HTTP {}: {}",
+                verb, status, body
+            )));
+        }
+        Ok(AckReport {
+            disposed: ack_ids.len(),
+            errors: Vec::new(),
         })
     }
 }
