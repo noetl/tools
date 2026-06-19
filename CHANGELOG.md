@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.13.0](https://github.com/noetl/tools/compare/v3.12.0...v3.13.0) (2026-06-19)
+
+### Features
+
+* **subscription:** deferred (ack-after-processing) ack capability ([#71](https://github.com/noetl/tools/issues/71)) ([8972ec1](https://github.com/noetl/tools/commit/8972ec1cec9540ab9cb1fea421902fd06ef5fdef)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+
 ## [3.12.0](https://github.com/noetl/tools/compare/v3.11.0...v3.12.0) (2026-06-17)
 
 ### Features
