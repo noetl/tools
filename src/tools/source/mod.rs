@@ -84,12 +84,27 @@ pub fn clamp_timeout_ms(requested: Option<u64>) -> u64 {
 
 /// How a bounded drain treats the messages it fetched.
 ///
-/// Phase 1 has a single behavioral axis — ack within the drain or not.
-/// `auto` / `on_success` ack; `manual` / `none` leave the messages pending
-/// so the source redelivers them on the next drain (the existing
-/// `js_consume` `ack: false` semantics).  The richer ack-after-dispatch
-/// timing (RFC OQ14) is a later-phase concern handled by the continuous
-/// runtime, not the bounded tool.
+/// The behavioral axes are *when* the drain acks and *whether* it surfaces
+/// durable ack handles for a later out-of-band disposition:
+///
+/// - `auto` / `on_success` — ack each message inside the drain (the
+///   bounded-drain default; what every Phase-1/2 subscription user gets).
+/// - `manual` — leave the messages pending so the source redelivers them on
+///   the next drain (the legacy `js_consume` `ack: false` semantics). The
+///   backend surfaces whatever ack ids it can in [`PollOutcome::ack_ids`].
+/// - `defer` — **ack-after-processing**: do NOT ack in the drain, and surface
+///   a *durable* ack handle per message ([`PolledMessage::ack_id`]) that a
+///   later [`SourceClient::ack`] call disposes (ack / nack / term) once
+///   downstream processing has succeeded. The message stays in-flight until
+///   the handle is acked or the source's ack-wait expires (then it
+///   redelivers). This is the durability boundary the CQRS materializer needs
+///   ([noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)) so a
+///   transient downstream failure between drain and write redelivers the
+///   batch instead of losing it.
+/// - `none` — never ack and surface no ids (a pure peek).
+///
+/// `defer` is opt-in: existing callers default to `on_success` and are
+/// unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AckMode {
@@ -102,6 +117,11 @@ pub enum AckMode {
     /// Their ack ids ride back in [`PollOutcome::ack_ids`] for a caller
     /// that wants to ack out of band.
     Manual,
+    /// Ack-after-processing: do not ack in the drain, but surface a *durable*
+    /// ack handle per message so a later [`SourceClient::ack`] disposes it
+    /// once downstream processing succeeds. Un-acked handles redeliver after
+    /// the source's ack-wait. See the type docs for the durability rationale.
+    Defer,
     /// Never ack and do not surface ack ids (a pure peek).
     None,
 }
@@ -113,9 +133,18 @@ impl AckMode {
         matches!(self, AckMode::OnSuccess | AckMode::Auto)
     }
 
-    /// True when un-acked ack ids should ride back in the outcome.
+    /// True when un-acked ack ids should ride back in the outcome — for a
+    /// caller that will dispose them out of band ([`AckMode::Manual`]) or
+    /// after downstream success ([`AckMode::Defer`]).
     pub fn surfaces_ack_ids(&self) -> bool {
-        matches!(self, AckMode::Manual)
+        matches!(self, AckMode::Manual | AckMode::Defer)
+    }
+
+    /// True when the backend must capture a *durable* ack handle (one that
+    /// survives the drain and can be disposed by a later, possibly
+    /// out-of-process, [`SourceClient::ack`] call).
+    pub fn defers_ack(&self) -> bool {
+        matches!(self, AckMode::Defer)
     }
 
     /// Stable wire string for the result payload.
@@ -124,6 +153,7 @@ impl AckMode {
             AckMode::OnSuccess => "on_success",
             AckMode::Auto => "auto",
             AckMode::Manual => "manual",
+            AckMode::Defer => "defer",
             AckMode::None => "none",
         }
     }
@@ -140,18 +170,91 @@ impl AckMode {
                 "on_success" => Ok(AckMode::OnSuccess),
                 "auto" | "true" => Ok(AckMode::Auto),
                 "manual" | "false" => Ok(AckMode::Manual),
+                "defer" | "deferred" => Ok(AckMode::Defer),
                 "none" | "peek" => Ok(AckMode::None),
                 other => Err(ToolError::Configuration(format!(
-                    "Invalid subscription 'ack' value '{}'. Valid: on_success, auto, manual, none",
+                    "Invalid subscription 'ack' value '{}'. Valid: on_success, auto, manual, \
+                     defer, none",
                     other
                 ))),
             },
             Some(other) => Err(ToolError::Configuration(format!(
                 "Invalid subscription 'ack' value {}. Expected a bool or one of: \
-                 on_success, auto, manual, none",
+                 on_success, auto, manual, defer, none",
                 other
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-band ack disposition (deferred-ack capability)
+// ---------------------------------------------------------------------------
+
+/// How a previously-fetched (deferred) message should be disposed by a later
+/// [`SourceClient::ack`] call.
+///
+/// The three dispositions map onto the JetStream ack protocol (and the
+/// equivalent Pub/Sub `acknowledge` / `modifyAckDeadline` surface):
+///
+/// - [`Ack`](AckDisposition::Ack) — positive ack; the source advances its
+///   cursor past the message and never redelivers it.
+/// - [`Nack`](AckDisposition::Nack) — negative ack; the source redelivers the
+///   message (optionally after `delay_ms`). Use after a *transient* downstream
+///   failure to retry sooner than ack-wait would.
+/// - [`Term`](AckDisposition::Term) — terminate delivery; the source stops
+///   redelivering (dead-letter). Use for a *poison* message that will never
+///   succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckDisposition {
+    /// Positive ack — done, never redeliver.
+    Ack,
+    /// Negative ack — redeliver, optionally after a delay (ms).
+    Nack { delay_ms: Option<u64> },
+    /// Terminate — stop redelivering (dead-letter).
+    Term,
+}
+
+impl AckDisposition {
+    /// Stable wire string for the result payload / `operation` field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AckDisposition::Ack => "ack",
+            AckDisposition::Nack { .. } => "nack",
+            AckDisposition::Term => "term",
+        }
+    }
+
+    /// Parse a disposition from the subscription tool's `operation` value
+    /// (`ack` | `nack` | `term`), with an optional redelivery delay (ms) that
+    /// only applies to `nack`.
+    pub fn parse(operation: &str, delay_ms: Option<u64>) -> Result<AckDisposition, ToolError> {
+        match operation.to_ascii_lowercase().as_str() {
+            "ack" => Ok(AckDisposition::Ack),
+            "nack" | "nak" => Ok(AckDisposition::Nack { delay_ms }),
+            "term" => Ok(AckDisposition::Term),
+            other => Err(ToolError::Configuration(format!(
+                "Invalid subscription ack disposition '{}'. Valid: ack, nack, term",
+                other
+            ))),
+        }
+    }
+}
+
+/// Result of an out-of-band [`SourceClient::ack`] disposition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AckReport {
+    /// Number of ack handles disposed successfully.
+    pub disposed: usize,
+    /// Per-handle errors (handle id → message) for the handles that failed.
+    /// Empty on full success.
+    pub errors: Vec<String>,
+}
+
+impl AckReport {
+    /// True when every handle was disposed without error.
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
     }
 }
 
@@ -247,6 +350,34 @@ pub trait SourceClient: Send + Sync {
 
     /// Perform one bounded drain.
     async fn poll(&self, opts: &PollOptions) -> Result<PollOutcome, ToolError>;
+
+    /// Dispose a set of *durable* ack handles previously surfaced under
+    /// [`AckMode::Defer`] (or [`AckMode::Manual`] where the backend supports
+    /// out-of-band ack).
+    ///
+    /// This is the back half of the deferred-ack capability: `poll` with
+    /// `defer` returns handles without acking; the caller does its downstream
+    /// processing; then it calls `ack` to advance the cursor
+    /// ([`AckDisposition::Ack`]), retry ([`AckDisposition::Nack`]), or
+    /// dead-letter ([`AckDisposition::Term`]). Handles are connection- and
+    /// process-independent strings so a different worker run can dispose what
+    /// another fetched, within the source's ack-wait window.
+    ///
+    /// Default impl errors — a backend opts in by overriding this. `ack_ids`
+    /// being empty is a no-op success.
+    async fn ack(
+        &self,
+        ack_ids: &[String],
+        _disposition: AckDisposition,
+    ) -> Result<AckReport, ToolError> {
+        if ack_ids.is_empty() {
+            return Ok(AckReport::default());
+        }
+        Err(ToolError::Configuration(format!(
+            "subscription[{}]: source does not support out-of-band ack (deferred-ack)",
+            self.source_name()
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +469,14 @@ mod tests {
             AckMode::Manual
         );
         assert_eq!(
+            AckMode::parse(Some(&serde_json::json!("defer"))).unwrap(),
+            AckMode::Defer
+        );
+        assert_eq!(
+            AckMode::parse(Some(&serde_json::json!("deferred"))).unwrap(),
+            AckMode::Defer
+        );
+        assert_eq!(
             AckMode::parse(Some(&serde_json::json!("none"))).unwrap(),
             AckMode::None
         );
@@ -355,9 +494,56 @@ mod tests {
         assert!(AckMode::OnSuccess.should_ack());
         assert!(AckMode::Auto.should_ack());
         assert!(!AckMode::Manual.should_ack());
+        assert!(!AckMode::Defer.should_ack());
         assert!(!AckMode::None.should_ack());
         assert!(AckMode::Manual.surfaces_ack_ids());
+        assert!(AckMode::Defer.surfaces_ack_ids());
         assert!(!AckMode::None.surfaces_ack_ids());
+        // Only `defer` requires a durable, dispose-later handle.
+        assert!(AckMode::Defer.defers_ack());
+        assert!(!AckMode::Manual.defers_ack());
+        assert!(!AckMode::OnSuccess.defers_ack());
+    }
+
+    #[test]
+    fn ack_disposition_parse_and_str() {
+        assert_eq!(
+            AckDisposition::parse("ack", None).unwrap(),
+            AckDisposition::Ack
+        );
+        assert_eq!(
+            AckDisposition::parse("nack", Some(500)).unwrap(),
+            AckDisposition::Nack {
+                delay_ms: Some(500)
+            }
+        );
+        assert_eq!(
+            AckDisposition::parse("nak", None).unwrap(),
+            AckDisposition::Nack { delay_ms: None }
+        );
+        assert_eq!(
+            AckDisposition::parse("term", None).unwrap(),
+            AckDisposition::Term
+        );
+        assert!(AckDisposition::parse("bogus", None).is_err());
+        assert_eq!(AckDisposition::Ack.as_str(), "ack");
+        assert_eq!(
+            AckDisposition::Nack { delay_ms: None }.as_str(),
+            "nack"
+        );
+        assert_eq!(AckDisposition::Term.as_str(), "term");
+    }
+
+    #[test]
+    fn ack_report_clean() {
+        let r = AckReport::default();
+        assert!(r.is_clean());
+        assert_eq!(r.disposed, 0);
+        let r = AckReport {
+            disposed: 2,
+            errors: vec!["boom".into()],
+        };
+        assert!(!r.is_clean());
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
 
-use super::source::{PollOptions, PollOutcome, SourceClient};
+use super::source::{AckDisposition, PollOptions, PollOutcome, SourceClient};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -54,7 +54,8 @@ pub struct SubscriptionConfig {
     /// Source backend: `nats` | `pubsub` | `kafka`.
     pub source: String,
 
-    /// Operation. Phase 1 supports only `poll` (bounded drain).
+    /// Operation: `poll` (bounded drain) — or `ack` / `nack` / `term` to
+    /// dispose durable handles from a prior `ack: defer` poll.
     #[serde(default = "default_operation")]
     pub operation: String,
 
@@ -72,10 +73,20 @@ pub struct SubscriptionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 
-    /// Ack policy: `on_success` (default) | `auto` | `manual` | `none`, or a
-    /// bool (`true` → ack, `false` → manual).
+    /// Ack policy for `poll`: `on_success` (default) | `auto` | `manual` |
+    /// `defer` | `none`, or a bool (`true` → ack, `false` → manual). `defer`
+    /// surfaces durable `ack_ids` for a later `ack`/`nack`/`term` operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack: Option<serde_json::Value>,
+
+    /// Durable ack handles to dispose (for the `ack` / `nack` / `term`
+    /// operations) — the `ack_ids` returned by a prior `defer` poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_ids: Option<Vec<String>>,
+
+    /// Redelivery delay (ms) for the `nack` operation. Ignored otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nack_delay_ms: Option<u64>,
 
     // --- NATS ---
     /// NATS server URL (when not using a credential alias).
@@ -297,17 +308,33 @@ impl Tool for SubscriptionTool {
         let cfg = self.parse_config(config, ctx)?;
         let execution_id = ctx.execution_id;
 
-        // Phase 1 is poll-only.
-        if cfg.operation != "poll" {
-            return Err(ToolError::Configuration(format!(
-                "subscription: unsupported operation '{}'. Phase 1 supports: poll",
-                cfg.operation
-            )));
+        match cfg.operation.as_str() {
+            "poll" => self.execute_poll(&cfg, ctx, execution_id).await,
+            // Out-of-band disposition of durable handles from a prior `defer`
+            // poll — the back half of the deferred-ack capability.
+            "ack" | "nack" | "nak" | "term" => {
+                self.execute_ack(&cfg, ctx, execution_id).await
+            }
+            other => Err(ToolError::Configuration(format!(
+                "subscription: unsupported operation '{}'. Supported: poll, ack, nack, term",
+                other
+            ))),
         }
+    }
+}
 
+impl SubscriptionTool {
+    /// Bounded-drain poll (the original Phase-1/2 behavior, now also the
+    /// `defer` ack-after-processing path).
+    async fn execute_poll(
+        &self,
+        cfg: &SubscriptionConfig,
+        ctx: &ExecutionContext,
+        execution_id: i64,
+    ) -> Result<ToolResult, ToolError> {
         let ack = super::source::AckMode::parse(cfg.ack.as_ref())?;
         let opts = PollOptions::new(cfg.batch, cfg.timeout_ms, ack);
-        let source = self.build_source(&cfg, ctx)?;
+        let source = self.build_source(cfg, ctx)?;
         let source_name = source.source_name();
 
         // Observability triad (agents/rules/observability.md):
@@ -317,7 +344,7 @@ impl Tool for SubscriptionTool {
         let span = tracing::info_span!(
             "tool.dispatch.subscription",
             source = source_name,
-            operation = %cfg.operation,
+            operation = "poll",
             execution_id,
         );
         let _guard = span.enter();
@@ -331,6 +358,8 @@ impl Tool for SubscriptionTool {
             execution_id,
             count = outcome.count(),
             acked = outcome.acked,
+            ack_mode = ack.as_str(),
+            deferred = outcome.ack_ids.len(),
             duration_ms,
             "subscription poll complete"
         );
@@ -338,7 +367,7 @@ impl Tool for SubscriptionTool {
         let data = serde_json::json!({
             "status": "success",
             "source": source_name,
-            "operation": cfg.operation,
+            "operation": "poll",
             "count": outcome.count(),
             "messages": outcome.messages,
             "acked": outcome.acked,
@@ -348,6 +377,58 @@ impl Tool for SubscriptionTool {
             // worker exports (noetl_subscription_messages_fetched_total{source}).
             "metrics": {
                 "noetl_subscription_messages_fetched_total": outcome.count(),
+                "source": source_name,
+            },
+        });
+
+        Ok(ToolResult::success(data).with_duration(duration_ms))
+    }
+
+    /// Dispose durable ack handles from a prior `defer` poll: `ack` (done),
+    /// `nack` (redeliver), or `term` (dead-letter).
+    async fn execute_ack(
+        &self,
+        cfg: &SubscriptionConfig,
+        ctx: &ExecutionContext,
+        execution_id: i64,
+    ) -> Result<ToolResult, ToolError> {
+        let disposition = AckDisposition::parse(&cfg.operation, cfg.nack_delay_ms)?;
+        let ack_ids = cfg.ack_ids.clone().unwrap_or_default();
+        let source = self.build_source(cfg, ctx)?;
+        let source_name = source.source_name();
+
+        let span = tracing::info_span!(
+            "tool.dispatch.subscription",
+            source = source_name,
+            operation = disposition.as_str(),
+            execution_id,
+        );
+        let _guard = span.enter();
+
+        let start = std::time::Instant::now();
+        let report = source.ack(&ack_ids, disposition).await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            source = source_name,
+            execution_id,
+            disposition = disposition.as_str(),
+            requested = ack_ids.len(),
+            disposed = report.disposed,
+            errors = report.errors.len(),
+            duration_ms,
+            "subscription ack complete"
+        );
+
+        let data = serde_json::json!({
+            "status": if report.is_clean() { "success" } else { "partial" },
+            "source": source_name,
+            "operation": disposition.as_str(),
+            "requested": ack_ids.len(),
+            "disposed": report.disposed,
+            "errors": report.errors,
+            "metrics": {
+                "noetl_subscription_messages_disposed_total": report.disposed,
                 "source": source_name,
             },
         });
@@ -620,6 +701,159 @@ mod tests {
         // A second drain returns nothing (the first acked everything).
         let again = tool.execute(&config, &ctx).await.expect("second poll");
         assert_eq!(again.data.unwrap()["count"], 0);
+
+        let _ = js.delete_stream(&stream_name).await;
+    }
+
+    /// Live NATS proof of the **deferred-ack** capability + the redelivery
+    /// path (noetl/ai-meta#103 durability boundary). Same env gates as
+    /// `nats_integration_bounded_drain`. Drives:
+    ///   1. `defer` poll → messages carry durable `ack_id`s; `acked=false`.
+    ///   2. NO disposition → wait past a short ack-wait → poll again →
+    ///      the SAME messages **redeliver** (un-acked work is not lost).
+    ///   3. `ack` operation with the captured ids → `disposed=N`.
+    ///   4. Poll again → empty (the acked messages never come back).
+    #[tokio::test]
+    async fn nats_integration_deferred_ack_and_redelivery() {
+        let nats_url = match std::env::var("NOETL_TEST_NATS_URL") {
+            Ok(u) => u,
+            Err(_) => return, // skip when no live NATS available
+        };
+        let user = std::env::var("NOETL_TEST_NATS_USER").ok();
+        let pass = std::env::var("NOETL_TEST_NATS_PASS").ok();
+
+        use async_nats::jetstream::{self, consumer, stream};
+        use std::time::Duration;
+
+        let mut connect_opts = async_nats::ConnectOptions::new();
+        if let (Some(u), Some(p)) = (&user, &pass) {
+            connect_opts = connect_opts.user_and_password(u.clone(), p.clone());
+        }
+        let nc = connect_opts.connect(&nats_url).await.expect("connect");
+        let js = jetstream::new(nc);
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stream_name = format!("NOETL_SUB_DEFER_{}", suffix);
+        let subject = format!("noetl.subdefer.{}", suffix);
+        let consumer_name = format!("sub_defer_{}", suffix);
+
+        js.create_stream(stream::Config {
+            name: stream_name.clone(),
+            subjects: vec![subject.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+
+        for i in 0..3 {
+            js.publish(subject.clone(), format!(r#"{{"n":{}}}"#, i).into())
+                .await
+                .expect("publish")
+                .await
+                .expect("publish ack");
+        }
+
+        // Ack-explicit consumer with a SHORT ack-wait so the redelivery path
+        // is observable in a unit test (production uses a generous ack-wait).
+        let stream_handle = js.get_stream(&stream_name).await.expect("get stream");
+        stream_handle
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some(consumer_name.clone()),
+                ack_policy: consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(2),
+                ..Default::default()
+            })
+            .await
+            .expect("create consumer");
+
+        let tool = SubscriptionTool::new();
+        let mut ctx = ExecutionContext::default();
+        let cred = match (&user, &pass) {
+            (Some(u), Some(p)) => {
+                serde_json::json!({ "url": nats_url, "user": u, "password": p })
+            }
+            _ => serde_json::json!({ "url": nats_url }),
+        };
+        ctx.set_secret("nats_test", cred.to_string());
+
+        let poll_defer = ToolConfig {
+            kind: "subscription".to_string(),
+            config: serde_json::json!({
+                "source": "nats",
+                "operation": "poll",
+                "auth": "nats_test",
+                "stream": stream_name,
+                "consumer": consumer_name,
+                "batch": 10,
+                "timeout_ms": 3000,
+                "ack": "defer",
+            }),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+
+        // 1. Deferred poll — handles surfaced, nothing acked.
+        let first = tool.execute(&poll_defer, &ctx).await.expect("defer poll");
+        let d1 = first.data.unwrap();
+        assert_eq!(d1["count"], 3, "deferred poll should drain all 3");
+        assert_eq!(d1["acked"], false, "defer must not ack in the drain");
+        let ack_ids: Vec<String> = d1["ack_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ack_ids.len(), 3, "every message carries a durable handle");
+        assert!(
+            ack_ids.iter().all(|s| s.contains("$JS.ACK")),
+            "NATS handles are $JS.ACK reply subjects: {:?}",
+            ack_ids
+        );
+
+        // 2. No disposition → wait past ack-wait → the SAME work redelivers.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let redeliver = tool.execute(&poll_defer, &ctx).await.expect("redeliver poll");
+        let d2 = redeliver.data.unwrap();
+        assert_eq!(
+            d2["count"], 3,
+            "un-acked deferred messages must REDELIVER, not vanish"
+        );
+        let redeliver_ids: Vec<String> = d2["ack_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        // 3. Dispose with `ack` using the redelivery's fresh handles.
+        let ack_op = ToolConfig {
+            kind: "subscription".to_string(),
+            config: serde_json::json!({
+                "source": "nats",
+                "operation": "ack",
+                "auth": "nats_test",
+                "stream": stream_name,
+                "consumer": consumer_name,
+                "ack_ids": redeliver_ids,
+            }),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let acked = tool.execute(&ack_op, &ctx).await.expect("ack op");
+        let da = acked.data.unwrap();
+        assert_eq!(da["operation"], "ack");
+        assert_eq!(da["disposed"], 3, "all 3 handles disposed");
+
+        // 4. Now the stream is empty — acked work never comes back.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let after = tool.execute(&poll_defer, &ctx).await.expect("post-ack poll");
+        assert_eq!(
+            after.data.unwrap()["count"],
+            0,
+            "acked messages must not redeliver"
+        );
 
         let _ = js.delete_stream(&stream_name).await;
     }
