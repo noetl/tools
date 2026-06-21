@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.14.0](https://github.com/noetl/tools/compare/v3.13.1...v3.14.0) (2026-06-21)
+
+### Features
+
+* **task_sequence:** honor do jump / break / retry control-flow verbs ([#73](https://github.com/noetl/tools/issues/73)) ([62d0948](https://github.com/noetl/tools/commit/62d0948916c5f7e07b0c2fa3d43a6b5f9b7755f8)), closes [noetl/ai-meta#125](https://github.com/noetl/ai-meta/issues/125)
+
 ## [3.13.1](https://github.com/noetl/tools/compare/v3.13.0...v3.13.1) (2026-06-21)
 
 ### Bug Fixes
