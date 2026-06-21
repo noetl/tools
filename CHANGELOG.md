@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.13.1](https://github.com/noetl/tools/compare/v3.13.0...v3.13.1) (2026-06-21)
+
+### Bug Fixes
+
+* **http:** expose parsed response body under data (Python-era contract) ([#72](https://github.com/noetl/tools/issues/72)) ([86f0216](https://github.com/noetl/tools/commit/86f0216e9e9e725e127f2c64db428ee0db784ede)), closes [noetl/ai-meta#126](https://github.com/noetl/ai-meta/issues/126)
+
 ## [3.13.0](https://github.com/noetl/tools/compare/v3.12.0...v3.13.0) (2026-06-19)
 
 ### Features
