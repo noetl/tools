@@ -220,16 +220,75 @@ impl Tool for TaskSequenceTool {
         // as written in the playbook (e.g. `ctx.counter`).
         let mut context_updates: HashMap<String, serde_json::Value> = HashMap::new();
 
+        // Build a label → index map so a `do: jump, to: <label>`
+        // policy action can re-enter the pipeline at the named
+        // sub-task.  The wire shape is an ordered list of single-key
+        // `{label: spec}` entries, so positional index doubles as the
+        // jump address.  Last definition wins on a duplicate label.
+        let label_to_idx: HashMap<String, usize> = tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| entry.keys().next().map(|k| (k.clone(), i)))
+            .collect();
+
+        // Bound total sub-task executions so a `do: jump` loop whose
+        // `do: break` condition is never reached can't spin forever
+        // (noetl/ai-meta#125 acceptance: guard against infinite jump
+        // loops).  Generous default; override via
+        // NOETL_TASK_SEQUENCE_MAX_ITERATIONS for pathological drains.
+        let max_iterations: u64 = std::env::var("NOETL_TASK_SEQUENCE_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1_000_000);
+
+        // Per-label retry counter (noetl/ai-meta#125 `do: retry`).
+        let mut retry_counts: HashMap<String, u32> = HashMap::new();
+        let mut current_idx: usize = 0;
+        let mut iterations: u64 = 0;
+
         tracing::debug!(task_count = tasks.len(), "task_sequence: starting pipeline");
 
-        for (idx, task_entry) in tasks.into_iter().enumerate() {
+        while current_idx < tasks.len() {
+            iterations += 1;
+            if iterations > max_iterations {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    max_iterations,
+                    "task_sequence: exceeded max iterations (possible infinite jump loop)"
+                );
+                return Ok(ToolResult {
+                    status: ToolStatus::Error,
+                    data: Some(serde_json::json!({
+                        "labeled_results": labeled_results,
+                        "error": "max_iterations_exceeded",
+                    })),
+                    error: Some(format!(
+                        "task_sequence exceeded max iterations ({max_iterations}); possible infinite `do: jump` loop without a reachable `do: break`"
+                    )),
+                    stdout: Some(last_stdout),
+                    stderr: Some(last_stderr),
+                    exit_code: Some(1),
+                    duration_ms: Some(duration_ms),
+                    pending_callback: None,
+                });
+            }
+
+            let idx = current_idx;
+            let task_entry = &tasks[current_idx];
             if task_entry.len() != 1 {
                 return Err(ToolError::Configuration(format!(
                     "task_sequence: task[{idx}] must have exactly one labeled entry (got {})",
                     task_entry.len()
                 )));
             }
-            let (label, spec) = task_entry.into_iter().next().unwrap();
+            // Clone label + spec: a sub-task may be re-executed by a
+            // `do: jump` / `do: retry`, so the task list is borrowed,
+            // not consumed.
+            let (label, spec) = {
+                let (l, s) = task_entry.iter().next().unwrap();
+                (l.clone(), s.clone())
+            };
 
             let spec_obj = spec.as_object().ok_or_else(|| {
                 ToolError::Configuration(format!(
@@ -360,6 +419,17 @@ impl Tool for TaskSequenceTool {
             // the raw result in a `{status, data}` envelope so
             // templates like `{{ output.data.counter }}` resolve
             // correctly (matches the Python server's convention).
+            // The control action chosen by the first matching policy
+            // rule.  `None` means no rule matched — the default action
+            // is then derived from the sub-task outcome (error → fail,
+            // success → continue), matching the Python reference.
+            let mut matched_action: Option<ControlAction> = None;
+
+            // Running attempt number for this sub-task (1-based), used
+            // for `do: retry` accounting and exposed to policy
+            // templates as `_attempt` (Python parity).
+            let attempt = retry_counts.get(&label).copied().unwrap_or(0) + 1;
+
             if let Some(ref rules) = policy_rules {
                 // Build the output envelope for policy evaluation
                 let output_envelope = serde_json::json!({
@@ -373,6 +443,9 @@ impl Tool for TaskSequenceTool {
                 policy_eval_ctx
                     .variables
                     .insert("output".to_string(), output_envelope);
+                policy_eval_ctx
+                    .variables
+                    .insert("_attempt".to_string(), serde_json::json!(attempt));
                 let policy_template_ctx = policy_eval_ctx.to_template_context();
 
                 for rule in rules {
@@ -444,88 +517,325 @@ impl Tool for TaskSequenceTool {
                             }
                         }
 
-                        // Handle `do:` action — `fail` short-circuits
-                        // the pipeline; `continue` (and unrecognised
-                        // actions) proceed normally.  `retry` is
-                        // deferred to a follow-up.
-                        if let Some(do_val) = then_obj.and_then(|o| o.get("do")) {
-                            if do_val.as_str() == Some("fail") {
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                return Ok(ToolResult {
-                                    status: ToolStatus::Error,
-                                    data: Some(serde_json::json!({
-                                        "labeled_results": labeled_results,
-                                        "failed_task": idx,
-                                    })),
-                                    error: Some(format!(
-                                        "policy rule triggered fail for task[{idx}] '{label}'"
-                                    )),
-                                    stdout: Some(last_stdout),
-                                    stderr: Some(last_stderr),
-                                    exit_code: Some(1),
-                                    duration_ms: Some(duration_ms),
-                                    pending_callback: None,
-                                });
-                            }
+                        // Capture the `do:` control action for the
+                        // first matching rule.  Dispatch happens after
+                        // the rule loop so `set:` mutations above are
+                        // applied first (Python applies set, then the
+                        // action).  Recognised verbs: continue / fail /
+                        // break / jump / retry; an unrecognised verb
+                        // falls back to `continue`.
+                        if let Some(then_map) = then_obj {
+                            matched_action = Some(parse_control_action(then_map));
                         }
                     }
                     break; // First matching rule wins
                 }
             }
 
-            // Failure short-circuit: the orchestrator's
-            // command.failed handler (noetl/ai-meta#58) emits
-            // playbook.failed cleanly when the worker reports a
-            // failed sub-task, so we don't run the rest of the
-            // pipeline — the user's expectation of "first failure
-            // stops the pipeline" matches the Python reference.
-            if task_result.status == ToolStatus::Error {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(ToolResult {
-                    status: ToolStatus::Error,
-                    data: Some(serde_json::json!({
-                        "labeled_results": labeled_results,
-                        "failed_task": idx,
-                    })),
-                    error: task_result
-                        .error
-                        .clone()
-                        .or_else(|| Some(format!("task_sequence task[{idx}] failed"))),
-                    stdout: Some(last_stdout),
-                    stderr: Some(last_stderr),
-                    exit_code: Some(total_exit_code),
-                    duration_ms: Some(duration_ms),
-                    pending_callback: None,
-                });
+            // Resolve the effective control action: an explicit
+            // matched rule wins; otherwise default by outcome
+            // (error → fail, success → continue) — Python parity.
+            let task_errored = task_result.status == ToolStatus::Error;
+            let action = matched_action.unwrap_or(if task_errored {
+                ControlAction::Fail
+            } else {
+                ControlAction::Continue
+            });
+
+            match action {
+                ControlAction::Continue => {
+                    current_idx += 1;
+                }
+
+                ControlAction::Break => {
+                    // Clean stop (e.g. drain loop's `claim` returned 0
+                    // rows).  Success with the accumulated results.
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    tracing::debug!(task = %label, "task_sequence: break");
+                    return Ok(build_pipeline_result(
+                        ToolStatus::Success,
+                        labeled_results,
+                        context_updates,
+                        None,
+                        last_stdout,
+                        last_stderr,
+                        total_exit_code,
+                        duration_ms,
+                    ));
+                }
+
+                ControlAction::Jump { to } => {
+                    let target = to
+                        .as_deref()
+                        .and_then(|t| resolve_jump_target(t, idx, &label_to_idx));
+                    match target {
+                        Some(t) => {
+                            tracing::debug!(from = %label, to = ?to, "task_sequence: jump");
+                            current_idx = t;
+                        }
+                        None => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            return Ok(ToolResult {
+                                status: ToolStatus::Error,
+                                data: Some(serde_json::json!({
+                                    "labeled_results": labeled_results,
+                                    "failed_task": idx,
+                                })),
+                                error: Some(format!(
+                                    "task_sequence: jump target {to:?} from task[{idx}] '{label}' not found"
+                                )),
+                                stdout: Some(last_stdout),
+                                stderr: Some(last_stderr),
+                                exit_code: Some(1),
+                                duration_ms: Some(duration_ms),
+                                pending_callback: None,
+                            });
+                        }
+                    }
+                }
+
+                ControlAction::Retry {
+                    attempts,
+                    backoff,
+                    delay,
+                } => {
+                    let count = retry_counts.entry(label.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= attempts {
+                        tracing::error!(
+                            task = %label,
+                            attempts,
+                            "task_sequence: retry exhausted"
+                        );
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        return Ok(ToolResult {
+                            status: ToolStatus::Error,
+                            data: Some(serde_json::json!({
+                                "labeled_results": labeled_results,
+                                "failed_task": idx,
+                            })),
+                            error: task_result.error.clone().or_else(|| {
+                                Some(format!(
+                                    "task_sequence task[{idx}] '{label}' exceeded retry attempts ({attempts})"
+                                ))
+                            }),
+                            stdout: Some(last_stdout),
+                            stderr: Some(last_stderr),
+                            exit_code: Some(total_exit_code),
+                            duration_ms: Some(duration_ms),
+                            pending_callback: None,
+                        });
+                    }
+                    let delay_secs = calc_retry_delay(&backoff, delay, *count);
+                    if delay_secs > 0.0 {
+                        tracing::debug!(
+                            task = %label,
+                            delay_secs,
+                            backoff = %backoff,
+                            "task_sequence: retry backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(delay_secs)).await;
+                    }
+                    tracing::debug!(
+                        task = %label,
+                        attempt = *count + 1,
+                        attempts,
+                        "task_sequence: retrying"
+                    );
+                    // current_idx unchanged → re-execute this sub-task.
+                }
+
+                ControlAction::Fail => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    return Ok(ToolResult {
+                        status: ToolStatus::Error,
+                        data: Some(serde_json::json!({
+                            "labeled_results": labeled_results,
+                            "failed_task": idx,
+                        })),
+                        error: task_result.error.clone().or_else(|| {
+                            Some(format!(
+                                "policy rule triggered fail for task[{idx}] '{label}'"
+                            ))
+                        }),
+                        stdout: Some(last_stdout),
+                        stderr: Some(last_stderr),
+                        exit_code: Some(if task_errored { total_exit_code } else { 1 }),
+                        duration_ms: Some(duration_ms),
+                        pending_callback: None,
+                    });
+                }
+            }
+
+            // Sub-task failure with no policy rule to handle it is
+            // covered above: the default action for an errored task is
+            // `Fail`, which returns from the `match` arm.  Reaching
+            // here means the action was Continue / Jump / Retry, so we
+            // loop with the (already-updated) `current_idx`.
+        }
+
+        // Pipeline drained normally (ran off the end of the task list).
+        let duration_ms = start.elapsed().as_millis() as u64;
+        Ok(build_pipeline_result(
+            ToolStatus::Success,
+            labeled_results,
+            context_updates,
+            None,
+            last_stdout,
+            last_stderr,
+            total_exit_code,
+            duration_ms,
+        ))
+    }
+}
+
+/// Control-flow verb produced by a matching `spec.policy.rules`
+/// `then.do` directive (noetl/ai-meta#125).  Mirrors the Python
+/// `task_sequence_executor` `ControlAction`.
+#[derive(Debug, Clone)]
+enum ControlAction {
+    /// Advance to the next sub-task.
+    Continue,
+    /// Re-run the current sub-task up to `attempts` times, sleeping
+    /// `calc_retry_delay(backoff, delay, attempt)` seconds between.
+    Retry {
+        attempts: u32,
+        backoff: String,
+        delay: f64,
+    },
+    /// Re-enter the pipeline at the sub-task named by `to` (or the
+    /// previous sub-task for the special `previous`/`prev` targets).
+    Jump { to: Option<String> },
+    /// Stop the pipeline cleanly and report success.
+    Break,
+    /// Stop the pipeline and report failure.
+    Fail,
+}
+
+/// Parse a policy rule's `then` block into a [`ControlAction`].
+/// Defaults mirror the Python reference: `attempts` 3, `backoff`
+/// "none", `delay` 1.0.  An unrecognised `do:` verb (or a missing
+/// one) falls back to `Continue` so a malformed rule never wedges
+/// the pipeline.
+fn parse_control_action(then_obj: &serde_json::Map<String, serde_json::Value>) -> ControlAction {
+    let do_str = then_obj.get("do").and_then(|v| v.as_str()).unwrap_or("continue");
+    match do_str {
+        "break" => ControlAction::Break,
+        "fail" => ControlAction::Fail,
+        "jump" => ControlAction::Jump {
+            to: then_obj
+                .get("to")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        },
+        "retry" => {
+            let attempts = then_obj
+                .get("attempts")
+                .and_then(json_to_u32)
+                .unwrap_or(3)
+                .max(1);
+            let backoff = then_obj
+                .get("backoff")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+                .to_string();
+            let delay = then_obj
+                .get("delay")
+                .and_then(json_to_f64)
+                .unwrap_or(1.0);
+            ControlAction::Retry {
+                attempts,
+                backoff,
+                delay,
             }
         }
+        // "continue" and anything unrecognised.
+        _ => ControlAction::Continue,
+    }
+}
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+/// Coerce a JSON number/string into u32 (YAML scalars can arrive
+/// either way after templating).
+fn json_to_u32(v: &serde_json::Value) -> Option<u32> {
+    v.as_u64()
+        .map(|n| n as u32)
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
 
-        // Merge `_context_updates` into the result data so the
-        // server can apply cross-step variable propagation.  Only
-        // added when policy rules produced mutations — the key is
-        // absent otherwise, so existing consumers are unaffected.
-        let mut result_map: serde_json::Map<String, serde_json::Value> =
-            labeled_results.into_iter().collect();
-        if !context_updates.is_empty() {
-            result_map.insert(
-                "_context_updates".to_string(),
-                serde_json::to_value(&context_updates)
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
+/// Coerce a JSON number/string into f64.
+fn json_to_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
 
-        Ok(ToolResult {
-            status: ToolStatus::Success,
-            data: Some(serde_json::Value::Object(result_map)),
-            error: None,
-            stdout: Some(last_stdout),
-            stderr: Some(last_stderr),
-            exit_code: Some(total_exit_code),
-            duration_ms: Some(duration_ms),
-            pending_callback: None,
-        })
+/// Retry backoff (seconds) for a given attempt, matching the Python
+/// `_calculate_delay`: `none` → 0, `linear` → delay·attempt,
+/// `exponential` → delay·2^(attempt-1), otherwise → delay.
+fn calc_retry_delay(backoff: &str, delay: f64, attempt: u32) -> f64 {
+    match backoff {
+        "none" => 0.0,
+        "linear" => delay * attempt as f64,
+        "exponential" => delay * 2f64.powi((attempt as i32) - 1),
+        _ => delay,
+    }
+}
+
+/// Resolve a `do: jump` target label to a task index.  Supports the
+/// special `previous` / `prev` / `_previous` / `@previous` targets
+/// (jump one sub-task back); returns `None` if the label is unknown
+/// or `previous` is requested from the first sub-task.
+fn resolve_jump_target(
+    to: &str,
+    current_idx: usize,
+    label_to_idx: &HashMap<String, usize>,
+) -> Option<usize> {
+    let trimmed = to.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "previous" | "prev" | "_previous" | "@previous"
+    ) {
+        return if current_idx == 0 {
+            None
+        } else {
+            Some(current_idx - 1)
+        };
+    }
+    label_to_idx.get(trimmed).copied()
+}
+
+/// Build the aggregated pipeline [`ToolResult`].  Merges
+/// `_context_updates` into the data payload only when policy rules
+/// produced mutations, so existing consumers are unaffected when the
+/// key is absent.
+#[allow(clippy::too_many_arguments)]
+fn build_pipeline_result(
+    status: ToolStatus,
+    labeled_results: HashMap<String, serde_json::Value>,
+    context_updates: HashMap<String, serde_json::Value>,
+    error: Option<String>,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    duration_ms: u64,
+) -> ToolResult {
+    let mut result_map: serde_json::Map<String, serde_json::Value> =
+        labeled_results.into_iter().collect();
+    if !context_updates.is_empty() {
+        result_map.insert(
+            "_context_updates".to_string(),
+            serde_json::to_value(&context_updates).unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    ToolResult {
+        status,
+        data: Some(serde_json::Value::Object(result_map)),
+        error,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+        exit_code: Some(exit_code),
+        duration_ms: Some(duration_ms),
+        pending_callback: None,
     }
 }
 
@@ -1226,5 +1536,309 @@ mod tests {
             .get("then")
             .and_then(|t| t.get("set"));
         assert!(set_block.is_some(), "rule should have a set block");
+    }
+
+    // ----------------------------------------------------------------
+    // noetl/ai-meta#125 — control-flow verbs: jump / break / retry
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_control_action_verbs() {
+        let mk = |s: &str| -> serde_json::Map<String, serde_json::Value> {
+            s.parse::<serde_json::Value>()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+
+        assert!(matches!(
+            parse_control_action(&mk(r#"{"do":"continue"}"#)),
+            ControlAction::Continue
+        ));
+        assert!(matches!(
+            parse_control_action(&mk(r#"{"do":"break"}"#)),
+            ControlAction::Break
+        ));
+        assert!(matches!(
+            parse_control_action(&mk(r#"{"do":"fail"}"#)),
+            ControlAction::Fail
+        ));
+        // Unknown verb falls back to continue (never wedges).
+        assert!(matches!(
+            parse_control_action(&mk(r#"{"do":"frobnicate"}"#)),
+            ControlAction::Continue
+        ));
+        // Missing `do` defaults to continue.
+        assert!(matches!(
+            parse_control_action(&mk(r#"{"set":{"a":"b"}}"#)),
+            ControlAction::Continue
+        ));
+
+        match parse_control_action(&mk(r#"{"do":"jump","to":"claim_batch"}"#)) {
+            ControlAction::Jump { to } => assert_eq!(to.as_deref(), Some("claim_batch")),
+            other => panic!("expected jump, got {other:?}"),
+        }
+
+        // Retry defaults: attempts 3, backoff none, delay 1.0.
+        match parse_control_action(&mk(r#"{"do":"retry"}"#)) {
+            ControlAction::Retry {
+                attempts,
+                backoff,
+                delay,
+            } => {
+                assert_eq!(attempts, 3);
+                assert_eq!(backoff, "none");
+                assert_eq!(delay, 1.0);
+            }
+            other => panic!("expected retry, got {other:?}"),
+        }
+        // Retry with explicit fields; attempts as a string coerces.
+        match parse_control_action(&mk(r#"{"do":"retry","attempts":"5","backoff":"exponential","delay":2}"#)) {
+            ControlAction::Retry {
+                attempts,
+                backoff,
+                delay,
+            } => {
+                assert_eq!(attempts, 5);
+                assert_eq!(backoff, "exponential");
+                assert_eq!(delay, 2.0);
+            }
+            other => panic!("expected retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calc_retry_delay_backoff() {
+        assert_eq!(calc_retry_delay("none", 1.0, 3), 0.0);
+        assert_eq!(calc_retry_delay("linear", 1.5, 3), 4.5);
+        assert_eq!(calc_retry_delay("exponential", 1.0, 1), 1.0);
+        assert_eq!(calc_retry_delay("exponential", 1.0, 3), 4.0);
+        assert_eq!(calc_retry_delay("unknown", 2.0, 9), 2.0);
+    }
+
+    #[test]
+    fn test_resolve_jump_target() {
+        let mut map = HashMap::new();
+        map.insert("claim_batch".to_string(), 0usize);
+        map.insert("fetch_batch".to_string(), 1usize);
+        map.insert("save_batch".to_string(), 2usize);
+
+        assert_eq!(resolve_jump_target("claim_batch", 2, &map), Some(0));
+        assert_eq!(resolve_jump_target(" save_batch ", 0, &map), Some(2));
+        assert_eq!(resolve_jump_target("nope", 0, &map), None);
+        // `previous` jumps one back; invalid from the first task.
+        assert_eq!(resolve_jump_target("previous", 2, &map), Some(1));
+        assert_eq!(resolve_jump_target("PREV", 1, &map), Some(0));
+        assert_eq!(resolve_jump_target("previous", 0, &map), None);
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_jump_drains_loop() {
+        // Mirrors the pft batch drain loop: `claim` yields work until a
+        // counter hits zero (then `do: break`); `save` jumps back to
+        // `claim`.  Before the fix `do: jump` was a no-op, so the
+        // pipeline ran claim→save exactly once.  With the fix it loops
+        // until the break condition, draining the counter to -1.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "claim": {
+                        "kind": "python",
+                        "input": {"counter": "{{ iter.counter }}"},
+                        "code": "result = {'remaining': {{ counter }} - 1, 'work': (1 if {{ counter }} > 0 else 0)}",
+                        "spec": {"policy": {"rules": [
+                            {"when": "{{ output.data.work == 0 }}", "then": {"do": "break"}},
+                            {"else": {"then": {"do": "continue", "set": {
+                                "iter.counter": "{{ output.data.remaining }}"
+                            }}}}
+                        ]}}
+                    }
+                },
+                {
+                    "save": {
+                        "kind": "python",
+                        "code": "result = {'saved': True}",
+                        "spec": {"policy": {"rules": [
+                            {"else": {"then": {"do": "jump", "to": "claim"}}}
+                        ]}}
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let mut ctx = ExecutionContext::default();
+        ctx.variables
+            .insert("iter".to_string(), serde_json::json!({"counter": 3}));
+
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+        assert!(
+            result.is_success(),
+            "drain loop should break cleanly: {:?}",
+            result.error
+        );
+        let data = result.data.expect("data present");
+        // Last claim ran at counter=0 → remaining=-1 → work=0 → break.
+        // If `jump` were a no-op, claim would have run once (remaining=2).
+        let remaining = data
+            .get("claim")
+            .and_then(|c| c.get("remaining"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(
+            remaining,
+            Some(-1),
+            "claim must have re-run via jump until the break condition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_break_stops_cleanly() {
+        // `do: break` returns success and skips the rest of the pipeline.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "gate": {
+                        "kind": "python",
+                        "code": "result = {'go': 0}",
+                        "spec": {"policy": {"rules": [
+                            {"when": "{{ output.data.go == 0 }}", "then": {"do": "break"}}
+                        ]}}
+                    }
+                },
+                {
+                    "after": {
+                        "kind": "python",
+                        "code": "result = {'ran': True}"
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+        assert!(result.is_success(), "break is a clean success");
+        let data = result.data.expect("data present");
+        assert!(data.get("gate").is_some(), "gate ran");
+        assert!(
+            data.get("after").is_none(),
+            "tasks after a break must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_retry_counts_attempts() {
+        // A task that retries while `_attempt < 3`, then continues.
+        // Proves retry re-executes the same task and increments the
+        // attempt counter; the final `_attempt` is captured via `set`.
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "flaky": {
+                        "kind": "python",
+                        "code": "result = {'x': 1}",
+                        "spec": {"policy": {"rules": [
+                            {"when": "{{ _attempt < 3 }}", "then": {"do": "retry", "attempts": 5}},
+                            {"else": {"then": {"do": "continue", "set": {
+                                "ctx.final_attempt": "{{ _attempt }}"
+                            }}}}
+                        ]}}
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+        assert!(result.is_success(), "retries then continues: {:?}", result.error);
+        let data = result.data.expect("data present");
+        let final_attempt = data
+            .get("_context_updates")
+            .and_then(|u| u.get("ctx.final_attempt"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(
+            final_attempt,
+            Some(3),
+            "task should have run 3 times (retried twice) before continuing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_retry_exhausted_fails() {
+        // A task that always errors with `do: retry, attempts: 2`
+        // exhausts its budget and the pipeline fails (no infinite loop).
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "always_fail": {
+                        "kind": "python",
+                        "code": "raise ValueError('nope')",
+                        "spec": {"policy": {"rules": [
+                            {"when": "{{ output.status == \"error\" }}", "then": {"do": "retry", "attempts": 2}}
+                        ]}}
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool
+            .execute(&config, &ctx)
+            .await
+            .expect("execute returns Ok with Error status");
+        assert_eq!(result.status, ToolStatus::Error, "retry budget exhausted");
+        let failed = result
+            .data
+            .and_then(|d| d.get("failed_task").and_then(|v| v.as_i64()));
+        assert_eq!(failed, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_task_sequence_jump_to_unknown_label_errors() {
+        let tool = TaskSequenceTool::new();
+        let config = ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                {
+                    "t": {
+                        "kind": "python",
+                        "code": "result = {'ok': True}",
+                        "spec": {"policy": {"rules": [
+                            {"else": {"then": {"do": "jump", "to": "does_not_exist"}}}
+                        ]}}
+                    }
+                },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let ctx = ExecutionContext::default();
+        let result = tool.execute(&config, &ctx).await.expect("execute ok");
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not found"),
+            "error should name the missing jump target: {:?}",
+            result.error
+        );
     }
 }
