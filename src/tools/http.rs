@@ -280,11 +280,7 @@ impl HttpTool {
             } else {
                 crate::result::ToolStatus::Error
             },
-            data: Some(serde_json::json!({
-                "status_code": status_code,
-                "headers": headers,
-                "body": data,
-            })),
+            data: Some(Self::build_response_data(status_code, &headers, data)),
             error: if !is_success {
                 Some(format!("HTTP {} response", status_code))
             } else {
@@ -298,6 +294,34 @@ impl HttpTool {
         };
 
         Ok(result)
+    }
+
+    /// Build the `ToolResult.data` envelope for an HTTP response.
+    ///
+    /// The parsed response payload is exposed under **`data`** — the
+    /// field name NoETL playbooks consume as `output.data.data.*`
+    /// (the Python http tool nested the body under `data`, and every
+    /// in-repo fixture reads it that way: `pft_flow_test/*`,
+    /// `patient_batch_parallel_queue`, `data_transfer/...`).
+    ///
+    /// `body` is kept as a sibling alias of `data` for backward
+    /// compatibility with consumers that read `output.data.body`
+    /// (e.g. the `amadeus_ai_api` error-path fixture), alongside
+    /// `status_code` and `headers`.  Restores noetl/ai-meta#126: the
+    /// Rust port previously exposed the payload only under `body`, so
+    /// `output.data.data` resolved to undefined and
+    /// `save_batch`'s `jsonb_to_recordset` received a non-array.
+    fn build_response_data(
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status_code": status_code,
+            "headers": headers,
+            "data": body,
+            "body": body,
+        })
     }
 
     /// Parse HTTP config from tool config.
@@ -418,6 +442,71 @@ mod tests {
     async fn test_http_tool_interface() {
         let tool = HttpTool::new();
         assert_eq!(tool.name(), "http");
+    }
+
+    #[test]
+    fn test_build_response_data_exposes_body_under_data() {
+        // noetl/ai-meta#126: playbooks read the parsed response as
+        // `output.data.data.*` (Python-era contract).  The envelope
+        // must expose the body under `data` (primary) and keep `body`
+        // as a backward-compat sibling, with status_code + headers.
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = serde_json::json!({
+            "rows": [{"patient_id": 1}, {"patient_id": 2}],
+            "rowCount": 2
+        });
+
+        let envelope = HttpTool::build_response_data(200, &headers, body.clone());
+
+        // Primary contract: output.data.data == parsed body.
+        assert_eq!(
+            envelope.get("data"),
+            Some(&body),
+            "parsed body must be exposed under `data` for output.data.data.*"
+        );
+        // The exact path the pft batch fixture reads.
+        let rows = envelope
+            .get("data")
+            .and_then(|d| d.get("rows"))
+            .and_then(|r| r.as_array());
+        assert_eq!(rows.map(|r| r.len()), Some(2), "data.rows resolves to an array");
+        assert_eq!(
+            envelope.pointer("/data/rowCount").and_then(|v| v.as_i64()),
+            Some(2),
+            "data.rowCount resolves"
+        );
+
+        // Backward-compat: `body` alias still carries the same payload.
+        assert_eq!(
+            envelope.get("body"),
+            Some(&body),
+            "`body` sibling preserved for output.data.body consumers"
+        );
+
+        // Metadata siblings present.
+        assert_eq!(
+            envelope.get("status_code").and_then(|v| v.as_u64()),
+            Some(200)
+        );
+        assert_eq!(
+            envelope.pointer("/headers/content-type").and_then(|v| v.as_str()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_build_response_data_non_object_body() {
+        // A plain-text / scalar body still lands under both keys.
+        let headers = HashMap::new();
+        let body = serde_json::json!("plain text response");
+        let envelope = HttpTool::build_response_data(503, &headers, body.clone());
+        assert_eq!(envelope.get("data"), Some(&body));
+        assert_eq!(envelope.get("body"), Some(&body));
+        assert_eq!(
+            envelope.get("status_code").and_then(|v| v.as_u64()),
+            Some(503)
+        );
     }
 
     #[test]
