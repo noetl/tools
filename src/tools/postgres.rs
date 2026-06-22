@@ -1,12 +1,13 @@
 //! PostgreSQL query execution tool.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use deadpool_postgres::{Config, Pool, Runtime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::NoTls;
 
 use crate::context::ExecutionContext;
@@ -500,7 +501,143 @@ fn json_to_pg_param(value: &serde_json::Value) -> Box<dyn ToSql + Sync + Send> {
     }
 }
 
+/// ISO-8601 string for a `timestamp without time zone` value.
+///
+/// No offset is appended — a tz-naive value carries no zone, so
+/// stamping it `+00:00` (as `DateTime<Utc>::to_rfc3339` would) is a
+/// lie.  `%.f` prints fractional seconds only when present, so a
+/// whole-second value renders `2026-06-14T12:00:00` and a fractional
+/// one `2026-06-14T12:00:00.500`.
+fn naive_datetime_to_json(dt: chrono::NaiveDateTime) -> serde_json::Value {
+    serde_json::json!(dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+}
+
+/// ISO-8601 date (`YYYY-MM-DD`).  `NaiveDate`'s `Display` already
+/// emits the ISO shape.
+fn naive_date_to_json(d: chrono::NaiveDate) -> serde_json::Value {
+    serde_json::json!(d.to_string())
+}
+
+/// ISO-8601 time (`HH:MM:SS[.fff]`).  `NaiveTime`'s `Display` emits
+/// the ISO shape, including fractional seconds when present.
+fn naive_time_to_json(t: chrono::NaiveTime) -> serde_json::Value {
+    serde_json::json!(t.to_string())
+}
+
+/// Decode the PostgreSQL `numeric` binary wire format into an exact
+/// decimal string.
+///
+/// `tokio-postgres` has no built-in `FromSql` for `numeric` without a
+/// `rust_decimal` / `bigdecimal` feature (neither is wired here), and
+/// the binary form is lossless, so we decode it directly.  Layout
+/// (all big-endian): `ndigits: i16`, `weight: i16`, `sign: u16`,
+/// `dscale: u16`, then `ndigits` base-10000 digit groups (`i16`
+/// each).  The reconstructed value is
+/// `sign * Σ digit[i] * 10000^(weight - i)`, rendered with `dscale`
+/// fractional decimal places.  Returns the string convention duckdb
+/// already uses for `Value::Decimal` (decimal-as-string) so result
+/// payloads stay consistent across tool kinds.
+fn decode_pg_numeric(buf: &[u8]) -> Option<String> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let ndigits = i16::from_be_bytes([buf[0], buf[1]]);
+    let weight = i16::from_be_bytes([buf[2], buf[3]]);
+    let sign = u16::from_be_bytes([buf[4], buf[5]]);
+    let dscale = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+
+    // 0xC000 = NaN.  (0xD000/0xF000 = +/-Inf in PG 14+; surface as text.)
+    match sign {
+        0xC000 => return Some("NaN".to_string()),
+        0xD000 => return Some("Infinity".to_string()),
+        0xF000 => return Some("-Infinity".to_string()),
+        _ => {}
+    }
+
+    let ndigits = ndigits as usize;
+    if buf.len() < 8 + ndigits * 2 {
+        return None;
+    }
+    let digits: Vec<i16> = (0..ndigits)
+        .map(|i| {
+            let off = 8 + i * 2;
+            i16::from_be_bytes([buf[off], buf[off + 1]])
+        })
+        .collect();
+
+    // Integer part: groups whose power (weight - i) >= 0.
+    let mut int_str = String::new();
+    if weight < 0 {
+        int_str.push('0');
+    } else {
+        for i in 0..=weight {
+            let g = digits.get(i as usize).copied().unwrap_or(0);
+            if i == 0 {
+                int_str.push_str(&g.to_string());
+            } else {
+                int_str.push_str(&format!("{g:04}"));
+            }
+        }
+    }
+
+    // Fractional part: groups whose power (weight - i) < 0.  When the
+    // first stored group already sits below the point (weight < 0),
+    // prepend the implied zero groups.
+    let mut frac_str = String::new();
+    let start_idx = if weight >= 0 {
+        (weight + 1) as usize
+    } else {
+        for _ in 0..(-weight - 1) {
+            frac_str.push_str("0000");
+        }
+        0
+    };
+    for d in digits.iter().skip(start_idx) {
+        frac_str.push_str(&format!("{d:04}"));
+    }
+    // dscale is the authoritative display scale: pad or trim to it.
+    if frac_str.len() < dscale {
+        frac_str.push_str(&"0".repeat(dscale - frac_str.len()));
+    }
+    frac_str.truncate(dscale);
+
+    let sign_str = if sign == 0x4000 { "-" } else { "" };
+    if dscale == 0 {
+        Some(format!("{sign_str}{int_str}"))
+    } else {
+        Some(format!("{sign_str}{int_str}.{frac_str}"))
+    }
+}
+
+/// `FromSql` adapter that reads a `numeric`/`decimal` column as its
+/// exact decimal string via [`decode_pg_numeric`].
+struct PgNumericString(String);
+
+impl<'a> FromSql<'a> for PgNumericString {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        decode_pg_numeric(raw)
+            .map(PgNumericString)
+            .ok_or_else(|| "failed to decode postgres numeric wire format".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
+    }
+}
+
 /// Convert PostgreSQL row value to JSON.
+///
+/// The probe order is type-driven: `try_get` consults each candidate's
+/// `FromSql::accepts` against the column's real OID before
+/// deserializing, so a mismatched arm returns `Err(WrongType)` and
+/// falls through cleanly.  A genuine SQL `NULL` is only `Ok(None)` on
+/// the arm whose type matches the column, so NULL still renders
+/// `Value::Null` rather than masking a missing arm.  Anything with no
+/// matching arm lands on the trailing `Null` — that fall-through was
+/// the bug behind noetl/ai-meta#95 for the temporal types below.
 fn pg_value_to_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
     // Try different types
     if let Ok(v) = row.try_get::<_, Option<i64>>(idx) {
@@ -531,9 +668,42 @@ fn pg_value_to_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value 
     if let Ok(v) = row.try_get::<_, Option<serde_json::Value>>(idx) {
         return v.unwrap_or(serde_json::Value::Null);
     }
+    // `timestamptz` — keeps the UTC offset (`+00:00`).
     if let Ok(v) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
         return v
             .map(|dt| serde_json::json!(dt.to_rfc3339()))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    // `timestamp without time zone` — the noetl/ai-meta#95 root cause:
+    // a tz-naive value previously fell through to `Null` because only
+    // the `DateTime<Utc>` arm above existed.
+    if let Ok(v) = row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+        return v.map(naive_datetime_to_json).unwrap_or(serde_json::Value::Null);
+    }
+    // `date`.
+    if let Ok(v) = row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
+        return v.map(naive_date_to_json).unwrap_or(serde_json::Value::Null);
+    }
+    // `time`.
+    if let Ok(v) = row.try_get::<_, Option<chrono::NaiveTime>>(idx) {
+        return v.map(naive_time_to_json).unwrap_or(serde_json::Value::Null);
+    }
+    // `uuid` → hyphenated lowercase string.
+    if let Ok(v) = row.try_get::<_, Option<uuid::Uuid>>(idx) {
+        return v
+            .map(|u| serde_json::json!(u.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    // `numeric`/`decimal` → exact decimal string (no precision loss).
+    if let Ok(v) = row.try_get::<_, Option<PgNumericString>>(idx) {
+        return v
+            .map(|n| serde_json::json!(n.0))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    // `bytea` → base64 string.
+    if let Ok(v) = row.try_get::<_, Option<Vec<u8>>>(idx) {
+        return v
+            .map(|b| serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b)))
             .unwrap_or(serde_json::Value::Null);
     }
 
@@ -556,6 +726,103 @@ mod tests {
         assert_eq!(config.query, "SELECT * FROM users WHERE id = $1");
         assert_eq!(config.params.len(), 1);
         assert!(config.connection_string.is_some());
+    }
+
+    #[test]
+    fn test_temporal_value_to_json() {
+        // noetl/ai-meta#95: tz-naive temporal types previously fell
+        // through to Null.  Pin each one's JSON shape.
+        use chrono::{NaiveDate, NaiveTime};
+
+        // `timestamp without time zone` — ISO-8601, NO offset suffix.
+        let dt = NaiveDate::from_ymd_opt(2026, 6, 14)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap();
+        assert_eq!(
+            naive_datetime_to_json(dt),
+            serde_json::json!("2026-06-14T12:30:45")
+        );
+
+        // Fractional seconds are preserved when present.
+        let dt_frac = NaiveDate::from_ymd_opt(2026, 6, 14)
+            .unwrap()
+            .and_hms_milli_opt(12, 30, 45, 500)
+            .unwrap();
+        assert_eq!(
+            naive_datetime_to_json(dt_frac),
+            serde_json::json!("2026-06-14T12:30:45.500")
+        );
+
+        // `date`.
+        assert_eq!(
+            naive_date_to_json(NaiveDate::from_ymd_opt(2026, 6, 14).unwrap()),
+            serde_json::json!("2026-06-14")
+        );
+
+        // `time`.
+        assert_eq!(
+            naive_time_to_json(NaiveTime::from_hms_opt(23, 59, 1).unwrap()),
+            serde_json::json!("23:59:01")
+        );
+    }
+
+    /// Build a PostgreSQL `numeric` binary wire buffer from its parts.
+    fn pg_numeric_bytes(weight: i16, sign: u16, dscale: u16, digits: &[i16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(digits.len() as i16).to_be_bytes());
+        b.extend_from_slice(&weight.to_be_bytes());
+        b.extend_from_slice(&sign.to_be_bytes());
+        b.extend_from_slice(&dscale.to_be_bytes());
+        for d in digits {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn test_decode_pg_numeric() {
+        // Zero: ndigits=0.
+        assert_eq!(decode_pg_numeric(&pg_numeric_bytes(0, 0, 0, &[])).unwrap(), "0");
+        // 1.
+        assert_eq!(decode_pg_numeric(&pg_numeric_bytes(0, 0, 0, &[1])).unwrap(), "1");
+        // -1.
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(0, 0x4000, 0, &[1])).unwrap(),
+            "-1"
+        );
+        // 1234.5678 — one integer group (weight 0) + one fraction group.
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(0, 0, 4, &[1234, 5678])).unwrap(),
+            "1234.5678"
+        );
+        // 100000 — weight 1, single group 10 (10 * 10000^1).
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(1, 0, 0, &[10])).unwrap(),
+            "100000"
+        );
+        // 0.5 — weight -1, group 5000, dscale 1.
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(-1, 0, 1, &[5000])).unwrap(),
+            "0.5"
+        );
+        // 0.00005 — weight -2, group 5000, dscale 5.
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(-2, 0, 5, &[5000])).unwrap(),
+            "0.00005"
+        );
+        // Trailing-zero padding to dscale: 100 stored at dscale 2 → "100.00".
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(0, 0, 2, &[100])).unwrap(),
+            "100.00"
+        );
+        // NaN sentinel.
+        assert_eq!(
+            decode_pg_numeric(&pg_numeric_bytes(0, 0xC000, 0, &[])).unwrap(),
+            "NaN"
+        );
+        // Truncated buffer → None, not a panic.
+        assert!(decode_pg_numeric(&[0, 1, 0, 0]).is_none());
     }
 
     #[test]
