@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.0](https://github.com/noetl/tools/compare/v3.14.2...v3.15.0) (2026-06-22)
+
+### Features
+
+* **locator:** extract noetl-locator slim crate ([#104](https://github.com/noetl/tools/issues/104) Phase A) ([e91be8b](https://github.com/noetl/tools/commit/e91be8bc1093d8360d30bbbfbf199d365b9f111b))
+
 ## [3.14.2](https://github.com/noetl/tools/compare/v3.14.1...v3.14.2) (2026-06-22)
 
 ### Bug Fixes
