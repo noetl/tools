@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.16.0](https://github.com/noetl/tools/compare/v3.15.0...v3.16.0) (2026-06-22)
+
+### Features
+
+* **locator:** ResultCoordinates::parse / from_locator ([#104](https://github.com/noetl/tools/issues/104) Phase B) ([740a2c2](https://github.com/noetl/tools/commit/740a2c2290be7db6dace3b94c7d640d399061506))
+
 ## [3.15.0](https://github.com/noetl/tools/compare/v3.14.2...v3.15.0) (2026-06-22)
 
 ### Features
