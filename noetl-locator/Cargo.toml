@@ -1,0 +1,20 @@
+[package]
+name = "noetl-locator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/noetl/noetl"
+homepage = "https://noetl.io"
+description = "NoETL Resource Locator — the dependency-free logical-URI + shard-derivation types (ResourceLocator, ResultCoordinates, shard_key, CellPlacement, legacy-ref parse) shared by the worker, the control-plane server, and the materialiser pool (noetl/ai-meta#104)."
+keywords = ["noetl", "locator", "uri", "sharding"]
+categories = ["parsing"]
+
+# Deliberately dependency-free: pure `std`.  This crate is consumed by the
+# internet-facing-adjacent control-plane noetl-server, which must NOT pull
+# noetl-tools' heavy graph (duckdb/kube/arrow-flight/tonic/rhai) just to parse a
+# result URI — so the two-layer derivable naming has ONE implementation without
+# dragging the registry's dependency tree onto the control plane.  Mirrors the
+# lean `noetl-directives` member (noetl/ai-meta#92).  noetl-tools re-exports it
+# as `noetl_tools::locator` so existing consumers (the worker stamp path) are
+# unchanged.
+[dependencies]

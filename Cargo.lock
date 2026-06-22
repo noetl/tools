@@ -2469,6 +2469,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-locator"
+version = "0.1.0"
+
+[[package]]
 name = "noetl-tools"
 version = "3.14.2"
 dependencies = [
@@ -2493,6 +2497,7 @@ dependencies = [
  "minijinja",
  "noetl-arrow-flight-client",
  "noetl-directives",
+ "noetl-locator",
  "pem",
  "regex",
  "reqwest",
