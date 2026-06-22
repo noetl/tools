@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.14.2](https://github.com/noetl/tools/compare/v3.14.1...v3.14.2) (2026-06-22)
+
+### Bug Fixes
+
+* **postgres:** serialize temporal/identity types in pg_value_to_json ([#75](https://github.com/noetl/tools/issues/75)) ([06302ac](https://github.com/noetl/tools/commit/06302ac73af3a4457de361e0fb4d26824a892f54)), closes [noetl/ai-meta#95](https://github.com/noetl/ai-meta/issues/95) [noetl/ai-meta#95](https://github.com/noetl/ai-meta/issues/95)
+
 ## [3.14.1](https://github.com/noetl/tools/compare/v3.14.0...v3.14.1) (2026-06-22)
 
 ### Performance Improvements
