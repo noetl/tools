@@ -78,6 +78,30 @@ jobs:
             # Give the sparse index a moment so the root crate's publish resolves it.
             sleep 20
           fi
+      # Publish the workspace member `noetl-locator` (noetl/ai-meta#104) before
+      # the root crate for the same reason as noetl-directives: noetl-tools
+      # re-exports it as `noetl_tools::locator`, so `cargo publish` of the root
+      # crate needs it resolvable from crates.io.  The control-plane noetl-server
+      # also depends on this crate directly (slim dep, no heavy graph).
+      # Idempotent: skip if this version is already published.
+      - name: Publish noetl-locator (if changed)
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version = ' noetl-locator/Cargo.toml | head -1 | cut -d'"' -f2)"
+          if cargo search noetl-locator 2>/dev/null | grep -q "noetl-locator = \"${VER}\""; then
+            echo "noetl-locator ${VER} already on crates.io; skipping."
+          else
+            OUTPUT="$(cargo publish -p noetl-locator 2>&1)" || {
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
+            }
+            echo "$OUTPUT"
+            # Give the sparse index a moment so the root crate's publish resolves it.
+            sleep 20
+          fi
       - name: Publish noetl-tools crate
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         env:

@@ -4,7 +4,7 @@
 # noetl-gateway can consume the security-sensitive allowlist WITHOUT pulling
 # noetl-tools' heavy graph (duckdb/kube/tokio).  noetl-tools re-exports it.
 [workspace]
-members = ["directives"]
+members = ["directives", "noetl-locator"]
 resolver = "2"
 
 [package]
@@ -51,6 +51,14 @@ s3 = ["dep:hmac"]
 # call sites are unchanged.  Path dep within the workspace; the published
 # `version` is what external consumers resolve.
 noetl-directives = { version = "0.1", path = "directives" }
+
+# The Resource Locator (noetl/ai-meta#104).  Extracted into the lean,
+# dependency-free `noetl-locator` member so the control-plane server can parse
+# the canonical result URI WITHOUT pulling noetl-tools' heavy graph.  noetl-tools
+# re-exports it as `noetl_tools::locator` (see `src/lib.rs`) so the worker stamp
+# path (`noetl_tools::locator::ResultCoordinates`) is unchanged.  Path dep within
+# the workspace; the published `version` is what external consumers resolve.
+noetl-locator = { version = "0.1", path = "noetl-locator" }
 
 # Async runtime
 tokio = { version = "1", features = ["process", "fs", "sync", "time", "io-util", "rt-multi-thread"] }

@@ -12,7 +12,12 @@
 
 pub mod arrow_codec;
 pub mod auth;
-pub mod locator;
+// The Resource Locator now lives in the lean, dependency-free `noetl-locator`
+// crate (noetl/ai-meta#104) so the control-plane server can depend on it WITHOUT
+// noetl-tools' heavy graph.  Re-exported here as `noetl_tools::locator` so
+// existing consumers (the worker stamp path
+// `noetl_tools::locator::ResultCoordinates`) are unchanged.
+pub use noetl_locator as locator;
 pub mod context;
 pub mod error;
 pub mod registry;
