@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.14.1](https://github.com/noetl/tools/compare/v3.14.0...v3.14.1) (2026-06-22)
+
+### Performance Improvements
+
+* **task_sequence:** reuse proxied context per sub-task to cut per-iteration CPU ([#127](https://github.com/noetl/tools/issues/127)) ([#74](https://github.com/noetl/tools/issues/74)) ([9dd9aa6](https://github.com/noetl/tools/commit/9dd9aa63fc41efac8f3c36b49428bf56d5924dcb)), closes [#124](https://github.com/noetl/tools/issues/124) [#125](https://github.com/noetl/tools/issues/125)
+
 ## [3.14.0](https://github.com/noetl/tools/compare/v3.13.1...v3.14.0) (2026-06-21)
 
 ### Features
