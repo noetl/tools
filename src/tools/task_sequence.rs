@@ -323,9 +323,18 @@ impl Tool for TaskSequenceTool {
             // absent.
             let input_val = spec_obj.get("input").or_else(|| spec_obj.get("args"));
             if let Some(input_obj) = input_val.and_then(|v| v.as_object()) {
-                let template_ctx = task_ctx.to_template_context();
+                // Build the proxied context once (pre-injection
+                // snapshot) and reuse it across every `input:` value —
+                // each input renders against the same frozen context,
+                // matching the prior per-call `to_template_context()`
+                // snapshot semantics without the repeated deep-clone
+                // (noetl/ai-meta#127).
+                let input_ctx = TemplateEngine::build_context_with_overlay(
+                    &task_ctx.variables,
+                    task_ctx.template_metadata(),
+                );
                 for (key, val) in input_obj {
-                    let rendered = self.template_engine.render_value(val, &template_ctx)?;
+                    let rendered = self.template_engine.render_value_with(val, &input_ctx)?;
                     task_ctx.variables.insert(key.clone(), rendered);
                 }
             }
@@ -333,10 +342,16 @@ impl Tool for TaskSequenceTool {
             let raw_task_config = Self::build_task_config(&label, &spec)?;
 
             // Render templates in the task config against the
-            // augmented context (running vars + resolved input).
+            // augmented context (running vars + resolved input).  Build
+            // the proxied context once and reuse it across the config
+            // tree's templated fields (noetl/ai-meta#127).
+            let task_ctx_value = TemplateEngine::build_context_with_overlay(
+                &task_ctx.variables,
+                task_ctx.template_metadata(),
+            );
             let rendered = self
                 .template_engine
-                .render_value(&raw_task_config.config, &task_ctx.to_template_context())?;
+                .render_value_with(&raw_task_config.config, &task_ctx_value)?;
             let task_config = ToolConfig {
                 kind: raw_task_config.kind,
                 config: rendered,
@@ -400,14 +415,21 @@ impl Tool for TaskSequenceTool {
             // values into the running context for subsequent items.
             if let Some(set_val) = set_block {
                 if let Some(set_obj) = set_val.as_object() {
-                    let mut set_eval_ctx = task_ctx.clone();
-                    set_eval_ctx
-                        .variables
-                        .insert("output".to_string(), result_data.clone());
-                    let set_template_ctx = set_eval_ctx.to_template_context();
+                    // Build the proxied eval context once — base
+                    // (running vars + resolved input) overlaid with
+                    // `output` (this tool's raw result) — and reuse it
+                    // across every `set:` expression, instead of cloning
+                    // the whole ExecutionContext + a `to_template_context`
+                    // deep-clone per block (noetl/ai-meta#127).
+                    let set_eval_ctx = TemplateEngine::build_context_with_overlay(
+                        &task_ctx.variables,
+                        task_ctx
+                            .template_metadata()
+                            .into_iter()
+                            .chain(std::iter::once(("output", result_data.clone()))),
+                    );
                     for (key, expr) in set_obj {
-                        let rendered =
-                            self.template_engine.render_value(expr, &set_template_ctx)?;
+                        let rendered = self.template_engine.render_value_with(expr, &set_eval_ctx)?;
                         set_nested_var(&mut running_ctx.variables, key, rendered);
                     }
                 }
@@ -439,14 +461,19 @@ impl Tool for TaskSequenceTool {
                         "retryable": false
                     }
                 });
-                let mut policy_eval_ctx = task_ctx.clone();
-                policy_eval_ctx
-                    .variables
-                    .insert("output".to_string(), output_envelope);
-                policy_eval_ctx
-                    .variables
-                    .insert("_attempt".to_string(), serde_json::json!(attempt));
-                let policy_template_ctx = policy_eval_ctx.to_template_context();
+                // Build the proxied policy-eval context once — base
+                // (running vars + resolved input) overlaid with the
+                // `output` envelope + `_attempt` — and reuse it across
+                // every rule's `when:` / `set:` render, instead of a
+                // per-step ExecutionContext clone + `to_template_context`
+                // deep-clone (noetl/ai-meta#127).
+                let policy_template_ctx = TemplateEngine::build_context_with_overlay(
+                    &task_ctx.variables,
+                    task_ctx.template_metadata().into_iter().chain([
+                        ("output", output_envelope),
+                        ("_attempt", serde_json::json!(attempt)),
+                    ]),
+                );
 
                 for rule in rules {
                     let rule_obj = match rule.as_object() {
@@ -467,7 +494,7 @@ impl Tool for TaskSequenceTool {
                             let condition_str = when_val.as_str().unwrap_or("");
                             let rendered = self
                                 .template_engine
-                                .render(condition_str, &policy_template_ctx)
+                                .render_with(condition_str, &policy_template_ctx)
                                 .unwrap_or_default();
                             let is_truthy = !rendered.is_empty()
                                 && rendered != "false"
@@ -502,7 +529,7 @@ impl Tool for TaskSequenceTool {
                                 for (key, expr) in set_obj {
                                     let rendered = self
                                         .template_engine
-                                        .render_value(expr, &policy_template_ctx)?;
+                                        .render_value_with(expr, &policy_template_ctx)?;
                                     set_nested_var(
                                         &mut running_ctx.variables,
                                         key,
