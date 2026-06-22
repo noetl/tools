@@ -63,6 +63,9 @@ pub enum LocatorError {
     TooFewSegments(String),
     /// An empty segment where a value was required.
     EmptySegment(String),
+    /// The locator is well-formed but is not a `results` locator (its `kind`
+    /// segment is something else) — surfaced by [`ResultCoordinates::from_locator`].
+    NotResultLocator(String),
 }
 
 impl fmt::Display for LocatorError {
@@ -76,6 +79,9 @@ impl fmt::Display for LocatorError {
                 "locator must have at least tenant/project/kind/logical_path segments: {s:?}"
             ),
             LocatorError::EmptySegment(s) => write!(f, "locator has an empty required segment: {s:?}"),
+            LocatorError::NotResultLocator(s) => {
+                write!(f, "locator is not a '{KIND_RESULTS}' locator: {s:?}")
+            }
         }
     }
 }
@@ -251,6 +257,57 @@ impl ResultCoordinates {
     /// The logical URI string (convenience over `to_locator().to_uri()`).
     pub fn logical_uri(&self) -> String {
         self.to_locator().to_uri()
+    }
+
+    /// Parse the canonical results logical URI back into coordinates — the
+    /// inverse of [`logical_uri`](Self::logical_uri).
+    ///
+    /// The result materialiser (noetl/ai-meta#104 Phase B) derives the §7
+    /// physical key from the worker-stamped `reference.uri`, so it must recover
+    /// `(tenant, project, execution_id, step, frame, row, attempt)` from the
+    /// stable name. This is the single source of that inversion so the
+    /// materialiser and any future consumer agree with the producer
+    /// ([`logical_uri`](Self::logical_uri)) byte-for-byte.
+    ///
+    /// Accepts `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`.
+    pub fn parse(uri: &str) -> Result<Self, LocatorError> {
+        Self::from_locator(&ResourceLocator::parse(uri)?)
+    }
+
+    /// Recover result coordinates from an already-parsed [`ResourceLocator`].
+    ///
+    /// `step` may itself contain `/`, so the numeric tail
+    /// (`frame`/`row`/`attempt`) is taken from the END and `execution_id` from
+    /// the front; everything between is the step. Rejects a non-`results`
+    /// locator ([`LocatorError::NotResultLocator`]) and a tail that does not
+    /// parse as integers.
+    pub fn from_locator(loc: &ResourceLocator) -> Result<Self, LocatorError> {
+        if loc.kind != KIND_RESULTS {
+            return Err(LocatorError::NotResultLocator(loc.to_uri()));
+        }
+        let segs: Vec<&str> = loc.logical_path.split('/').collect();
+        if segs.len() < 5 {
+            return Err(LocatorError::TooFewSegments(loc.to_uri()));
+        }
+        let n = segs.len();
+        let parse_int_err = || LocatorError::EmptySegment(loc.to_uri());
+        let execution_id = segs[0].parse::<i64>().map_err(|_| parse_int_err())?;
+        let frame = segs[n - 3].parse::<u64>().map_err(|_| parse_int_err())?;
+        let row = segs[n - 2].parse::<u64>().map_err(|_| parse_int_err())?;
+        let attempt = segs[n - 1].parse::<u32>().map_err(|_| parse_int_err())?;
+        let step = segs[1..n - 3].join("/");
+        if step.is_empty() {
+            return Err(LocatorError::EmptySegment(loc.to_uri()));
+        }
+        Ok(Self::new(
+            Some(&loc.tenant),
+            Some(&loc.project),
+            execution_id,
+            step,
+            frame,
+            row,
+            attempt,
+        ))
     }
 
     /// Stable shard key, co-celling all results of one execution by feeding
@@ -454,6 +511,71 @@ mod tests {
         let loc = ResourceLocator::parse(&c.logical_uri()).unwrap();
         assert_eq!(loc.kind, "results");
         assert_eq!(loc.logical_path, "325/load_next_facility/2/4/1");
+    }
+
+    #[test]
+    fn result_coordinates_parse_round_trips_logical_uri() {
+        // The producer stamps `logical_uri`; the materialiser parses it back.
+        // The inversion must be exact for every field.
+        let c = ResultCoordinates::new(Some("t_acme"), Some("p_gen"), 325, "load_next_facility", 2, 4, 1);
+        let parsed = ResultCoordinates::parse(&c.logical_uri()).unwrap();
+        assert_eq!(parsed, c);
+        // No-fan-out default coordinates round-trip too.
+        let d = ResultCoordinates::new(None, None, 7, "start", 0, 0, 1);
+        assert_eq!(ResultCoordinates::parse(&d.logical_uri()).unwrap(), d);
+    }
+
+    #[test]
+    fn result_coordinates_parse_keeps_every_attempt() {
+        // Keep-every (OQ1): a retry bumps `attempt`, which is in the name — so
+        // parsing two attempts of the same (eid, step, frame, row) yields
+        // distinct coordinates AND distinct physical keys (never overwritten).
+        let a1 = ResultCoordinates::parse("noetl://t/p/results/1/s/0/0/1").unwrap();
+        let a2 = ResultCoordinates::parse("noetl://t/p/results/1/s/0/0/2").unwrap();
+        assert_eq!(a1.attempt, 1);
+        assert_eq!(a2.attempt, 2);
+        assert_ne!(a1, a2);
+        let pl = CellPlacement::new("dev", "local", "local-0", 0);
+        assert_ne!(
+            a1.physical_key(&pl, "2026-06-22", "feather"),
+            a2.physical_key(&pl, "2026-06-22", "feather")
+        );
+    }
+
+    #[test]
+    fn result_coordinates_parse_handles_step_with_slash() {
+        // A step name containing '/' must still parse: eid from the front,
+        // frame/row/attempt from the tail, the slash-bearing remainder is step.
+        let c = ResultCoordinates::parse("noetl://t/p/results/9/a/b/c/3/5/2").unwrap();
+        assert_eq!(c.execution_id, 9);
+        assert_eq!(c.step, "a/b/c");
+        assert_eq!(c.frame, 3);
+        assert_eq!(c.row, 5);
+        assert_eq!(c.attempt, 2);
+    }
+
+    #[test]
+    fn result_coordinates_parse_rejects_malformed() {
+        // Wrong kind.
+        assert!(matches!(
+            ResultCoordinates::parse("noetl://t/p/datasets/9/s/0/0/1"),
+            Err(LocatorError::NotResultLocator(_))
+        ));
+        // Too few tail segments.
+        assert!(matches!(
+            ResultCoordinates::parse("noetl://t/p/results/9/s/0"),
+            Err(LocatorError::TooFewSegments(_))
+        ));
+        // Non-integer attempt.
+        assert!(matches!(
+            ResultCoordinates::parse("noetl://t/p/results/9/s/0/0/x"),
+            Err(LocatorError::EmptySegment(_))
+        ));
+        // Not a locator at all.
+        assert!(matches!(
+            ResultCoordinates::parse("https://x/y/results/9/s/0/0/1"),
+            Err(LocatorError::MissingScheme(_))
+        ));
     }
 
     #[test]
