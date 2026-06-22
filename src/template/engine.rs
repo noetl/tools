@@ -74,12 +74,60 @@ impl TemplateEngine {
         template: &str,
         context: &HashMap<String, serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let tmpl = self.env.template_from_str(template)?;
-
-        // Convert context to minijinja Value
+        // Convert context to minijinja Value (deep-clones the JSON +
+        // wraps every map in a `StepResultProxy`).  This is the
+        // dominant per-render cost when the context carries large
+        // accumulated payloads, so callers that render many values
+        // against the same context should prefer [`build_context`] +
+        // [`render_with`] to pay it once (noetl/ai-meta#127).
         let ctx = context_to_value(context);
+        self.render_with(template, &ctx)
+    }
 
-        tmpl.render(ctx)
+    /// Build the proxied minijinja [`Value`] for a context once, so it
+    /// can be reused across many [`render_with`] / [`render_value_with`]
+    /// calls without re-cloning + re-proxying the whole context each
+    /// time.  Cloning the returned `Value` is cheap — minijinja's
+    /// `Value` is `Arc`-backed for compound types, so a clone is a
+    /// refcount bump, not a deep copy (noetl/ai-meta#127).
+    pub fn build_context(context: &HashMap<String, serde_json::Value>) -> Value {
+        context_to_value(context)
+    }
+
+    /// Build a proxied minijinja [`Value`] directly from borrowed
+    /// `variables` plus `overlay` entries that take precedence over a
+    /// variable of the same name — mirroring the metadata-wins
+    /// semantics of [`ExecutionContext::to_template_context`].
+    ///
+    /// This lets a hot loop avoid the intermediate
+    /// `to_template_context()` `HashMap` deep-clone: the variables are
+    /// cloned straight into minijinja `Value`s (the one unavoidable
+    /// clone), and small per-iteration overlays (`output`, `_attempt`,
+    /// execution metadata) are layered on without rebuilding the base
+    /// map (noetl/ai-meta#127).
+    pub fn build_context_with_overlay<'a, I>(
+        variables: &HashMap<String, serde_json::Value>,
+        overlay: I,
+    ) -> Value
+    where
+        I: IntoIterator<Item = (&'a str, serde_json::Value)>,
+    {
+        let mut map: std::collections::BTreeMap<String, Value> = variables
+            .iter()
+            .map(|(k, v)| (k.clone(), json_to_proxied_value(v.clone())))
+            .collect();
+        for (k, v) in overlay {
+            map.insert(k.to_string(), json_to_proxied_value(v));
+        }
+        Value::from(map)
+    }
+
+    /// Render a template string against a pre-built proxied context
+    /// [`Value`] (see [`build_context`]).  Cloning the `Value` per
+    /// render is cheap (`Arc` bump).
+    pub fn render_with(&self, template: &str, ctx: &Value) -> Result<String, ToolError> {
+        let tmpl = self.env.template_from_str(template)?;
+        tmpl.render(ctx.clone())
             .map_err(|e| ToolError::Template(e.to_string()))
     }
 
@@ -106,9 +154,30 @@ impl TemplateEngine {
         value: &serde_json::Value,
         context: &HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, ToolError> {
+        // Build the proxied minijinja context ONCE and reuse it across
+        // every nested templated field, instead of rebuilding it inside
+        // each `render()` call.  For a config object with K templated
+        // fields this turns K full context deep-clones into one
+        // (noetl/ai-meta#127).
+        let ctx = context_to_value(context);
+        self.render_value_with(value, &ctx)
+    }
+
+    /// Render a value tree against a pre-built proxied context
+    /// [`Value`] (see [`build_context`] / [`build_context_with_overlay`]).
+    ///
+    /// Behaviourally identical to [`render_value`]; the only difference
+    /// is that the caller supplies the already-converted context so the
+    /// proxied `Value` is built once and shared across the whole tree
+    /// — the lever behind noetl/ai-meta#127's per-sub-task CPU cut.
+    pub fn render_value_with(
+        &self,
+        value: &serde_json::Value,
+        ctx: &Value,
+    ) -> Result<serde_json::Value, ToolError> {
         match value {
             serde_json::Value::String(s) if Self::is_template(s) => {
-                let rendered = self.render(s, context)?;
+                let rendered = self.render_with(s, ctx)?;
                 // Try to parse as JSON first.
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&rendered) {
                     return Ok(val);
@@ -131,7 +200,7 @@ impl TemplateEngine {
                     // could conflict (e.g. user already wrote |tojson).
                     if !inner.contains("|tojson") {
                         let json_tmpl = format!("{{{{ {} | tojson }}}}", inner.trim());
-                        if let Ok(json_rendered) = self.render(&json_tmpl, context) {
+                        if let Ok(json_rendered) = self.render_with(&json_tmpl, ctx) {
                             if let Ok(val) =
                                 serde_json::from_str::<serde_json::Value>(&json_rendered)
                             {
@@ -146,13 +215,15 @@ impl TemplateEngine {
             serde_json::Value::Object(obj) => {
                 let mut result = serde_json::Map::new();
                 for (k, v) in obj {
-                    result.insert(k.clone(), self.render_value(v, context)?);
+                    result.insert(k.clone(), self.render_value_with(v, ctx)?);
                 }
                 Ok(serde_json::Value::Object(result))
             }
             serde_json::Value::Array(arr) => {
-                let result: Result<Vec<_>, _> =
-                    arr.iter().map(|v| self.render_value(v, context)).collect();
+                let result: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|v| self.render_value_with(v, ctx))
+                    .collect();
                 Ok(serde_json::Value::Array(result?))
             }
             _ => Ok(value.clone()),
@@ -498,6 +569,77 @@ mod tests {
 
         let result = engine.render("{{ data | tojson }}", &ctx).unwrap();
         assert!(result.contains("\"key\"") && result.contains("\"value\""));
+    }
+
+    #[test]
+    fn test_render_value_with_matches_render_value() {
+        // noetl/ai-meta#127: render_value_with (shared pre-built
+        // context) must produce byte-identical output to render_value
+        // (per-call context build) across the value shapes that show up
+        // in a task_sequence config — nested objects, arrays, the
+        // tojson-retry path for object-valued single expressions, the
+        // `.result` proxy fall-through, and plain non-template values.
+        let engine = TemplateEngine::new();
+        let mut ctx = HashMap::new();
+        ctx.insert("name".to_string(), serde_json::json!("World"));
+        ctx.insert("n".to_string(), serde_json::json!(7));
+        ctx.insert(
+            "producer".to_string(),
+            serde_json::json!({"reference": {"ref": "noetl://x"}, "rows": [1, 2, 3]}),
+        );
+        ctx.insert(
+            "output".to_string(),
+            serde_json::json!({"data": {"counter": 42, "label": "hi"}}),
+        );
+
+        let values = vec![
+            serde_json::json!("Hello, {{ name }}!"),
+            serde_json::json!("{{ output.data }}"), // object → tojson retry
+            serde_json::json!("{{ producer.result.reference.ref }}"), // proxy
+            serde_json::json!({
+                "url": "https://api/{{ name }}/{{ n }}",
+                "nested": {"count": "{{ output.data.counter }}"},
+                "list": ["{{ n }}", "static", "{{ producer.rows[0] }}"],
+                "plain": 99,
+            }),
+        ];
+
+        let shared = TemplateEngine::build_context(&ctx);
+        for v in &values {
+            let per_call = engine.render_value(v, &ctx).unwrap();
+            let shared_out = engine.render_value_with(v, &shared).unwrap();
+            assert_eq!(
+                per_call, shared_out,
+                "render_value_with must match render_value for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_context_with_overlay_metadata_wins() {
+        // The overlay (execution metadata / output / _attempt) takes
+        // precedence over a variable of the same name — preserving the
+        // metadata-wins semantics of to_template_context that the hot
+        // loop relies on (noetl/ai-meta#127).
+        let engine = TemplateEngine::new();
+        let mut variables = HashMap::new();
+        variables.insert("step".to_string(), serde_json::json!("from_variable"));
+        variables.insert("keep".to_string(), serde_json::json!("kept"));
+
+        let ctx = TemplateEngine::build_context_with_overlay(
+            &variables,
+            vec![("step", serde_json::json!("from_overlay"))],
+        );
+        assert_eq!(
+            engine.render_with("{{ step }}", &ctx).unwrap(),
+            "from_overlay",
+            "overlay must win over a same-named variable"
+        );
+        assert_eq!(
+            engine.render_with("{{ keep }}", &ctx).unwrap(),
+            "kept",
+            "non-colliding variables survive"
+        );
     }
 
     #[test]

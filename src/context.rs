@@ -129,6 +129,30 @@ impl ExecutionContext {
         ctx
     }
 
+    /// The execution-metadata overlay entries that
+    /// [`to_template_context`](Self::to_template_context) layers on top
+    /// of `variables` (with metadata winning on a name collision).
+    ///
+    /// Exposed separately so a hot loop can build a proxied minijinja
+    /// context straight from `&variables` + this overlay via
+    /// `TemplateEngine::build_context_with_overlay`, skipping the
+    /// intermediate `to_template_context()` `HashMap` deep-clone
+    /// (noetl/ai-meta#127).  Order matches `to_template_context`.
+    pub fn template_metadata(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let mut meta: Vec<(&'static str, serde_json::Value)> = vec![
+            ("execution_id", serde_json::json!(self.execution_id)),
+            ("step", serde_json::json!(self.step)),
+            ("server_url", serde_json::json!(self.server_url)),
+        ];
+        if let Some(ref worker_id) = self.worker_id {
+            meta.push(("worker_id", serde_json::json!(worker_id)));
+        }
+        if let Some(ref command_id) = self.command_id {
+            meta.push(("command_id", serde_json::json!(command_id)));
+        }
+        meta
+    }
+
     /// Merge another context's variables into this one.
     pub fn merge_variables(&mut self, other: &HashMap<String, serde_json::Value>) {
         for (k, v) in other {
