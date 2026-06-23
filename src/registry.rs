@@ -129,11 +129,61 @@ pub enum AuthType {
     None,
 }
 
+/// Classify whether a tool **kind** has external side effects
+/// ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase E —
+/// the side-effect durability barrier; OQ4).
+///
+/// "Side-effecting" means a single execution of the cycle mutates state outside
+/// NoETL that a replay must not repeat: an HTTP `POST`, a database write, a
+/// payment, an email. "Pure / re-runnable" means re-execution is free of
+/// externally-observable consequences: a condition evaluation, a sandboxed
+/// transform, a no-op.
+///
+/// The barrier uses this to decide **where to block on resume**: before
+/// re-dispatching a side-effecting cycle whose durable result already exists,
+/// the worker skips re-execution and adopts the recorded result (so the side
+/// effect fires exactly once across a crash-resume / re-drive). Non-side-effecting
+/// cycles are never blocked — idempotent recompute is fine.
+///
+/// ## Static classification (OQ4 disposition)
+///
+/// This is a **static, per-kind** attribute — the RFC's baseline. The
+/// classification is **conservative: the default is `true`**. Over-classifying a
+/// pure tool as side-effecting is *safe* because the barrier only ever ADOPTS an
+/// already-durable result — it never skips a cycle whose result is absent, and
+/// adopting an idempotent recompute's prior result is byte-equivalent to
+/// recomputing it. Under-classifying a genuinely side-effecting tool is the only
+/// unsafe direction (it would re-fire the side effect on resume), so the safe
+/// default is `true` and only kinds with no externally-observable effect are
+/// `false`.
+///
+/// Pure / re-runnable kinds (`false`):
+/// - `noop` — does nothing.
+/// - `rhai` — a sandboxed expression/transform evaluator with no host I/O.
+///
+/// Every other registered kind is `true`. A *per-invocation* refinement (e.g. an
+/// `http` `GET` is pure while a `POST` is not) is deliberately **not** done here:
+/// because over-classification is safe, the static flag is sufficient for
+/// correctness, and a per-invocation predicate is a future optimization (OQ4)
+/// rather than a correctness requirement.
+pub fn kind_is_side_effecting(kind: &str) -> bool {
+    !matches!(kind, "noop" | "rhai")
+}
+
 /// Tool trait for implementing executable tools.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Returns the tool's unique name/kind.
     fn name(&self) -> &'static str;
+
+    /// Whether this tool has external side effects (see [`kind_is_side_effecting`]
+    /// for the full contract — [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+    /// Phase E). The default delegates to the per-kind classifier keyed on
+    /// [`Tool::name`], so the classification has a single source of truth; a tool
+    /// only overrides this when its kind string can't carry the distinction.
+    fn side_effecting(&self) -> bool {
+        kind_is_side_effecting(self.name())
+    }
 
     /// Execute the tool with the given configuration and context.
     async fn execute(
@@ -175,6 +225,17 @@ impl ToolRegistry {
     /// List all registered tool names.
     pub fn list(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Whether the registered tool `name` has external side effects
+    /// ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase E).
+    /// `None` if no tool by that name is registered. Callers that only have a
+    /// kind string (e.g. the worker's WASM dispatch path, which holds
+    /// `command.tool_kind` but no `Tool` instance) should use the free
+    /// [`kind_is_side_effecting`] instead — it is the same classification without
+    /// the registry lookup.
+    pub fn is_side_effecting(&self, name: &str) -> Option<bool> {
+        self.get(name).map(|tool| tool.side_effecting())
     }
 
     /// Execute a tool by name.
@@ -292,6 +353,85 @@ mod tests {
         assert_eq!(config.initial_delay_ms, 500);
         assert_eq!(config.max_delay_ms, 10000);
         assert_eq!(config.backoff_multiplier, 2.0);
+    }
+
+    // ---- noetl/ai-meta#104 Phase E: side_effecting classification ----
+
+    /// A pure mock tool that overrides the default classification to `false`.
+    struct PureMockTool;
+
+    #[async_trait]
+    impl Tool for PureMockTool {
+        fn name(&self) -> &'static str {
+            "pure_mock"
+        }
+        fn side_effecting(&self) -> bool {
+            false
+        }
+        async fn execute(
+            &self,
+            _config: &ToolConfig,
+            _ctx: &ExecutionContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::success(serde_json::json!({"pure": true})))
+        }
+    }
+
+    #[test]
+    fn kind_is_side_effecting_classifies_pure_kinds_false() {
+        // The only two pure / re-runnable kinds.
+        assert!(!kind_is_side_effecting("noop"));
+        assert!(!kind_is_side_effecting("rhai"));
+    }
+
+    #[test]
+    fn kind_is_side_effecting_defaults_true_for_everything_else() {
+        // Conservative default: an over-classification is safe (adopt-only barrier).
+        for kind in [
+            "http",
+            "postgres",
+            "snowflake",
+            "duckdb",
+            "ducklake",
+            "python",
+            "shell",
+            "script",
+            "transfer",
+            "container",
+            "nats",
+            "mcp",
+            "subscription",
+            "artifact",
+            "result_fetch",
+            "playbook",
+            "task_sequence",
+            // an unknown kind is treated as side-effecting (safe default).
+            "some_future_kind",
+        ] {
+            assert!(
+                kind_is_side_effecting(kind),
+                "kind {kind:?} should classify as side-effecting"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_side_effecting_default_delegates_to_kind() {
+        // MockTool's name "mock" is not in the pure set → default trait method true.
+        assert!(MockTool.side_effecting());
+        // An override wins over the default.
+        assert!(!PureMockTool.side_effecting());
+    }
+
+    #[test]
+    fn registry_is_side_effecting_lookup() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(PureMockTool);
+        assert_eq!(registry.is_side_effecting("mock"), Some(true));
+        assert_eq!(registry.is_side_effecting("pure_mock"), Some(false));
+        // An unregistered name yields None (caller falls back to the free fn).
+        assert_eq!(registry.is_side_effecting("nope"), None);
     }
 
     #[test]
