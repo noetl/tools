@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.17.0](https://github.com/noetl/tools/compare/v3.16.0...v3.17.0) (2026-06-23)
+
+### Features
+
+* **registry:** side_effecting tool classification ([#104](https://github.com/noetl/tools/issues/104) Phase E) ([#78](https://github.com/noetl/tools/issues/78)) ([41120a3](https://github.com/noetl/tools/commit/41120a30a39b9cbd0608b2c2fa59d599336a7662))
+
 ## [3.16.0](https://github.com/noetl/tools/compare/v3.15.0...v3.16.0) (2026-06-22)
 
 ### Features
