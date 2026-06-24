@@ -10,6 +10,7 @@
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use async_trait::async_trait;
 use futures::StreamExt;
+use tokio::sync::Mutex;
 
 use crate::error::ToolError;
 use crate::tools::nats::NatsConnParams;
@@ -18,6 +19,22 @@ use super::{
     decode_payload, normalize_headers, AckDisposition, AckReport, PollOptions, PollOutcome,
     PolledMessage, SourceClient,
 };
+
+/// A long-lived NATS connection + resolved pull-consumer handle, cached so a
+/// repeatedly-polled source (the continuous subscription runtime, the
+/// materializer / projector drain loops) reuses ONE connection instead of
+/// opening a fresh TCP+TLS connection — plus a `get_stream` + `get_consumer`
+/// round-trip pair — on every poll and every ack.
+///
+/// Before this cache, `NatsSource::poll` connected, looked the stream and
+/// consumer up, drained, and dropped the connection every call; a drain loop
+/// polling a few times a second churned hundreds of connect/close cycles
+/// (noetl/ai-meta#130 broader-latency track). The handles below are cheap
+/// `Arc`-backed clones — cloning the consumer does not re-hit the server.
+struct CachedConsumer {
+    client: async_nats::Client,
+    consumer: PullConsumer,
+}
 
 /// A bounded NATS JetStream pull-consumer drain.
 ///
@@ -28,6 +45,10 @@ pub struct NatsSource {
     conn: NatsConnParams,
     stream: String,
     consumer: String,
+    /// Lazily-established connection + consumer handle, reused across calls.
+    /// `None` until the first `poll`/`ack`, and reset to `None` whenever a
+    /// drain or ack fails so the next call transparently reconnects.
+    cache: Mutex<Option<CachedConsumer>>,
 }
 
 impl NatsSource {
@@ -38,7 +59,55 @@ impl NatsSource {
             conn,
             stream,
             consumer,
+            cache: Mutex::new(None),
         }
+    }
+
+    /// Return a `(client, consumer)` pair, establishing the connection and
+    /// resolving the stream + consumer once and reusing them thereafter.
+    ///
+    /// The handles are cloned out of the cache before the lock is released, so
+    /// the (up-to-`timeout_ms`) drain that follows never holds the cache lock —
+    /// a concurrent ack on the same source isn't blocked behind a long poll.
+    async fn handles(&self) -> Result<(async_nats::Client, PullConsumer), ToolError> {
+        let mut guard = self.cache.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            return Ok((cached.client.clone(), cached.consumer.clone()));
+        }
+
+        let client = self.conn.connect().await?;
+        let js = jetstream::new(client.clone());
+        let stream = js.get_stream(&self.stream).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "subscription[nats]: stream '{}' not found: {}",
+                self.stream, e
+            ))
+        })?;
+        let consumer: PullConsumer = stream.get_consumer(&self.consumer).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "subscription[nats]: consumer '{}' on stream '{}' not found: {}",
+                self.consumer, self.stream, e
+            ))
+        })?;
+
+        tracing::debug!(
+            stream = %self.stream,
+            consumer = %self.consumer,
+            "subscription[nats]: established reusable NATS connection"
+        );
+
+        *guard = Some(CachedConsumer {
+            client: client.clone(),
+            consumer: consumer.clone(),
+        });
+        Ok((client, consumer))
+    }
+
+    /// Drop the cached connection so the next `poll`/`ack` reconnects. Called
+    /// after any drain or ack error — a broken or stale handle must not be
+    /// reused, or every subsequent poll would fail against a dead connection.
+    async fn invalidate(&self) {
+        *self.cache.lock().await = None;
     }
 }
 
@@ -49,24 +118,18 @@ impl SourceClient for NatsSource {
     }
 
     async fn poll(&self, opts: &PollOptions) -> Result<PollOutcome, ToolError> {
-        let nc = self.conn.connect().await?;
-        let js = jetstream::new(nc);
-
-        let stream = js.get_stream(&self.stream).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!(
-                "subscription[nats]: stream '{}' not found: {}",
-                self.stream, e
-            ))
-        })?;
-
-        let consumer: PullConsumer = stream.get_consumer(&self.consumer).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!(
-                "subscription[nats]: consumer '{}' on stream '{}' not found: {}",
-                self.consumer, self.stream, e
-            ))
-        })?;
-
-        drain_pull_consumer(&consumer, opts).await
+        let (_client, consumer) = self.handles().await?;
+        match drain_pull_consumer(&consumer, opts).await {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // A drain failure may mean the cached connection/consumer is
+                // stale (server restart, consumer recreated). Drop the cache so
+                // the next poll reconnects + re-resolves rather than retrying a
+                // dead handle forever.
+                self.invalidate().await;
+                Err(e)
+            }
+        }
     }
 
     /// Dispose deferred ack handles out of band.
@@ -91,7 +154,7 @@ impl SourceClient for NatsSource {
             return Ok(AckReport::default());
         }
 
-        let nc = self.conn.connect().await?;
+        let (nc, _consumer) = self.handles().await?;
         let payload = ack_payload(disposition);
 
         let mut report = AckReport::default();
@@ -107,9 +170,15 @@ impl SourceClient for NatsSource {
         // Confirm the ack bytes left the client before we report success — an
         // un-flushed ack that never reaches the server would silently let the
         // message redeliver, defeating ack-after-processing.
-        nc.flush().await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("subscription[nats] ack flush failed: {}", e))
-        })?;
+        if let Err(e) = nc.flush().await {
+            // The reused connection failed to flush — treat it as stale and
+            // reconnect on the next call rather than wedging every future ack.
+            self.invalidate().await;
+            return Err(ToolError::ExecutionFailed(format!(
+                "subscription[nats] ack flush failed: {}",
+                e
+            )));
+        }
 
         Ok(report)
     }
@@ -250,4 +319,89 @@ pub(crate) async fn drain_pull_consumer(
         acked: do_ack,
         ack_ids,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::nats::NatsConnParams;
+    use crate::tools::source::AckMode;
+
+    fn params(url: &str) -> NatsConnParams {
+        NatsConnParams {
+            url: url.to_string(),
+            user: None,
+            password: None,
+            token: None,
+        }
+    }
+
+    /// A fresh source holds no connection, and `invalidate` is a safe no-op on
+    /// an already-empty cache. Deterministic — runs without a live server.
+    #[tokio::test]
+    async fn new_source_starts_unconnected_and_invalidate_is_idempotent() {
+        let s = NatsSource::new(
+            params("nats://127.0.0.1:4222"),
+            "stream".to_string(),
+            "consumer".to_string(),
+        );
+        assert!(s.cache.lock().await.is_none());
+        s.invalidate().await;
+        assert!(s.cache.lock().await.is_none());
+    }
+
+    /// Live-server proof that `poll` establishes the connection once and the
+    /// handle survives across polls (the connection is no longer opened +
+    /// closed per poll). Set `NOETL_TEST_NATS_URL=nats://localhost:4222`.
+    #[tokio::test]
+    async fn poll_caches_connection_and_reuses_it() {
+        let url = match std::env::var("NOETL_TEST_NATS_URL") {
+            Ok(u) => u,
+            Err(_) => return, // skip without a live NATS
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stream_name = format!("reuse_{suffix}");
+        let subject = format!("reuse.{suffix}.x");
+        let consumer_name = format!("reuse_c_{suffix}");
+
+        let client = async_nats::connect(&url).await.expect("connect");
+        let js = jetstream::new(client);
+        let stream = js
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.clone(),
+                subjects: vec![subject.clone()],
+                ..Default::default()
+            })
+            .await
+            .expect("create stream");
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some(consumer_name.clone()),
+                filter_subject: subject.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("create consumer");
+
+        let source = NatsSource::new(params(&url), stream_name.clone(), consumer_name);
+        let opts = PollOptions::new(Some(1), Some(200), AckMode::None);
+
+        // First poll establishes + caches the connection.
+        source.poll(&opts).await.expect("first poll");
+        assert!(
+            source.cache.lock().await.is_some(),
+            "first poll must cache the connection for reuse"
+        );
+
+        // Second poll succeeds against the cached handle (no reconnect path).
+        source.poll(&opts).await.expect("second poll");
+        assert!(
+            source.cache.lock().await.is_some(),
+            "cached connection must survive across polls"
+        );
+
+        // Cleanup.
+        let _ = js.delete_stream(&stream_name).await;
+    }
 }
