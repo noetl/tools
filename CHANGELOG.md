@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.18.0](https://github.com/noetl/tools/compare/v3.17.0...v3.18.0) (2026-06-25)
+
+### Features
+
+* **playbook:** return child playbook result data in blocking mode ([#136](https://github.com/noetl/tools/issues/136)) ([#80](https://github.com/noetl/tools/issues/80)) ([fb960f4](https://github.com/noetl/tools/commit/fb960f4b69c8a5904ccbc1206685d9737a97cc96))
+
 ## [3.17.0](https://github.com/noetl/tools/compare/v3.16.0...v3.17.0) (2026-06-23)
 
 ### Features
