@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.18.1](https://github.com/noetl/tools/compare/v3.18.0...v3.18.1) (2026-06-25)
+
+### Bug Fixes
+
+* **playbook:** explicit payload must not be shadowed by injected empty args ([#136](https://github.com/noetl/tools/issues/136)) ([#81](https://github.com/noetl/tools/issues/81)) ([cd54568](https://github.com/noetl/tools/commit/cd54568f308bc70b3f66471e18f862b051c516b8))
+
 ## [3.18.0](https://github.com/noetl/tools/compare/v3.17.0...v3.18.0) (2026-06-25)
 
 ### Features
