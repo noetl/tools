@@ -103,14 +103,34 @@ impl PlaybookTool {
             .map_err(|e| ToolError::Configuration(format!("Invalid playbook config: {}", e)))
     }
 
+    /// Build the child execution's input payload from the playbook config.
+    ///
+    /// Both `args` (python parity) and `payload` can carry the child's
+    /// workload override.  The worker auto-injects an `args` key into the
+    /// tool config from the command input
+    /// (`worker/src/executor/command.rs`), and for a step that declares
+    /// `payload:` (not `args:`) that injected `args` is an **empty object**.
+    /// An empty injected `args` must NOT shadow an explicit `payload` —
+    /// otherwise the child runs its *default* workload and the call payload
+    /// (`method` / `tool` / `arguments`) is silently lost, so an MCP
+    /// composition step like `mcp/google-places.search_text` runs the
+    /// playbook's default `tools/list` instead (noetl/ai-meta#136).
+    ///
+    /// Precedence: a **non-empty** `args` wins (python parity), else
+    /// `payload`, else `args` as-is (possibly empty), else `{}`.
     fn build_payload(config: &PlaybookConfig) -> serde_json::Value {
+        let is_empty = |v: &serde_json::Value| {
+            v.is_null() || v.as_object().map(|m| m.is_empty()).unwrap_or(false)
+        };
         if let Some(args) = &config.args {
-            args.clone()
-        } else if let Some(payload) = &config.payload {
-            payload.clone()
-        } else {
-            serde_json::json!({})
+            if !is_empty(args) {
+                return args.clone();
+            }
         }
+        if let Some(payload) = &config.payload {
+            return payload.clone();
+        }
+        config.args.clone().unwrap_or_else(|| serde_json::json!({}))
     }
 
     /// Returns `true` when the status-endpoint payload indicates a terminal
@@ -572,6 +592,70 @@ mod tests {
             !PlaybookTool::is_terminal_status(&payload),
             "missing status key should NOT be terminal"
         );
+    }
+
+    // --- noetl/ai-meta#136 — child input payload precedence ---
+
+    #[test]
+    fn build_payload_empty_args_does_not_shadow_payload() {
+        // The worker injects an empty `args: {}` for a step that declares
+        // `payload:`.  That empty args must NOT win — otherwise the child
+        // runs its default workload (the bug that made the planner's
+        // `search_text` step run `tools/list`).
+        let cfg = PlaybookConfig {
+            path: Some("automation/agents/mcp/google-places".to_string()),
+            catalog_id: None,
+            version: None,
+            payload: Some(serde_json::json!({"method": "tools/call", "tool": "search_text"})),
+            args: Some(serde_json::json!({})),
+            parent_execution_id: None,
+            return_step: None,
+            return_result: Some(true),
+            result_step: None,
+            timeout: None,
+            poll_interval: None,
+        };
+        let p = PlaybookTool::build_payload(&cfg);
+        assert_eq!(p["method"], "tools/call");
+        assert_eq!(p["tool"], "search_text");
+    }
+
+    #[test]
+    fn build_payload_null_args_does_not_shadow_payload() {
+        let cfg = PlaybookConfig {
+            path: None,
+            catalog_id: None,
+            version: None,
+            payload: Some(serde_json::json!({"method": "tools/call"})),
+            args: Some(serde_json::Value::Null),
+            parent_execution_id: None,
+            return_step: None,
+            return_result: None,
+            result_step: None,
+            timeout: None,
+            poll_interval: None,
+        };
+        assert_eq!(PlaybookTool::build_payload(&cfg)["method"], "tools/call");
+    }
+
+    #[test]
+    fn build_payload_nonempty_args_wins_python_parity() {
+        // A genuinely-supplied `args` still wins over `payload` (python
+        // parity preserved).
+        let cfg = PlaybookConfig {
+            path: None,
+            catalog_id: None,
+            version: None,
+            payload: Some(serde_json::json!({"from": "payload"})),
+            args: Some(serde_json::json!({"from": "args"})),
+            parent_execution_id: None,
+            return_step: None,
+            return_result: None,
+            result_step: None,
+            timeout: None,
+            poll_interval: None,
+        };
+        assert_eq!(PlaybookTool::build_payload(&cfg)["from"], "args");
     }
 
     // --- noetl/ai-meta#136 — blocking-with-result mode ---
