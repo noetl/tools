@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.19.0](https://github.com/noetl/tools/compare/v3.18.1...v3.19.0) (2026-06-26)
+
+### Features
+
+* **container:** G1 GPU placement + G2 poll-to-terminal helper (SLM platform [#144](https://github.com/noetl/tools/issues/144)/[#145](https://github.com/noetl/tools/issues/145)) ([#82](https://github.com/noetl/tools/issues/82)) ([db865d2](https://github.com/noetl/tools/commit/db865d2f63ce307737e94b15e525b2380004cd0d))
+
 ## [3.18.1](https://github.com/noetl/tools/compare/v3.18.0...v3.18.1) (2026-06-25)
 
 ### Bug Fixes
