@@ -101,8 +101,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec, ResourceRequirements,
-    SecretKeySelector,
+    ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, ResourceRequirements,
+    SecretKeySelector, SecretVolumeSource, Toleration, Volume, VolumeMount,
 };
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::Client;
@@ -184,6 +185,117 @@ pub struct ContainerConfig {
     /// Job; defaults to `Never`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<String>,
+
+    /// Pod's `nodeSelector` (noetl/ai-meta#144 G1).  The knob that
+    /// places a GPU Job on a GPU node pool — e.g.
+    /// `{ "cloud.google.com/gke-accelerator": "nvidia-l4" }`.  Empty
+    /// map → omitted from the spec.
+    #[serde(default)]
+    pub node_selector: std::collections::BTreeMap<String, String>,
+
+    /// Pod's `tolerations` (G1).  GPU node pools are tainted
+    /// (`nvidia.com/gpu`), so a GPU Job must tolerate the taint to
+    /// schedule there.  Empty → omitted.
+    #[serde(default)]
+    pub tolerations: Vec<ContainerToleration>,
+
+    /// Pod-level `volumes` (G1).  Round-1 subset: `empty_dir`,
+    /// `persistent_volume_claim`, `config_map`, `secret`.  A training
+    /// Job uses these for scratch space + a mounted artifact volume.
+    #[serde(default)]
+    pub volumes: Vec<ContainerVolume>,
+
+    /// Container `volumeMounts` (G1).  Each references a `volumes[]`
+    /// entry by name.  Empty → omitted.
+    #[serde(default)]
+    pub volume_mounts: Vec<ContainerVolumeMount>,
+}
+
+/// One pod toleration.  Mirrors the K8s `Toleration` shape in
+/// snake_case to match the rest of [`ContainerConfig`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerToleration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// `Exists` or `Equal`.  `Exists` (with no `value`) tolerates any
+    /// value for the key — the common GPU-taint shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// `NoSchedule` / `PreferNoSchedule` / `NoExecute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toleration_seconds: Option<i64>,
+}
+
+/// One pod volume.  Exactly one source field should be set; the round-1
+/// subset covers the sources a batch Job realistically needs.  When more
+/// than one is set, the first non-`None` in declaration order wins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerVolume {
+    pub name: String,
+    /// Ephemeral scratch space (`emptyDir: {}`).  Value is the optional
+    /// `{ medium, size_limit }`; an empty object means defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_dir: Option<EmptyDirSource>,
+    /// Mount an existing PersistentVolumeClaim (e.g. a shared dataset /
+    /// model-artifact volume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_volume_claim: Option<PvcSource>,
+    /// Mount a ConfigMap as files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_map: Option<NamedSource>,
+    /// Mount a Secret as files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretSource>,
+}
+
+/// `emptyDir` volume source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmptyDirSource {
+    /// `""` (node disk) or `"Memory"` (tmpfs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
+    /// Size cap, e.g. `"10Gi"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_limit: Option<String>,
+}
+
+/// `persistentVolumeClaim` volume source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PvcSource {
+    pub claim_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+/// `configMap` volume source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NamedSource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+}
+
+/// `secret` volume source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecretSource {
+    pub secret_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+}
+
+/// One container `volumeMount`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerVolumeMount {
+    pub name: String,
+    pub mount_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
 }
 
 /// One env var the playbook author declared.
@@ -329,6 +441,19 @@ impl ContainerTool {
             })
         };
 
+        // noetl/ai-meta#144 G1 — container volumeMounts.
+        let volume_mounts: Vec<VolumeMount> = cfg
+            .volume_mounts
+            .iter()
+            .map(|vm| VolumeMount {
+                name: vm.name.clone(),
+                mount_path: vm.mount_path.clone(),
+                read_only: vm.read_only,
+                sub_path: vm.sub_path.clone(),
+                ..Default::default()
+            })
+            .collect();
+
         let container = Container {
             name: "main".to_string(),
             image: Some(cfg.image.clone()),
@@ -340,8 +465,58 @@ impl ContainerTool {
                 Some(env_vars)
             },
             resources,
+            volume_mounts: if volume_mounts.is_empty() {
+                None
+            } else {
+                Some(volume_mounts)
+            },
             ..Default::default()
         };
+
+        // noetl/ai-meta#144 G1 — pod-level volumes (round-1 source subset).
+        let volumes: Vec<Volume> = cfg
+            .volumes
+            .iter()
+            .map(|v| Volume {
+                name: v.name.clone(),
+                empty_dir: v.empty_dir.as_ref().map(|e| EmptyDirVolumeSource {
+                    medium: e.medium.clone(),
+                    size_limit: e.size_limit.as_ref().map(|s| {
+                        k8s_openapi::apimachinery::pkg::api::resource::Quantity(s.clone())
+                    }),
+                }),
+                persistent_volume_claim: v.persistent_volume_claim.as_ref().map(|p| {
+                    PersistentVolumeClaimVolumeSource {
+                        claim_name: p.claim_name.clone(),
+                        read_only: p.read_only,
+                    }
+                }),
+                config_map: v.config_map.as_ref().map(|c| ConfigMapVolumeSource {
+                    name: c.name.clone(),
+                    optional: c.optional,
+                    ..Default::default()
+                }),
+                secret: v.secret.as_ref().map(|s| SecretVolumeSource {
+                    secret_name: Some(s.secret_name.clone()),
+                    optional: s.optional,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+
+        // noetl/ai-meta#144 G1 — tolerations (GPU node-pool taint).
+        let tolerations: Vec<Toleration> = cfg
+            .tolerations
+            .iter()
+            .map(|t| Toleration {
+                key: t.key.clone(),
+                operator: t.operator.clone(),
+                value: t.value.clone(),
+                effect: t.effect.clone(),
+                toleration_seconds: t.toleration_seconds,
+            })
+            .collect();
 
         let pod_spec = PodSpec {
             containers: vec![container],
@@ -351,6 +526,23 @@ impl ContainerTool {
                     .unwrap_or_else(|| DEFAULT_RESTART_POLICY.to_string()),
             ),
             service_account_name: cfg.service_account.clone(),
+            // noetl/ai-meta#144 G1 — GPU placement + volumes.  Empty
+            // collections serialise as None so the wire shape stays minimal.
+            node_selector: if cfg.node_selector.is_empty() {
+                None
+            } else {
+                Some(cfg.node_selector.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            },
+            tolerations: if tolerations.is_empty() {
+                None
+            } else {
+                Some(tolerations)
+            },
+            volumes: if volumes.is_empty() {
+                None
+            } else {
+                Some(volumes)
+            },
             ..Default::default()
         };
 
@@ -407,6 +599,153 @@ impl ContainerTool {
         };
 
         Ok(job)
+    }
+}
+
+// ===========================================================================
+// noetl/ai-meta#145 G2 — poll-based completion fallback.
+//
+// The durable async-resume path is the external `noetl-k8s-watcher`
+// (#43 Round 1).  This helper is the *poll* fallback for environments
+// that don't run the watcher: the worker calls it from a detached task
+// (slot already freed) to observe a dispatched Job to its terminal
+// state, then emits the resume `call.done` itself.  Returning a plain
+// [`JobTerminalOutcome`] keeps `kube`/`k8s-openapi` types from crossing
+// the crate boundary, so the worker gains no new direct dependency.
+// ===========================================================================
+
+/// Knobs for [`poll_job_to_terminal`].  All have sensible defaults via
+/// [`PollOptions::default`]; the worker overrides from env.
+#[derive(Debug, Clone)]
+pub struct PollOptions {
+    /// First poll interval.  Doubles up to `max_interval` on each tick.
+    pub interval: std::time::Duration,
+    /// Backoff cap for the poll interval.
+    pub max_interval: std::time::Duration,
+    /// Overall deadline backstop.  If the Job hasn't reached a terminal
+    /// state by then the poller returns [`JobTerminalOutcome`] with
+    /// `state = "poll_timeout"`.  This is a safety net *above* the Job's
+    /// own `activeDeadlineSeconds` (which is authoritative); it only
+    /// fires if the watch itself wedges.
+    pub max_wait: std::time::Duration,
+}
+
+impl Default for PollOptions {
+    fn default() -> Self {
+        Self {
+            interval: std::time::Duration::from_secs(5),
+            max_interval: std::time::Duration::from_secs(30),
+            max_wait: std::time::Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
+/// Terminal outcome of a polled Job.  `state` is one of `succeeded`,
+/// `failed`, or `poll_timeout` (the poll-deadline backstop).  Finer
+/// pod-level classification (OOM / image-pull / node-lost) is the
+/// watcher's job; the poll fallback reports the Job-condition outcome
+/// only (round-1 scope).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobTerminalOutcome {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl JobTerminalOutcome {
+    /// `true` only for the `succeeded` state — the worker maps this to a
+    /// `call.done` `status="COMPLETED"`; everything else is `FAILED`.
+    pub fn is_success(&self) -> bool {
+        self.state == "succeeded"
+    }
+}
+
+/// Classify a [`JobStatus`] into a terminal outcome, or `None` if the
+/// Job is still running.  Pure function over the status so it unit-tests
+/// without a cluster.  A Job is terminal when it carries a `Complete`
+/// (→ `succeeded`) or `Failed` (→ `failed`) condition with
+/// `status == "True"`.
+fn classify_job_status(
+    status: &k8s_openapi::api::batch::v1::JobStatus,
+) -> Option<JobTerminalOutcome> {
+    let conditions = status.conditions.as_ref()?;
+    for c in conditions {
+        if c.status != "True" {
+            continue;
+        }
+        let completed_at = c.last_transition_time.as_ref().map(|t| t.0);
+        match c.type_.as_str() {
+            "Complete" => {
+                return Some(JobTerminalOutcome {
+                    state: "succeeded".to_string(),
+                    reason: c.reason.clone(),
+                    completed_at,
+                })
+            }
+            "Failed" => {
+                return Some(JobTerminalOutcome {
+                    state: "failed".to_string(),
+                    reason: c
+                        .reason
+                        .clone()
+                        .or_else(|| c.message.clone()),
+                    completed_at,
+                })
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Poll a K8s Job to its terminal state.  Builds an in-cluster kube
+/// client, polls the Job's status with exponential backoff until a
+/// terminal condition appears or `opts.max_wait` elapses.
+///
+/// Errors (`ToolError::ExecutionFailed`) only on infrastructure
+/// failures — kube client init or a Job `get` that fails.  A Job that
+/// never finishes within `max_wait` is *not* an error; it returns
+/// `state = "poll_timeout"` so the worker can emit a FAILED resume
+/// rather than leaking a poller forever.
+pub async fn poll_job_to_terminal(
+    namespace: &str,
+    job_name: &str,
+    opts: PollOptions,
+) -> Result<JobTerminalOutcome, ToolError> {
+    use k8s_openapi::api::batch::v1::Job as K8sJob;
+
+    let client = Client::try_default().await.map_err(|e| {
+        ToolError::ExecutionFailed(format!("container.poll: kube client init failed: {e}"))
+    })?;
+    let api: Api<K8sJob> = Api::namespaced(client, namespace);
+
+    let started = std::time::Instant::now();
+    let mut interval = opts.interval;
+    loop {
+        let job = api.get(job_name).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "container.poll: get Job '{job_name}' in '{namespace}' failed: {e}"
+            ))
+        })?;
+        if let Some(status) = job.status.as_ref() {
+            if let Some(outcome) = classify_job_status(status) {
+                return Ok(outcome);
+            }
+        }
+        if started.elapsed() >= opts.max_wait {
+            return Ok(JobTerminalOutcome {
+                state: "poll_timeout".to_string(),
+                reason: Some(format!(
+                    "poll deadline {}s exceeded without terminal Job condition",
+                    opts.max_wait.as_secs()
+                )),
+                completed_at: None,
+            });
+        }
+        tokio::time::sleep(interval).await;
+        interval = std::cmp::min(interval.saturating_mul(2), opts.max_interval);
     }
 }
 
@@ -507,6 +846,10 @@ mod tests {
             namespace: None,
             backoff_limit: None,
             restart_policy: None,
+            node_selector: std::collections::BTreeMap::new(),
+            tolerations: Vec::new(),
+            volumes: Vec::new(),
+            volume_mounts: Vec::new(),
         }
     }
 
@@ -737,5 +1080,210 @@ mod tests {
         let job = ContainerTool::build_job(&cfg, &ctx()).expect("build");
         let sa = job.spec.unwrap().template.spec.unwrap().service_account_name;
         assert_eq!(sa.as_deref(), Some("noetl-container-job"));
+    }
+
+    // --- noetl/ai-meta#144 G1 — GPU placement + volumes ---
+
+    #[test]
+    fn build_job_empty_placement_means_none() {
+        let cfg = minimal_config();
+        let pod = job_pod_spec(&cfg);
+        assert!(pod.node_selector.is_none(), "empty node_selector → None");
+        assert!(pod.tolerations.is_none(), "empty tolerations → None");
+        assert!(pod.volumes.is_none(), "empty volumes → None");
+        assert!(
+            pod.containers[0].volume_mounts.is_none(),
+            "empty volume_mounts → None"
+        );
+    }
+
+    #[test]
+    fn build_job_propagates_node_selector() {
+        let mut cfg = minimal_config();
+        cfg.node_selector.insert(
+            "cloud.google.com/gke-accelerator".to_string(),
+            "nvidia-l4".to_string(),
+        );
+        let pod = job_pod_spec(&cfg);
+        let ns = pod.node_selector.expect("node_selector present");
+        assert_eq!(
+            ns.get("cloud.google.com/gke-accelerator").map(String::as_str),
+            Some("nvidia-l4")
+        );
+    }
+
+    #[test]
+    fn build_job_propagates_gpu_toleration() {
+        let mut cfg = minimal_config();
+        cfg.tolerations.push(ContainerToleration {
+            key: Some("nvidia.com/gpu".to_string()),
+            operator: Some("Exists".to_string()),
+            effect: Some("NoSchedule".to_string()),
+            ..Default::default()
+        });
+        let pod = job_pod_spec(&cfg);
+        let tols = pod.tolerations.expect("tolerations present");
+        assert_eq!(tols.len(), 1);
+        assert_eq!(tols[0].key.as_deref(), Some("nvidia.com/gpu"));
+        assert_eq!(tols[0].operator.as_deref(), Some("Exists"));
+        assert_eq!(tols[0].effect.as_deref(), Some("NoSchedule"));
+    }
+
+    #[test]
+    fn build_job_propagates_gpu_resource_request() {
+        // The GPU *resource* request rides the existing resources
+        // passthrough — no new field.  Pin that it still works.
+        let mut cfg = minimal_config();
+        cfg.resources
+            .limits
+            .insert("nvidia.com/gpu".to_string(), "1".to_string());
+        let pod = job_pod_spec(&cfg);
+        let limits = pod.containers[0]
+            .resources
+            .clone()
+            .expect("resources")
+            .limits
+            .expect("limits");
+        assert_eq!(limits.get("nvidia.com/gpu").map(|q| q.0.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn build_job_propagates_empty_dir_volume_and_mount() {
+        let mut cfg = minimal_config();
+        cfg.volumes.push(ContainerVolume {
+            name: "scratch".to_string(),
+            empty_dir: Some(EmptyDirSource {
+                size_limit: Some("10Gi".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        cfg.volume_mounts.push(ContainerVolumeMount {
+            name: "scratch".to_string(),
+            mount_path: "/scratch".to_string(),
+            ..Default::default()
+        });
+        let pod = job_pod_spec(&cfg);
+        let vols = pod.volumes.expect("volumes present");
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].name, "scratch");
+        let ed = vols[0].empty_dir.as_ref().expect("empty_dir source");
+        assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("10Gi"));
+        let mounts = pod.containers[0]
+            .volume_mounts
+            .clone()
+            .expect("volume_mounts present");
+        assert_eq!(mounts[0].name, "scratch");
+        assert_eq!(mounts[0].mount_path, "/scratch");
+    }
+
+    #[test]
+    fn build_job_propagates_pvc_volume() {
+        let mut cfg = minimal_config();
+        cfg.volumes.push(ContainerVolume {
+            name: "models".to_string(),
+            persistent_volume_claim: Some(PvcSource {
+                claim_name: "slm-artifacts".to_string(),
+                read_only: Some(false),
+            }),
+            ..Default::default()
+        });
+        let pod = job_pod_spec(&cfg);
+        let vols = pod.volumes.expect("volumes present");
+        let pvc = vols[0]
+            .persistent_volume_claim
+            .as_ref()
+            .expect("pvc source");
+        assert_eq!(pvc.claim_name, "slm-artifacts");
+        assert_eq!(pvc.read_only, Some(false));
+    }
+
+    #[test]
+    fn config_deserialises_gpu_shape_from_yaml_json() {
+        // Pins the playbook-author wire shape (snake_case) for the new
+        // G1 fields — the contract the RFC examples document.
+        let raw = serde_json::json!({
+            "image": "gcr.io/noetl/slm-trainer:v1",
+            "resources": { "limits": { "nvidia.com/gpu": "1" } },
+            "node_selector": { "cloud.google.com/gke-accelerator": "nvidia-l4" },
+            "tolerations": [
+                { "key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule" }
+            ],
+            "volumes": [ { "name": "scratch", "empty_dir": {} } ],
+            "volume_mounts": [ { "name": "scratch", "mount_path": "/scratch" } ]
+        });
+        let cfg: ContainerConfig = serde_json::from_value(raw).expect("deserialise");
+        assert_eq!(cfg.node_selector.len(), 1);
+        assert_eq!(cfg.tolerations.len(), 1);
+        assert_eq!(cfg.volumes.len(), 1);
+        assert!(cfg.volumes[0].empty_dir.is_some());
+        assert_eq!(cfg.volume_mounts[0].mount_path, "/scratch");
+    }
+
+    // --- noetl/ai-meta#145 G2 — poll classifier ---
+
+    fn job_status_with_condition(
+        type_: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> k8s_openapi::api::batch::v1::JobStatus {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        JobStatus {
+            conditions: Some(vec![JobCondition {
+                type_: type_.to_string(),
+                status: status.to_string(),
+                reason: reason.map(String::from),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_complete_condition_is_succeeded() {
+        let st = job_status_with_condition("Complete", "True", None);
+        let outcome = classify_job_status(&st).expect("terminal");
+        assert_eq!(outcome.state, "succeeded");
+        assert!(outcome.is_success());
+    }
+
+    #[test]
+    fn classify_failed_condition_is_failed_with_reason() {
+        let st = job_status_with_condition("Failed", "True", Some("BackoffLimitExceeded"));
+        let outcome = classify_job_status(&st).expect("terminal");
+        assert_eq!(outcome.state, "failed");
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.reason.as_deref(), Some("BackoffLimitExceeded"));
+    }
+
+    #[test]
+    fn classify_running_job_is_none() {
+        use k8s_openapi::api::batch::v1::JobStatus;
+        // active pods, no terminal condition.
+        let st = JobStatus {
+            active: Some(1),
+            ..Default::default()
+        };
+        assert!(classify_job_status(&st).is_none());
+    }
+
+    #[test]
+    fn classify_condition_status_false_is_not_terminal() {
+        // A `Complete` condition that hasn't flipped to True yet.
+        let st = job_status_with_condition("Complete", "False", None);
+        assert!(classify_job_status(&st).is_none());
+    }
+
+    #[test]
+    fn poll_options_default_is_sane() {
+        let o = PollOptions::default();
+        assert!(o.interval <= o.max_interval);
+        assert!(o.max_wait.as_secs() >= 3600, "deadline should be generous");
+    }
+
+    /// Helper: build the Job and return its PodSpec for placement assertions.
+    fn job_pod_spec(cfg: &ContainerConfig) -> k8s_openapi::api::core::v1::PodSpec {
+        let job = ContainerTool::build_job(cfg, &ctx()).expect("build");
+        job.spec.unwrap().template.spec.unwrap()
     }
 }

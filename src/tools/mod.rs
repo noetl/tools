@@ -38,6 +38,11 @@ mod transfer;
 
 pub use self::artifact::ArtifactTool;
 pub use self::container::ContainerTool;
+// noetl/ai-meta#145 G2 — poll-based completion fallback.  Re-exported so
+// the worker can resolve a dispatched Job from a detached task without
+// taking a direct `kube`/`k8s-openapi` dependency (the helper returns the
+// plain `JobTerminalOutcome`).
+pub use self::container::{poll_job_to_terminal, JobTerminalOutcome, PollOptions};
 pub use self::duckdb::DuckdbTool;
 pub use self::ducklake::DucklakeTool;
 pub use self::http::HttpTool;
