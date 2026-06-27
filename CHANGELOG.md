@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.19.1](https://github.com/noetl/tools/compare/v3.19.0...v3.19.1) (2026-06-27)
+
+### Performance Improvements
+
+* **subscription:** reuse NATS connection across poll/ack in NatsSource ([#79](https://github.com/noetl/tools/issues/79)) ([14d095c](https://github.com/noetl/tools/commit/14d095c0e56b33faab2766ca7bf47f2d8ce4a768)), closes [noetl/ai-meta#130](https://github.com/noetl/ai-meta/issues/130)
+
 ## [3.19.0](https://github.com/noetl/tools/compare/v3.18.1...v3.19.0) (2026-06-26)
 
 ### Features
