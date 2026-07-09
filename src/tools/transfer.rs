@@ -492,10 +492,15 @@ impl TransferTool {
             ToolError::Configuration("Source URL required for HTTP transfer".to_string())
         })?;
 
-        // Get target connection
-        let target_conn = config.target.connection.as_ref().ok_or_else(|| {
-            ToolError::Configuration("Target connection string required".to_string())
-        })?;
+        // Assemble the target connection from the explicit `connection` string
+        // or the credential fields the worker's alias resolver injects into
+        // `target.extra` (host/port/user/password/database), mirroring the
+        // snowflake->postgres path.  An alias-based `auth:` (e.g. `pg_local`)
+        // never sets a literal `connection`, so requiring one here made every
+        // aliased http->postgres transfer fail with "Target connection string
+        // required".
+        let target_conn =
+            pg_connection_string(config.target.connection.as_ref(), &config.target.extra)?;
 
         let target_table =
             config.target.table.as_ref().ok_or_else(|| {
@@ -571,7 +576,7 @@ impl TransferTool {
         if matches!(config.mode, TransferMode::Replace) {
             let truncate_query = format!("TRUNCATE TABLE {}", target_table);
             pg_tool
-                .execute_query(&truncate_query, &[], target_conn, None, false)
+                .execute_query(&truncate_query, &[], &target_conn, None, false)
                 .await?;
         }
 
@@ -607,7 +612,7 @@ impl TransferTool {
                     .collect();
 
                 pg_tool
-                    .execute_query(&insert_query, &params, target_conn, None, false)
+                    .execute_query(&insert_query, &params, &target_conn, None, false)
                     .await?;
                 rows_transferred += 1;
             }
@@ -1256,6 +1261,65 @@ mod tests {
     async fn test_transfer_tool_interface() {
         let tool = TransferTool::new();
         assert_eq!(tool.name(), "transfer");
+    }
+
+    #[test]
+    fn pg_connection_string_prefers_literal_connection() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("host".to_string(), serde_json::json!("db"));
+        let conn = "postgresql://u:p@h:5432/d".to_string();
+        assert_eq!(
+            pg_connection_string(Some(&conn), &extra).unwrap(),
+            "postgresql://u:p@h:5432/d"
+        );
+    }
+
+    #[test]
+    fn pg_connection_string_assembles_from_alias_fields() {
+        // The credential resolver injects discrete host/port/user/password/
+        // database fields into `target.extra` when the fixture uses an
+        // alias-based `auth:` (e.g. `pg_local`) with no literal `connection`.
+        let mut extra = serde_json::Map::new();
+        extra.insert("host".to_string(), serde_json::json!("localhost"));
+        // `port` may arrive as a JSON string (keychain values are strings).
+        extra.insert("port".to_string(), serde_json::json!("54321"));
+        extra.insert("user".to_string(), serde_json::json!("noetl"));
+        extra.insert("password".to_string(), serde_json::json!("secret"));
+        extra.insert("database".to_string(), serde_json::json!("demo"));
+
+        let conn = pg_connection_string(None, &extra).unwrap();
+        assert_eq!(conn, "postgresql://noetl:secret@localhost:54321/demo");
+    }
+
+    #[test]
+    fn http_to_postgres_target_parses_alias_injected_fields() {
+        // An http->postgres transfer with an alias-based `auth:` deserializes
+        // with no literal `target.connection`; the resolver-injected fields
+        // flow through `target.extra` and pg_connection_string assembles the
+        // DSN.  Regression guard for "Target connection string required".
+        let json = serde_json::json!({
+            "source": {
+                "type": "http",
+                "url": "https://api.example.com/data",
+                "method": "GET"
+            },
+            "target": {
+                "type": "postgres",
+                "table": "public.http_dst",
+                "mapping": {"post_id": "id"},
+                "host": "localhost",
+                "port": 5432,
+                "user": "noetl",
+                "password": "pw",
+                "database": "demo"
+            }
+        });
+
+        let config: TransferConfig = serde_json::from_value(json).unwrap();
+        assert!(config.target.connection.is_none());
+        let conn =
+            pg_connection_string(config.target.connection.as_ref(), &config.target.extra).unwrap();
+        assert_eq!(conn, "postgresql://noetl:pw@localhost:5432/demo");
     }
 
     #[test]
