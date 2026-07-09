@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.19.2](https://github.com/noetl/tools/compare/v3.19.1...v3.19.2) (2026-07-09)
+
+### Bug Fixes
+
+* **transfer:** assemble http->postgres target connection from alias fields ([#83](https://github.com/noetl/tools/issues/83)) ([024b280](https://github.com/noetl/tools/commit/024b280c46edf33ed0bbc1ef1770787b4bc88db0))
+
 ## [3.19.1](https://github.com/noetl/tools/compare/v3.19.0...v3.19.1) (2026-06-27)
 
 ### Performance Improvements
