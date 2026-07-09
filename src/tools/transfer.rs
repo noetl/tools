@@ -135,6 +135,22 @@ fn coerce_snowflake_value(udt: Option<&String>, value: serde_json::Value) -> ser
     }
 }
 
+/// Coerce a native JSON value from an HTTP source into the text param a typed
+/// `$n::text::<udt>` cast expects.  HTTP JSON integers deserialize to Rust
+/// `i64` (int8); tokio-postgres refuses to implicitly narrow `i64` -> `int4`,
+/// so a source integer can't bind to an `INTEGER` target column.  Binding the
+/// value as text and letting Postgres cast it (`'42'::text::int4`) sidesteps
+/// the mismatch and generalises to numeric / bool / jsonb / timestamptz target
+/// columns.  Strings pass through unchanged; objects / arrays stringify to JSON
+/// text (which `::jsonb` parses); null stays null.
+fn coerce_http_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::String(s) => serde_json::Value::String(s),
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
 /// Convert Snowflake's internal timestamp string (`"<epoch_seconds>.<nanos>
 /// <tz_offset_minutes>"`, e.g. `"1781494755.203000000 1020"`) to an RFC3339
 /// UTC string a Postgres `timestamptz` accepts.  Returns `None` when the input
@@ -580,9 +596,28 @@ impl TransferTool {
                 .await?;
         }
 
+        // HTTP JSON values are natively typed (numbers -> i64, etc.).  Look up
+        // the target column types so each placeholder can carry an explicit
+        // `$n::text::<udt>` cast (text -> int4 / numeric / bool / jsonb /
+        // timestamptz), mirroring the Snowflake->Postgres writer.  Without this
+        // a JSON integer binds as `i64` and tokio-postgres rejects an `int4`
+        // target column ("cannot convert between the Rust type `i64` and the
+        // Postgres type `int4`").  Columns absent from the lookup fall back to a
+        // plain `$n` native bind, preserving prior behaviour.
+        let col_types = self
+            .fetch_pg_column_types(&pg_tool, &target_conn, target_table)
+            .await?;
+
         // Build INSERT query
         let insert_columns = columns.join(", ");
-        let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
+        let placeholders: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| match col_types.get(&col.to_lowercase()) {
+                Some(udt) => format!("${}::text::{}", i + 1, udt),
+                None => format!("${}", i + 1),
+            })
+            .collect();
         let insert_query = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             target_table,
@@ -605,9 +640,16 @@ impl TransferTool {
                             .and_then(|m| m.get(col))
                             .map(|s| s.as_str())
                             .unwrap_or(col);
-                        row.get(source_field)
+                        let raw = row
+                            .get(source_field)
                             .cloned()
-                            .unwrap_or(serde_json::Value::Null)
+                            .unwrap_or(serde_json::Value::Null);
+                        // Coerce to a text param only for columns we cast; leave
+                        // untyped columns as a native bind.
+                        match col_types.get(&col.to_lowercase()) {
+                            Some(_) => coerce_http_value(raw),
+                            None => raw,
+                        }
                     })
                     .collect();
 
@@ -1191,6 +1233,36 @@ mod tests {
         );
         // null stays null
         assert!(coerce_snowflake_value(Some(&num), serde_json::Value::Null).is_null());
+    }
+
+    #[test]
+    fn coerce_http_value_binds_integers_as_text() {
+        // JSON integer (the i64->int4 case from #183) -> text "42" so the
+        // `$n::text::int4` cast narrows it Postgres-side.
+        assert_eq!(
+            coerce_http_value(serde_json::json!(42)),
+            serde_json::json!("42")
+        );
+        // floats, bools -> their text form
+        assert_eq!(
+            coerce_http_value(serde_json::json!(100.5)),
+            serde_json::json!("100.5")
+        );
+        assert_eq!(
+            coerce_http_value(serde_json::json!(true)),
+            serde_json::json!("true")
+        );
+        // objects / arrays stringify to JSON text for `::jsonb` targets
+        assert_eq!(
+            coerce_http_value(serde_json::json!({"k": 1})),
+            serde_json::json!("{\"k\":1}")
+        );
+        // strings pass through unchanged; null stays null
+        assert_eq!(
+            coerce_http_value(serde_json::json!("hello")),
+            serde_json::json!("hello")
+        );
+        assert!(coerce_http_value(serde_json::Value::Null).is_null());
     }
 
     #[test]
