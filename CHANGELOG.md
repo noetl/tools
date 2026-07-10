@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.19.3](https://github.com/noetl/tools/compare/v3.19.2...v3.19.3) (2026-07-10)
+
+### Bug Fixes
+
+* **transfer:** coerce http->postgres params to target column types (i64->int4) ([#84](https://github.com/noetl/tools/issues/84)) ([28b7526](https://github.com/noetl/tools/commit/28b7526f4bc60983600cffc48dcc543ba6b66d65)), closes [noetl/ai-meta#183](https://github.com/noetl/ai-meta/issues/183)
+
 ## [3.19.2](https://github.com/noetl/tools/compare/v3.19.1...v3.19.2) (2026-07-09)
 
 ### Bug Fixes
