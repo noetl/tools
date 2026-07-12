@@ -42,6 +42,17 @@ gcs = []
 # `data-access-boundary.md`.  On by default so the shipped worker can spool to
 # an S3 bucket; opt out for a minimal NATS-only build.
 s3 = ["dep:hmac"]
+# DuckDB integration — the `duckdb` / `ducklake` tool kinds and the DuckDB↔
+# Postgres `transfer` directions.  OFF by default because `duckdb`'s `bundled`
+# feature compiles the full DuckDB C++ amalgamation (`libduckdb-sys`), a
+# multi-hour compile that dominates the noetl-worker release-image build.  The
+# default build compiles a stub for those kinds (clear opt-in error at
+# dispatch); enable this feature to compile the real DuckDB engine and run the
+# DuckDB integration tests (`cargo test --features duckdb-integration`).
+# Consumers that dispatch `duckdb`/`ducklake` at runtime (e.g. noetl-cli, which
+# already compiles duckdb via its own dependency) enable
+# `noetl-tools/duckdb-integration`.  noetl/ai-meta#185.
+duckdb-integration = ["dep:duckdb"]
 
 [dependencies]
 # Shared header/attribute directive engine (noetl/ai-meta#92).  The lean,
@@ -114,8 +125,17 @@ minijinja = { version = "2.5", features = ["loader"] }
 # Rhai scripting
 rhai = { version = "1.19", features = ["sync"] }
 
-# DuckDB
-duckdb = { version = "1.1", features = ["bundled"] }
+# DuckDB — optional, behind the non-default `duckdb-integration` feature.
+# `features = ["bundled"]` compiles the full DuckDB C++ amalgamation via
+# `libduckdb-sys`, a multi-hour compile under cluster contention that dominates
+# the noetl-worker release-image build.  The worker's core runtime (NATS pull
+# loop, event emission, state building) never touches DuckDB — it is only the
+# `duckdb` / `ducklake` tool kinds and the DuckDB↔Postgres `transfer`
+# directions.  With this feature OFF (the default worker + kind image build)
+# those kinds compile to a stub that returns a clear "rebuild with
+# `--features duckdb-integration`" error; the C++ amalgamation is not compiled.
+# See noetl/ai-meta#185.
+duckdb = { version = "1.1", features = ["bundled"], optional = true }
 
 # PostgreSQL (async)
 deadpool-postgres = "0.14"
