@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.20.0](https://github.com/noetl/tools/compare/v3.19.3...v3.20.0) (2026-07-13)
+
+### Features
+
+* **build:** gate DuckDB (libduckdb-sys C++) behind opt-in duckdb-integration feature ([#85](https://github.com/noetl/tools/issues/85)) ([b8a5081](https://github.com/noetl/tools/commit/b8a50817cda42782cb40190dc096bc492f30838a)), closes [noetl/ai-meta#185](https://github.com/noetl/ai-meta/issues/185)
+
 ## [3.19.3](https://github.com/noetl/tools/compare/v3.19.2...v3.19.3) (2026-07-10)
 
 ### Bug Fixes
