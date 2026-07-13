@@ -1,0 +1,88 @@
+# Sample playbook: NoETL `kind: provider` tool against Google Cloud.
+#
+# Illustrative reference for the round-1 REST provider tool (noetl-tools
+# `ProviderTool`).  It mirrors the operation specs the ShastaraTech
+# gcp-org-playbooks emit — see
+# https://github.com/shastaratech (private) automation/gcp_org/*.yaml — but
+# calls the provider tool directly instead of shelling out to `gcloud`.
+#
+# SAFETY: every step below is `dry_run: true` (plan mode) — the tool builds and
+# returns the request it WOULD send (`output.data.would_call`) without touching
+# the network or minting a credential.  To actually apply, a step must set
+# `dry_run: false` AND carry an explicit `auth:` alias (keychain-resolved) — the
+# tool refuses an apply-mode call with no `auth:` (no ambient ADC fallback).
+#
+# This file is documentation, not a cargo example (repos/tools is a library
+# crate).  A runnable e2e fixture + kind validation is a follow-up in repos/e2e.
+
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: provider_gcp_org_example
+  path: examples/provider-gcp-org
+  description: Plan Google Cloud org/project/service operations via the provider tool
+
+workload:
+  action: plan               # plan (dry_run) | apply — drives dry_run below
+  org_id: "561323743912"
+  folder_name: "20-media"
+  project_id: "shastaratech-youtube-prod"
+  display_name: "ShastaraTech YouTube Publisher"
+  billing_account: "billingAccounts/XXXXXX-XXXXXX-XXXXXX"
+  api: "youtube.googleapis.com"
+
+workflow:
+  # 1. List folders under the organization (read-only).
+  - step: list_folders
+    tool:
+      kind: provider
+      provider: google
+      runtime: rest
+      action: google.cloudresourcemanager.folders.list
+      dry_run: "{{ workload.action != 'apply' }}"
+      input:
+        parent: "organizations/{{ workload.org_id }}"
+      # `auth:` only consulted for a real (apply-mode) call; plan mode is
+      # credential-free.  For apply, reference a keychain alias, e.g.:
+      # auth:
+      #   type: gcp_adc
+      #   credential: "gcp_org_admin"
+      #   scopes: ["https://www.googleapis.com/auth/cloud-platform"]
+
+  # 2. Ensure the project exists under the folder (mutation; plan-able now,
+  #    apply is a documented round-1 stub for the multi-step ensure path).
+  - step: ensure_project
+    tool:
+      kind: provider
+      provider: google
+      runtime: rest
+      action: google.cloudresourcemanager.projects.ensure
+      dry_run: "{{ workload.action != 'apply' }}"
+      input:
+        project_id: "{{ workload.project_id }}"
+        display_name: "{{ workload.display_name }}"
+        parent: "folders/by-display-name/{{ workload.folder_name }}"
+
+  # 3. Enable a service API on the project (single-request idempotent mutation;
+  #    apply supported once an explicit `auth:` alias is added).
+  - step: enable_api
+    tool:
+      kind: provider
+      provider: google
+      runtime: rest
+      action: google.serviceusage.services.enable
+      dry_run: "{{ workload.action != 'apply' }}"
+      input:
+        project_id: "{{ workload.project_id }}"
+        service_name: "{{ workload.api }}"
+
+  # 4. Report currently-enabled services (read-only).
+  - step: list_enabled
+    tool:
+      kind: provider
+      provider: google
+      runtime: rest
+      action: google.serviceusage.services.list_enabled
+      dry_run: "{{ workload.action != 'apply' }}"
+      input:
+        project_id: "{{ workload.project_id }}"
