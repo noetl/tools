@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.23.0](https://github.com/noetl/tools/compare/v3.22.0...v3.23.0) (2026-07-13)
+
+### Features
+
+* **provider:** confirm-gated destroy + EHDB ownership projection + endpoint override ([#88](https://github.com/noetl/tools/issues/88)) ([36b3742](https://github.com/noetl/tools/commit/36b3742a9d9dadb854a0d0b046f9220e481ca349)), closes [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189) [#178](https://github.com/noetl/tools/issues/178) [#178](https://github.com/noetl/tools/issues/178) [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189)
+
 ## [3.22.0](https://github.com/noetl/tools/compare/v3.21.0...v3.22.0) (2026-07-13)
 
 ### Features
