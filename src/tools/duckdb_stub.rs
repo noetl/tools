@@ -2,10 +2,12 @@
 //!
 //! The real DuckDB implementation ([`super::duckdb`] / `duckdb.rs`) pulls in the
 //! `duckdb` crate with `features = ["bundled"]`, which compiles the full DuckDB
-//! C++ amalgamation via `libduckdb-sys` — a multi-hour compile that dominates
-//! the noetl-worker release-image build.  The worker's core runtime never
-//! touches DuckDB, so the dependency is gated behind the non-default
-//! `duckdb-integration` cargo feature (noetl/ai-meta#185).
+//! C++ amalgamation via `libduckdb-sys` — a multi-hour compile.  Making it
+//! opt-in behind the non-default `duckdb-integration` cargo feature
+//! (noetl/ai-meta#185) lets builds that never run duckdb steps — the
+//! tools-crate's own CI, a default `cargo build`, and lean consumers — skip it.
+//! Runtime consumers of the duckdb kinds (noetl-worker, whose pool executes
+//! `duckdb`/`ducklake` steps, and noetl-cli) enable the feature.
 //!
 //! This stub preserves `DuckdbTool`'s public surface (`new`, `execute_query`,
 //! `Default`, and the [`Tool`] impl) so `ducklake`, `transfer`, the registry,
@@ -25,10 +27,10 @@ use crate::result::ToolResult;
 /// not compile the DuckDB engine.
 const DISABLED_MSG: &str = "duckdb tool is not compiled into this build: the \
     DuckDB C++ engine (libduckdb-sys) is gated behind the non-default \
-    `duckdb-integration` cargo feature to keep the default worker / kind image \
-    build fast. Rebuild noetl-tools (or the consuming binary) with \
-    `--features duckdb-integration` to enable DuckDB / DuckLake support. \
-    See noetl/ai-meta#185.";
+    `duckdb-integration` cargo feature so builds that never run duckdb steps \
+    skip the multi-hour C++ compile. Rebuild the consuming binary with \
+    `--features duckdb-integration` (the noetl-worker image enables it) to \
+    enable DuckDB / DuckLake support. See noetl/ai-meta#185.";
 
 /// DuckDB query execution tool (stub).
 ///

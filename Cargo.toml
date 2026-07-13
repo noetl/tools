@@ -45,13 +45,15 @@ s3 = ["dep:hmac"]
 # DuckDB integration — the `duckdb` / `ducklake` tool kinds and the DuckDB↔
 # Postgres `transfer` directions.  OFF by default because `duckdb`'s `bundled`
 # feature compiles the full DuckDB C++ amalgamation (`libduckdb-sys`), a
-# multi-hour compile that dominates the noetl-worker release-image build.  The
-# default build compiles a stub for those kinds (clear opt-in error at
-# dispatch); enable this feature to compile the real DuckDB engine and run the
-# DuckDB integration tests (`cargo test --features duckdb-integration`).
-# Consumers that dispatch `duckdb`/`ducklake` at runtime (e.g. noetl-cli, which
-# already compiles duckdb via its own dependency) enable
-# `noetl-tools/duckdb-integration`.  noetl/ai-meta#185.
+# multi-hour compile.  Default-off keeps builds that never run those kinds fast
+# (the tools-crate's own CI, a default `cargo build`, lean consumers): they get
+# a stub with a clear opt-in error at dispatch.  Enable this feature to compile
+# the real DuckDB engine and run the DuckDB integration tests
+# (`cargo test --features duckdb-integration`).  Consumers that dispatch
+# `duckdb`/`ducklake` at runtime enable `noetl-tools/duckdb-integration`:
+# noetl-worker (its pool executes duckdb steps — see the worker Cargo.toml +
+# Dockerfile) and noetl-cli (which also compiles duckdb via its own dependency).
+# noetl/ai-meta#185.
 duckdb-integration = ["dep:duckdb"]
 
 [dependencies]
@@ -127,14 +129,16 @@ rhai = { version = "1.19", features = ["sync"] }
 
 # DuckDB — optional, behind the non-default `duckdb-integration` feature.
 # `features = ["bundled"]` compiles the full DuckDB C++ amalgamation via
-# `libduckdb-sys`, a multi-hour compile under cluster contention that dominates
-# the noetl-worker release-image build.  The worker's core runtime (NATS pull
-# loop, event emission, state building) never touches DuckDB — it is only the
-# `duckdb` / `ducklake` tool kinds and the DuckDB↔Postgres `transfer`
-# directions.  With this feature OFF (the default worker + kind image build)
-# those kinds compile to a stub that returns a clear "rebuild with
-# `--features duckdb-integration`" error; the C++ amalgamation is not compiled.
-# See noetl/ai-meta#185.
+# `libduckdb-sys`, a multi-hour compile under cluster contention.  DuckDB is
+# only reachable through the `duckdb` / `ducklake` tool kinds and the DuckDB↔
+# Postgres `transfer` directions.  Making it optional lets builds that don't run
+# those kinds — the tools-crate's own CI, a default `cargo build`, and lean
+# consumers — skip the C++ compile entirely (with the feature OFF those kinds
+# compile to a stub that returns a clear "rebuild with
+# `--features duckdb-integration`" error).  NOTE: the noetl-worker DOES dispatch
+# `duckdb`/`ducklake` steps at runtime (e2e fixtures execute them on the worker
+# pool), so the worker image build ENABLES this feature — see the worker's
+# `Cargo.toml` + `Dockerfile`.  See noetl/ai-meta#185.
 duckdb = { version = "1.1", features = ["bundled"], optional = true }
 
 # PostgreSQL (async)
