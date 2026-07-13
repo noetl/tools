@@ -92,6 +92,36 @@
 //! ensure action is safe to re-run (the GET-first converge makes the retry a
 //! no-op once the operation completes).
 //!
+//! ## Reconcile policy: report / enforce / adopt (round-4 — drift adoption)
+//!
+//! When infra is changed out-of-band (the GCP console, another tool), the tool
+//! must be able to **accept** the change rather than revert it or
+//! destroy-and-recreate.  A [`ReconcilePolicy`] on the step selects the
+//! response for the mutating ensure actions:
+//!
+//! - **`report`** (DEFAULT) — detect + report drift; change **nothing** (no
+//!   cloud mutation, no ownership fact).  A plain run is always safe.  This is
+//!   the Terraform-`plan` shape and it is now the default, so converging
+//!   requires an explicit `reconcile: enforce`.
+//! - **`enforce`** — push desired → actual (the round-2 GET-first converge);
+//!   `dry_run` still gates plan-vs-apply, apply still requires `auth:`.
+//! - **`adopt`** — accept the live actual as the NEW desired.  Makes **no**
+//!   cloud mutation (read/GET only); writes a new `provider_fact`
+//!   (`verb: "adopt"`, `outcome: "adopted"`) recording actual-as-desired.
+//!   Covers both an already-owned resource tweaked out-of-band (refresh
+//!   last-known-desired) and a resource created entirely outside NoETL
+//!   (`import`: `Untracked → Owned`).
+//!
+//! **`adopt` is confirm-gated, identical to the destroy gate:** a dry-run emits
+//! the field-by-field drift diff (desired vs actual) + a `plan_digest`; an apply
+//! requires `confirm:<plan_digest>`; a **stale digest is refused** if the
+//! resource drifted *again* since the human reviewed it.  Ungated adoption would
+//! launder an accidental or malicious out-of-band change into "desired"
+//! permanently — human review is the point.  The last-known-desired side of the
+//! diff comes from the caller's query adapter (`known_desired`, sourced from the
+//! EHDB raw-eventlog-tier fold — see [`state::extract_facts_from_eventlog`]);
+//! the live-actual side is [`normalize_live`]'d from a read-only GET.
+//!
 //! ## Cross-cloud shape
 //!
 //! [`ProviderFamily`] keeps `aws` / `azure` as explicit, not-yet-implemented
@@ -275,6 +305,37 @@ pub enum EndpointOverride {
     },
 }
 
+/// Reconciliation policy for a drifted resource (Round 4 — noetl/ai-meta#189).
+///
+/// Selects how the tool responds when last-known-desired ≠ live actual.  The
+/// default is [`ReconcilePolicy::Report`] — a plain run detects drift and
+/// changes **nothing** (no cloud mutation, no state write).  The two mutating
+/// policies are explicit opt-ins; `adopt` is additionally confirm-gated exactly
+/// like a destroy.  The tool never silently reverts and never silently accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReconcilePolicy {
+    /// DEFAULT.  Detect + report drift.  Reads live state only (needs `auth:`
+    /// to read the live actual — without it the report is `undetermined`, still
+    /// safe); makes **no** cloud mutation and writes **no** ownership fact.
+    #[default]
+    Report,
+    /// Push desired → actual — the round-2 GET-first idempotent converge (the
+    /// Terraform-`apply` shape).  Explicit opt-in; `dry_run` still gates
+    /// plan-vs-apply within enforce, and apply mode still REQUIRES `auth:`.
+    Enforce,
+    /// Accept the live actual as the NEW desired.  Makes **no** cloud mutation
+    /// (read/GET only) — records a new `provider_fact` (`verb: "adopt"`) marking
+    /// the live actual as desired.  Covers both an already-owned resource tweaked
+    /// out-of-band (update last-known-desired) and a resource created entirely
+    /// outside NoETL (import: `Untracked → Owned`).  Confirm-gated exactly like
+    /// destroy: dry-run emits the field-by-field diff + a `plan_digest`; apply
+    /// requires `confirm:<digest>`; a stale digest (the resource drifted again
+    /// since review) is refused so an accidental / malicious out-of-band change
+    /// cannot be laundered into "desired" without human review.
+    Adopt,
+}
+
 /// Parsed `kind: provider` tool config (deserialized from the flattened,
 /// template-rendered tool block).
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +397,25 @@ pub struct ProviderSpec {
     /// non-destroy actions.
     #[serde(default)]
     pub confirm: Option<String>,
+
+    /// Reconciliation policy (Round 4).  Governs the mutating **ensure** actions
+    /// only — reads (`folders.list`, `*.describe`, `*.get_policy`) and the
+    /// confirm-gated destroy verbs are unaffected.  Defaults to
+    /// [`ReconcilePolicy::Report`]: an unqualified run of a mutating action
+    /// reports drift and changes nothing.  Set `enforce` to converge (the
+    /// round-2 behavior) or `adopt` to accept live actual as desired.
+    #[serde(default)]
+    pub reconcile: ReconcilePolicy,
+
+    /// Last-known-desired spec for this resource's URN, supplied by the caller's
+    /// query adapter (the EHDB raw-eventlog-tier fold — see
+    /// [`state::extract_facts_from_eventlog`] / [`state::fold_facts`]).  Used by
+    /// `report` and `adopt` to compute the desired-vs-actual diff.  When absent,
+    /// the resource has no ownership record: `report` reports it `untracked` and
+    /// `adopt` performs an import (`Untracked → Owned`).  Ignored by `enforce`
+    /// (which derives desired from the step's own `input`).
+    #[serde(default)]
+    pub known_desired: Option<serde_json::Value>,
 }
 
 fn default_dry_run() -> bool {
@@ -1352,6 +1432,28 @@ impl ProviderTool {
                 .await;
         }
 
+        // ---- Reconciliation policy (Round 4) ----
+        // Governs the mutating ensure actions only.  Reads (`plan.mutates ==
+        // false`) have no desired-vs-actual to reconcile — they always execute
+        // as before.  Destroy (handled above) carries its own confirm gate.
+        if plan.mutates {
+            match spec.reconcile {
+                ReconcilePolicy::Report => {
+                    return self
+                        .run_report(&action, &plan, &spec, config, ctx, backend, start)
+                        .await;
+                }
+                ReconcilePolicy::Adopt => {
+                    return self
+                        .run_adopt(&action, &plan, &spec, config, ctx, backend, start)
+                        .await;
+                }
+                // Enforce is the round-2 converge — falls through to the existing
+                // dry-run-echo / apply path below.
+                ReconcilePolicy::Enforce => {}
+            }
+        }
+
         let stack = spec.stack.as_deref().unwrap_or("<unscoped>");
         let (service, resource_type) = service_and_type(&plan.apply);
         let urn = urn_for_apply(&plan.apply);
@@ -1771,6 +1873,380 @@ impl ProviderTool {
                     .await?;
                 Ok((updated, true))
             }
+        }
+    }
+
+    /// Round-4 `reconcile: report` — read-only drift report.  Reads the live
+    /// actual, normalizes it into the desired key space, and reports the drift
+    /// verdict against last-known-desired (`spec.known_desired`, supplied by the
+    /// caller's query adapter).  Makes **no** cloud mutation and writes **no**
+    /// ownership fact — a `report` run is always safe.  Without `auth:` the live
+    /// actual can't be read, so the drift is `undetermined` (still no mutation).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_report(
+        &self,
+        action: &str,
+        plan: &ActionPlan,
+        spec: &ProviderSpec,
+        config: &ToolConfig,
+        ctx: &ExecutionContext,
+        backend: &str,
+        start: std::time::Instant,
+    ) -> Result<ToolResult, ToolError> {
+        let urn = urn_for_apply(&plan.apply).unwrap_or_default();
+        let desired = spec
+            .known_desired
+            .as_ref()
+            .map(|d| canonicalize_desired(&plan.apply, d));
+
+        // No auth → we cannot read live actual.  Return a safe, mutation-free
+        // "undetermined" report rather than erroring: a plain run never fails.
+        let Some(auth_config) = config.auth.as_ref() else {
+            let data = serde_json::json!({
+                "provider": "google",
+                "action": action,
+                "reconcile": "report",
+                "backend": backend,
+                "converge": apply_strategy_label(&plan.apply),
+                "urn": urn,
+                "drift": "undetermined",
+                "changed": false,
+                "desired": desired,
+                "note": "no `auth:` supplied — cannot read live actual to detect drift. \
+                         Add an `auth:` block to compute the real desired-vs-actual report. \
+                         (report never mutates cloud state regardless.)",
+            });
+            return Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64));
+        };
+
+        let creds = self.auth_resolver.resolve(auth_config, ctx).await?;
+        let resolved = self.resolve_actual(action, &plan.apply, &creds).await?;
+        let actual_opt = if resolved.present {
+            Some(&resolved.actual)
+        } else {
+            None
+        };
+        let drift = state::drift_between(desired.as_ref(), actual_opt);
+
+        let data = serde_json::json!({
+            "provider": "google",
+            "action": action,
+            "reconcile": "report",
+            "backend": backend,
+            "converge": apply_strategy_label(&plan.apply),
+            "urn": urn,
+            // The verdict (in_sync / modified{fields} / missing / untracked / not_managed).
+            "drift": drift,
+            // Field-by-field desired-vs-actual (empty when in sync / untracked).
+            "diff": adopt_diff_echo(desired.as_ref(), &resolved.actual),
+            "desired": desired,
+            "actual": resolved.actual,
+            "present": resolved.present,
+            // A report NEVER mutates and NEVER writes an ownership fact.
+            "changed": false,
+        });
+        Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64))
+    }
+
+    /// Round-4 `reconcile: adopt` — accept the live actual as the NEW desired.
+    ///
+    /// Confirm-gated exactly like [`ProviderTool::run_destroy`]: the diff +
+    /// digest are resolved against live state (so `adopt` needs `auth:` even to
+    /// plan), a dry-run emits the field-by-field diff + a `plan_digest`, and an
+    /// apply requires `confirm:<digest>`.  A blind apply (no confirm) and a stale
+    /// digest (the resource drifted again since review) are both refused — this
+    /// is the guard that stops an accidental / malicious out-of-band change from
+    /// being laundered into "desired" without human review.
+    ///
+    /// **Adopt makes no cloud mutation.**  Structurally: this method only ever
+    /// calls [`ProviderTool::resolve_actual`], which issues reads
+    /// (GET / getIamPolicy) — it has no path to a create / update / delete /
+    /// setIamPolicy.  On apply it writes only the `provider_fact` (state), never
+    /// the cloud.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_adopt(
+        &self,
+        action: &str,
+        plan: &ActionPlan,
+        spec: &ProviderSpec,
+        config: &ToolConfig,
+        ctx: &ExecutionContext,
+        backend: &str,
+        start: std::time::Instant,
+    ) -> Result<ToolResult, ToolError> {
+        let stack = spec.stack.as_deref().unwrap_or("<unscoped>");
+        let (service, resource_type) = service_and_type(&plan.apply);
+        let desired = spec
+            .known_desired
+            .as_ref()
+            .map(|d| canonicalize_desired(&plan.apply, d));
+        let import = desired.is_none();
+
+        // Adopt needs auth even to plan — the diff + digest are resolved against
+        // live actual so a stale confirmation (drifted again) can be refused.
+        let auth_config = config.auth.as_ref().ok_or_else(|| {
+            ToolError::Configuration(format!(
+                "adopt action {action:?} requires an explicit `auth:` block even to plan: the \
+                 adopt diff is resolved against live cloud state so a stale confirmation can be \
+                 refused. Add an `auth:` block (dry_run:true still performs no mutation — only \
+                 the read needed to resolve the live actual)."
+            ))
+        })?;
+        let creds = self.auth_resolver.resolve(auth_config, ctx).await?;
+        let resolved = self.resolve_actual(action, &plan.apply, &creds).await?;
+        let urn = resolved.urn.clone();
+        let digest = adopt_plan_digest(action, &resolved);
+
+        // Nothing to adopt if the resource does not exist live.
+        if !resolved.present {
+            return Err(ToolError::ExecutionFailed(format!(
+                "adopt REFUSED for {urn}: the target resource was not found in live cloud state, \
+                 so there is nothing to adopt. Create it (reconcile:enforce) or fix the target. \
+                 No state was written."
+            )));
+        }
+
+        let actual_opt = Some(&resolved.actual);
+        let drift = state::drift_between(desired.as_ref(), actual_opt);
+
+        // ---- Adopt dry-run: emit the explicit diff + digest for review. ----
+        if spec.dry_run {
+            let data = serde_json::json!({
+                "provider": "google",
+                "action": action,
+                "reconcile": "adopt",
+                "dry_run": true,
+                "changed": false,
+                "adopt": true,
+                "import": import,
+                "backend": backend,
+                "converge": apply_strategy_label(&plan.apply),
+                "urn": urn,
+                "drift": drift,
+                "diff": adopt_diff_echo(desired.as_ref(), &resolved.actual),
+                "desired": desired,
+                "actual": resolved.actual,
+                "present": true,
+                "plan_digest": digest,
+                "confirm_hint": "review the diff above, then re-run with dry_run:false and \
+                                 confirm:<plan_digest> to accept this exact reviewed live actual \
+                                 as the new desired. No cloud state is ever modified by adopt. If \
+                                 the resource changes again before you apply, the digest will no \
+                                 longer match and the adopt will be refused.",
+                // A dry-run adopt fact is `planned` intent — the fold ignores it,
+                // so no ownership moves until a confirmed apply.
+                "provider_fact": build_fact(
+                    &urn, service, resource_type, "adopt", stack,
+                    resolved.actual.clone(), ctx.execution_id, "planned",
+                ),
+            });
+            return Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64));
+        }
+
+        // ---- Adopt apply: require a confirm digest bound to THIS live actual. ----
+        let confirm = spec.confirm.as_deref().ok_or_else(|| {
+            ToolError::Configuration(format!(
+                "adopt apply REFUSED for {urn}: no `confirm` digest supplied. An adopt apply must \
+                 echo the `plan_digest` from a reviewed dry-run — blind adoptions are not \
+                 permitted (they would launder an out-of-band change into desired without human \
+                 review). Run dry_run:true first, review the diff, then re-run with \
+                 confirm:<plan_digest>. No state was written."
+            ))
+        })?;
+        if confirm != digest {
+            return Err(ToolError::ExecutionFailed(format!(
+                "adopt apply REFUSED for {urn}: the supplied confirm digest ({confirm}) does not \
+                 match the live-resolved actual digest ({digest}). The resource changed again \
+                 since the diff was reviewed (or the confirm value is wrong) — re-run \
+                 dry_run:true, review the fresh diff, and confirm its new digest. No state was \
+                 written."
+            )));
+        }
+
+        // Digest matched → accept live actual as the new desired.  NO cloud call
+        // beyond the read already issued by `resolve_actual`.
+        let data = serde_json::json!({
+            "provider": "google",
+            "action": action,
+            "reconcile": "adopt",
+            "dry_run": false,
+            // No cloud state changed — adopt only rewrites last-known-desired.
+            "changed": false,
+            "adopt": true,
+            "adopted": true,
+            "import": import,
+            "backend": backend,
+            "converge": apply_strategy_label(&plan.apply),
+            "urn": urn,
+            // The accepted live actual is now the desired.
+            "desired": resolved.actual,
+            "actual": resolved.actual,
+            "present": true,
+            "provider_fact": build_fact(
+                &urn, service, resource_type, "adopt", stack,
+                resolved.actual.clone(), ctx.execution_id, "adopted",
+            ),
+        });
+        Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64))
+    }
+
+    /// Resolve the live actual state of an **ensure** resource, read-only, for
+    /// `report` / `adopt`.  Issues only reads (GET / getIamPolicy) — it has no
+    /// path to a mutation, which is what makes `adopt` provably non-mutating.
+    /// The returned `actual` is normalized into the desired key space so it can
+    /// be diffed directly against last-known-desired.
+    async fn resolve_actual(
+        &self,
+        action: &str,
+        apply: &ApplyKind,
+        creds: &crate::auth::AuthCredentials,
+    ) -> Result<ResolvedActual, ToolError> {
+        let urn = urn_for_apply(apply).unwrap_or_default();
+        match apply {
+            ApplyKind::EnsureFolder {
+                parent,
+                display_name,
+            } => {
+                let list = self
+                    .execute_request(
+                        &PlannedRequest::get(format!(
+                            "{}/folders?parent={}",
+                            self.endpoints.crm,
+                            urlencode(parent)
+                        )),
+                        creds,
+                    )
+                    .await?;
+                match find_active_folder(&list, display_name) {
+                    Some(folder) => Ok(ResolvedActual {
+                        urn,
+                        present: true,
+                        etag: folder
+                            .get("etag")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        state: folder
+                            .get("state")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        actual: normalize_live(apply, &folder),
+                    }),
+                    None => Ok(ResolvedActual::absent(urn)),
+                }
+            }
+            ApplyKind::EnsureProject { project_id, .. } => {
+                let (status, body) = self
+                    .send(
+                        &PlannedRequest::get(format!(
+                            "{}/projects/{project_id}",
+                            self.endpoints.crm
+                        )),
+                        creds,
+                    )
+                    .await?;
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(ResolvedActual::absent(urn));
+                }
+                if !status.is_success() {
+                    return Err(ToolError::Http(format!(
+                        "google API {} resolving actual for projects/{project_id}: {}",
+                        status.as_u16(),
+                        redact_sensitive(&body)
+                    )));
+                }
+                Ok(ResolvedActual {
+                    urn,
+                    present: true,
+                    etag: body.get("etag").and_then(|v| v.as_str()).map(String::from),
+                    state: body.get("state").and_then(|v| v.as_str()).map(String::from),
+                    actual: normalize_live(apply, &body),
+                })
+            }
+            ApplyKind::EnsureService { project, service } => {
+                let current = self
+                    .execute_request(
+                        &PlannedRequest::get(format!(
+                            "{}/projects/{project}/services/{service}",
+                            self.endpoints.serviceusage
+                        )),
+                        creds,
+                    )
+                    .await?;
+                let state = current
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("STATE_UNSPECIFIED");
+                // A service is "present to adopt" when it is ENABLED (the ensure
+                // desired); a DISABLED service has no enabled-state to accept.
+                let present = state == "ENABLED";
+                Ok(ResolvedActual {
+                    urn,
+                    present,
+                    etag: None,
+                    state: Some(state.to_string()),
+                    actual: if present {
+                        normalize_live(apply, &current)
+                    } else {
+                        serde_json::json!({})
+                    },
+                })
+            }
+            ApplyKind::EnsureBillingLink { project, .. } => {
+                let current = self
+                    .execute_request(
+                        &PlannedRequest::get(format!(
+                            "{}/projects/{project}/billingInfo",
+                            self.endpoints.billing
+                        )),
+                        creds,
+                    )
+                    .await?;
+                let linked = current
+                    .get("billingAccountName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let present = !linked.is_empty();
+                Ok(ResolvedActual {
+                    urn,
+                    present,
+                    etag: None,
+                    state: Some(if present { "linked" } else { "unlinked" }.to_string()),
+                    actual: if present {
+                        normalize_live(apply, &current)
+                    } else {
+                        serde_json::json!({})
+                    },
+                })
+            }
+            ApplyKind::EnsureIamBinding {
+                get_url,
+                role,
+                member,
+                ..
+            } => {
+                let policy = self
+                    .execute_request(
+                        &PlannedRequest::post(get_url.clone(), Some(serde_json::json!({}))),
+                        creds,
+                    )
+                    .await?;
+                let present = binding_present(&policy, role, member);
+                Ok(ResolvedActual {
+                    urn,
+                    present,
+                    etag: policy
+                        .get("etag")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    state: Some(if present { "bound" } else { "absent" }.to_string()),
+                    actual: serde_json::json!({ "role": role, "member": member, "bound": present }),
+                })
+            }
+            // A pure read has no desired/actual to adopt; guarded by the caller.
+            ApplyKind::Single | ApplyKind::Destroy(_) => Err(ToolError::Configuration(format!(
+                "action {action:?} is not an ensure resource and cannot be reconciled (report / \
+                 adopt apply only to mutating ensure actions)"
+            ))),
         }
     }
 }
@@ -2208,6 +2684,203 @@ fn destroy_plan_digest(action: &str, resolved: &ResolvedDestroy) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// One ensure resource's live actual, resolved read-only for `report` / `adopt`
+/// (Round 4).  `actual` is normalized into the desired key space so it diffs
+/// directly against last-known-desired.  The digest is computed over this so a
+/// `confirm` reviewed at one point in time is refused if the live actual drifted
+/// again (a changed field, etag, lifecycle state, or presence flip).
+#[derive(Debug, Clone)]
+struct ResolvedActual {
+    urn: String,
+    /// Whether the target currently exists live (and can be adopted).
+    present: bool,
+    /// Live actual normalized into the desired key space (`{}` when absent).
+    actual: serde_json::Value,
+    /// Optimistic-concurrency token where the API exposes one — folded into the
+    /// digest so a drift the normalized `actual` didn't surface still refuses a
+    /// stale confirm.
+    etag: Option<String>,
+    /// Lifecycle-state fingerprint (`ACTIVE` / `ENABLED` / `bound` / …).
+    state: Option<String>,
+}
+
+impl ResolvedActual {
+    fn absent(urn: String) -> Self {
+        Self {
+            urn,
+            present: false,
+            actual: serde_json::json!({}),
+            etag: None,
+            state: None,
+        }
+    }
+}
+
+/// SHA-256 (hex) over the canonical live-resolved adopt plan.  Every field that
+/// would make the adoption "a different adoption than the one reviewed" is
+/// folded in: the URN, presence, the normalized actual (canonical JSON — object
+/// keys are sorted because `serde_json::Map` is a `BTreeMap` in this build), and
+/// the live etag / lifecycle-state fingerprint.  A change in any of them yields a
+/// different digest, so a stale `confirm` is refused.
+fn adopt_plan_digest(action: &str, resolved: &ResolvedActual) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = format!(
+        "v1|adopt|action={}|urn={}|present={}|actual={}|etag={}|state={}",
+        action,
+        resolved.urn,
+        resolved.present,
+        serde_json::to_string(&resolved.actual).unwrap_or_default(),
+        resolved.etag.as_deref().unwrap_or(""),
+        resolved.state.as_deref().unwrap_or(""),
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Field-by-field desired-vs-actual diff echoed in a report / adopt dry-run.
+/// Emits one entry per field where the two differ, plus fields that are new in
+/// actual (the import case, where there is no prior desired).  `{}` when in sync.
+fn adopt_diff_echo(
+    desired: Option<&serde_json::Value>,
+    actual: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    let empty = serde_json::Map::new();
+    let desired_obj = desired.and_then(|d| d.as_object()).unwrap_or(&empty);
+    let actual_obj = actual.as_object().unwrap_or(&empty);
+
+    // Union of keys, so a field present on only one side still shows.
+    let mut keys: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    keys.extend(desired_obj.keys());
+    keys.extend(actual_obj.keys());
+    for k in keys {
+        let want = desired_obj.get(k);
+        let got = actual_obj.get(k);
+        if want != got {
+            out.insert(
+                k.clone(),
+                serde_json::json!({
+                    "desired": want,
+                    "actual": got,
+                }),
+            );
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Normalize a live GCP GET response into the desired key space for a given
+/// ensure action, so the live actual diffs directly against last-known-desired.
+/// This is the "normalize the live GET" half of the query I/O adapter (the other
+/// half — reading the EHDB raw eventlog tier — is [`state::extract_facts_from_eventlog`]).
+fn normalize_live(apply: &ApplyKind, live: &serde_json::Value) -> serde_json::Value {
+    let s = |k: &str| live.get(k).and_then(|v| v.as_str()).map(String::from);
+    match apply {
+        ApplyKind::EnsureFolder { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = s("parent") {
+                o.insert("parent".into(), v.into());
+            }
+            if let Some(v) = s("displayName") {
+                o.insert("display_name".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureProject { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = s("projectId") {
+                o.insert("project_id".into(), v.into());
+            }
+            // CRM v3 exposes `parent` as a string (`folders/123`).
+            if let Some(v) = s("parent") {
+                o.insert("parent".into(), v.into());
+            }
+            if let Some(v) = s("displayName") {
+                o.insert("display_name".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureService { .. } => {
+            serde_json::json!({ "state": s("state").unwrap_or_else(|| "ENABLED".into()) })
+        }
+        ApplyKind::EnsureBillingLink { .. } => {
+            serde_json::json!({ "billing_account": s("billingAccountName").unwrap_or_default() })
+        }
+        // IAM actual is synthesized at resolve time; nothing to normalize here.
+        ApplyKind::EnsureIamBinding { .. } | ApplyKind::Single | ApplyKind::Destroy(_) => {
+            live.clone()
+        }
+    }
+}
+
+/// Canonicalize a last-known-desired object (whatever key spellings the emitting
+/// playbook used) into the same snake_case key space [`normalize_live`] targets,
+/// so the report / adopt diff compares like against like.  Only the fields that
+/// are meaningful for the resource type are carried; unknown keys are dropped.
+fn canonicalize_desired(apply: &ApplyKind, desired: &serde_json::Value) -> serde_json::Value {
+    // First present of the candidate keys, coerced to string.
+    let pick =
+        |keys: &[&str]| -> Option<String> { keys.iter().find_map(|k| input_str(desired, k)) };
+    match apply {
+        ApplyKind::EnsureFolder { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = pick(&["parent"]) {
+                o.insert("parent".into(), v.into());
+            }
+            if let Some(v) = pick(&["display_name", "displayName"]) {
+                o.insert("display_name".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureProject { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = pick(&["project_id", "projectId"]) {
+                o.insert("project_id".into(), v.into());
+            }
+            if let Some(v) = pick(&["parent"]) {
+                o.insert("parent".into(), v.into());
+            }
+            if let Some(v) = pick(&["display_name", "displayName"]) {
+                o.insert("display_name".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureService { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = pick(&["state"]) {
+                o.insert("state".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureBillingLink { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = pick(&[
+                "billing_account",
+                "billingAccountName",
+                "billing_account_name",
+            ]) {
+                o.insert("billing_account".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::EnsureIamBinding { .. } => {
+            let mut o = serde_json::Map::new();
+            if let Some(v) = pick(&["role"]) {
+                o.insert("role".into(), v.into());
+            }
+            if let Some(v) = pick(&["member"]) {
+                o.insert("member".into(), v.into());
+            }
+            // A known binding is, by definition, bound.
+            o.insert("bound".into(), serde_json::Value::Bool(true));
+            serde_json::Value::Object(o)
+        }
+        ApplyKind::Single | ApplyKind::Destroy(_) => desired.clone(),
+    }
+}
+
 /// Ownership / drift / orphan projection over the provider event stream
 /// (Fork 1).  This is the **pure fold** half — it consumes an ordered slice of
 /// [`ProviderFact`]s (the shape a converge emits and the EHDB *raw eventlog
@@ -2239,14 +2912,16 @@ pub mod state {
         pub provider: String,
         pub service: String,
         pub resource_type: String,
-        /// `ensure` | `delete`.
+        /// `ensure` | `delete` | `adopt`.
         pub verb: String,
         pub stack: String,
-        /// Declared desired spec (normalized).  Empty for a delete.
+        /// Declared desired spec (normalized).  Empty for a delete; for an
+        /// `adopt` this is the live actual accepted as the new desired.
         #[serde(default)]
         pub desired: serde_json::Value,
         pub execution_id: i64,
-        /// `planned` (dry-run intent) | `changed` | `noop` | `deleted` | `absent`.
+        /// `planned` (dry-run intent) | `changed` | `noop` | `deleted` |
+        /// `absent` | `adopted` (Round 4 — actual accepted as desired).
         pub outcome: String,
     }
 
@@ -2291,8 +2966,12 @@ pub mod state {
         let mut model = OwnershipModel::default();
         for f in facts {
             match (f.verb.as_str(), f.outcome.as_str()) {
-                // An applied ensure asserts (or refreshes) live ownership.
-                ("ensure", "changed") | ("ensure", "noop") => {
+                // An applied ensure asserts (or refreshes) live ownership.  An
+                // applied `adopt` does the same — accepting the live actual as
+                // desired — and so covers BOTH cases: refreshing last-known-
+                // desired for an already-owned URN, and importing a
+                // previously-untracked one (`Untracked → Owned`).
+                ("ensure", "changed") | ("ensure", "noop") | ("adopt", "adopted") => {
                     model.tombstoned.remove(&f.urn);
                     model.owned.insert(
                         f.urn.clone(),
@@ -2332,31 +3011,43 @@ pub mod state {
         urn: &str,
         live_actual: Option<&serde_json::Value>,
     ) -> Drift {
-        match model.owned.get(urn) {
-            None => match live_actual {
-                Some(_) => Drift::Untracked,
-                None => Drift::NotManaged,
-            },
-            Some(owned) => match live_actual {
-                None => Drift::Missing,
-                Some(actual) => {
-                    let mut diffs = Vec::new();
-                    if let Some(desired) = owned.last_desired.as_object() {
-                        for (k, want) in desired {
-                            let got = actual.get(k);
-                            if got != Some(want) {
-                                diffs.push(k.clone());
-                            }
+        drift_between(model.owned.get(urn).map(|o| &o.last_desired), live_actual)
+    }
+
+    /// The drift primitive shared by the fold's [`compute_drift`] and the tool's
+    /// `report` / `adopt` paths.  Compares a last-known-desired object against a
+    /// live actual (both already normalized into the same key space):
+    ///
+    /// - both present → `InSync`, or `Modified { fields }` naming every desired
+    ///   key whose actual value differs;
+    /// - desired present, actual absent → `Missing` (we own it, it's gone);
+    /// - desired absent, actual present → `Untracked` (live, no ownership — the
+    ///   adopt-import case);
+    /// - neither → `NotManaged`.
+    pub fn drift_between(
+        desired: Option<&serde_json::Value>,
+        actual: Option<&serde_json::Value>,
+    ) -> Drift {
+        match (desired, actual) {
+            (Some(desired), Some(actual)) => {
+                let mut diffs = Vec::new();
+                if let Some(obj) = desired.as_object() {
+                    for (k, want) in obj {
+                        if actual.get(k) != Some(want) {
+                            diffs.push(k.clone());
                         }
                     }
-                    if diffs.is_empty() {
-                        Drift::InSync
-                    } else {
-                        diffs.sort();
-                        Drift::Modified { fields: diffs }
-                    }
                 }
-            },
+                if diffs.is_empty() {
+                    Drift::InSync
+                } else {
+                    diffs.sort();
+                    Drift::Modified { fields: diffs }
+                }
+            }
+            (Some(_), None) => Drift::Missing,
+            (None, Some(_)) => Drift::Untracked,
+            (None, None) => Drift::NotManaged,
         }
     }
 
@@ -2371,6 +3062,56 @@ pub mod state {
             .filter(|o| !declared.contains(&o.urn))
             .cloned()
             .collect()
+    }
+
+    /// Extract provider ownership facts from a slice of raw EHDB eventlog-tier
+    /// records (oldest→newest).  This is the pure half of the query I/O adapter
+    /// (Round 4): the caller fetches the raw eventlog tier
+    /// (`/api/ehdb/tiers/eventlog`, which carries full result payloads — unlike
+    /// the secret-free `/api/ehdb/events` projection that deliberately drops
+    /// them), and this fold pulls each step result's `provider_fact` out.  The
+    /// HTTP fetch itself is server-dependent and lives in the worker / CLI
+    /// adapter (out of scope for this pure crate); feeding the fetched records
+    /// here yields the same fact stream a converge emits.
+    ///
+    /// A `provider_fact` rides *inside* a step result payload, so the common
+    /// nesting shapes are probed: `result.data.provider_fact`,
+    /// `data.provider_fact`, and a bare top-level `provider_fact`.
+    pub fn extract_facts_from_eventlog(records: &[serde_json::Value]) -> Vec<ProviderFact> {
+        records.iter().filter_map(fact_in_record).collect()
+    }
+
+    /// Convenience: extract + fold raw eventlog-tier records into an ownership
+    /// model in one call.
+    pub fn fold_eventlog(records: &[serde_json::Value]) -> OwnershipModel {
+        fold_facts(&extract_facts_from_eventlog(records))
+    }
+
+    fn fact_in_record(record: &serde_json::Value) -> Option<ProviderFact> {
+        const PATHS: [&[&str]; 3] = [
+            &["result", "data", "provider_fact"],
+            &["data", "provider_fact"],
+            &["provider_fact"],
+        ];
+        for path in PATHS {
+            let mut cur = record;
+            let mut ok = true;
+            for key in path {
+                match cur.get(key) {
+                    Some(v) => cur = v,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Ok(fact) = serde_json::from_value::<ProviderFact>(cur.clone()) {
+                    return Some(fact);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2500,6 +3241,7 @@ mod tests {
             "provider": "google",
             "action": "google.serviceusage.services.enable",
             "dry_run": true,
+            "reconcile": "enforce",
             "input": { "project_id": "shastaratech-youtube-prod", "service_name": "youtube.googleapis.com" }
         }));
 
@@ -2550,6 +3292,7 @@ mod tests {
             "provider": "google",
             "action": "google.serviceusage.services.enable",
             "dry_run": false,
+            "reconcile": "enforce",
             "input": { "project_id": "p", "service_name": "youtube.googleapis.com" }
         }));
         let err = tool.execute(&cfg, &ctx).await.unwrap_err();
@@ -2780,6 +3523,9 @@ mod tests {
             "provider": "google",
             "action": action,
             "dry_run": false,
+            // Round 4: converge is now the explicit `enforce` policy (the default
+            // `report` changes nothing).  These tests exercise the enforce path.
+            "reconcile": "enforce",
             "input": input,
             // Fast poll so the timeout test doesn't sleep for real time.
             "poll": { "max_attempts": 3, "interval_ms": 5, "max_wait_secs": 2 },
@@ -3119,6 +3865,7 @@ mod tests {
             "provider": "google",
             "action": "google.serviceusage.services.enable",
             "dry_run": false,
+            "reconcile": "enforce",
             "endpoint": server.uri(),
             "input": { "project_id": "p", "service_name": "youtube.googleapis.com" }
         }));
@@ -3141,6 +3888,7 @@ mod tests {
             "provider": "google",
             "action": "google.cloudresourcemanager.projects.ensure",
             "dry_run": true,
+            "reconcile": "enforce",
             "stack": "shastaratech-prod",
             "input": { "project_id": "st-prod", "parent": "folders/20" }
         }));
@@ -3556,5 +4304,549 @@ mod tests {
         let orphans = detect_orphans(&model, &declared);
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].urn, "urn:b");
+    }
+
+    // ================= Round 4: reconcile policy — report / enforce / adopt ===
+
+    /// Config with `provider`/`action`/`input`/fast-poll defaults + `auth`, then
+    /// merge `extra` (reconcile / dry_run / confirm / known_desired / …).
+    fn reconcile_cfg(
+        action: &str,
+        input: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> ToolConfig {
+        let mut body = serde_json::json!({
+            "provider": "google",
+            "action": action,
+            "input": input,
+            "poll": { "max_attempts": 3, "interval_ms": 5, "max_wait_secs": 2 },
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k.as_str()] = v.clone();
+        }
+        let mut cfg = spec_config(body);
+        cfg.auth = Some(gcp_auth());
+        cfg
+    }
+
+    // ---- report (default): no cloud mutation, no state write ----
+
+    #[tokio::test]
+    async fn report_default_makes_no_cloud_mutation_and_no_state_write() {
+        // Only a GET mock is mounted.  No POST/PUT/DELETE mock exists, so any
+        // write attempt would 404 and fail the run — proving report reads only.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/st-prod", "projectId": "st-prod",
+                "parent": "folders/2", "displayName": "prod", "state": "ACTIVE", "etag": "E1"
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        // No `reconcile` key → defaults to `report`.  Known-desired says parent
+        // folders/1, live says folders/2 → modified.
+        let cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({
+                "known_desired": { "project_id": "st-prod", "parent": "folders/1", "display_name": "prod" }
+            }),
+        );
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+
+        assert_eq!(data["reconcile"], serde_json::json!("report"));
+        assert_eq!(data["changed"], serde_json::json!(false));
+        // Drift detected + reported...
+        assert_eq!(data["drift"]["drift"], serde_json::json!("modified"));
+        assert_eq!(
+            data["drift"]["fields"],
+            serde_json::json!(["parent"]),
+            "the diverged desired field is named"
+        );
+        assert_eq!(
+            data["diff"]["parent"]["desired"],
+            serde_json::json!("folders/1")
+        );
+        assert_eq!(
+            data["diff"]["parent"]["actual"],
+            serde_json::json!("folders/2")
+        );
+        // ...but NO ownership fact is written — a report changes no state.
+        assert!(
+            data.get("provider_fact").is_none(),
+            "report must NOT write an ownership fact: {data}"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_without_auth_is_undetermined_and_safe() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        // Default report, NO auth on the ToolConfig, no network reachable.
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.projects.ensure",
+            "input": { "project_id": "p", "parent": "folders/1" },
+        }));
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(data["reconcile"], serde_json::json!("report"));
+        assert_eq!(data["drift"], serde_json::json!("undetermined"));
+        assert_eq!(data["changed"], serde_json::json!(false));
+        assert!(data.get("provider_fact").is_none());
+    }
+
+    // ---- enforce: still converges like today ----
+
+    #[tokio::test]
+    async fn enforce_still_converges_like_today() {
+        // GET service DISABLED → enable POST (LRO done) → changed:true + fact.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p/services/youtube.googleapis.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/p/services/youtube.googleapis.com", "state": "DISABLED"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/p/services/youtube.googleapis.com:enable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/enable-1", "done": true,
+                "response": { "name": "projects/p/services/youtube.googleapis.com", "state": "ENABLED" }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = reconcile_cfg(
+            "google.serviceusage.services.enable",
+            serde_json::json!({ "project_id": "p", "service_name": "youtube.googleapis.com" }),
+            serde_json::json!({ "reconcile": "enforce", "dry_run": false }),
+        );
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(data["changed"], serde_json::json!(true), "enforce writes");
+        assert_eq!(
+            data["provider_fact"]["outcome"],
+            serde_json::json!("changed"),
+            "enforce records a converge fact — same as round-2"
+        );
+    }
+
+    // ---- adopt dry-run: field-by-field diff + digest ----
+
+    fn drifted_project_mock() -> serde_json::Value {
+        serde_json::json!({
+            "name": "projects/st-prod", "projectId": "st-prod",
+            "parent": "folders/2", "displayName": "renamed-in-console",
+            "state": "ACTIVE", "etag": "E1"
+        })
+    }
+
+    #[tokio::test]
+    async fn adopt_dryrun_emits_diff_and_digest() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drifted_project_mock()))
+            .mount(&server)
+            .await;
+        // NO write mock — adopt never mutates.
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({
+                "reconcile": "adopt",
+                "dry_run": true,
+                "known_desired": { "project_id": "st-prod", "parent": "folders/1", "display_name": "prod" }
+            }),
+        );
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(data["adopt"], serde_json::json!(true));
+        assert_eq!(data["dry_run"], serde_json::json!(true));
+        assert_eq!(data["changed"], serde_json::json!(false));
+        assert!(data["plan_digest"].as_str().unwrap().len() == 64);
+        assert_eq!(data["drift"]["drift"], serde_json::json!("modified"));
+        // Both diverged fields surface in the diff.
+        assert_eq!(
+            data["diff"]["parent"]["actual"],
+            serde_json::json!("folders/2")
+        );
+        assert_eq!(
+            data["diff"]["display_name"]["actual"],
+            serde_json::json!("renamed-in-console")
+        );
+        // Dry-run fact is planned intent — the fold ignores it.
+        assert_eq!(data["provider_fact"]["verb"], serde_json::json!("adopt"));
+        assert_eq!(
+            data["provider_fact"]["outcome"],
+            serde_json::json!("planned")
+        );
+    }
+
+    // ---- CORE SAFETY: adopt blind apply (no confirm) is refused ----
+
+    #[tokio::test]
+    async fn adopt_blind_apply_without_confirm_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drifted_project_mock()))
+            .mount(&server)
+            .await;
+        // No write mock — proving nothing is written.
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({ "reconcile": "adopt", "dry_run": false }), // no confirm
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m)
+                if m.contains("no `confirm`") && m.contains("blind adoptions")),
+            "an adopt apply with no confirm must be refused: {err:?}"
+        );
+    }
+
+    // ---- CORE SAFETY: adopt stale confirm digest is refused ----
+
+    #[tokio::test]
+    async fn adopt_stale_confirm_digest_is_refused() {
+        // The human reviewed a diff when the project etag was E1; by apply time
+        // the cloud drifted (etag now E2) → the live digest differs → refuse,
+        // and NO state is written.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/st-prod", "projectId": "st-prod",
+                "parent": "folders/2", "displayName": "renamed", "state": "ACTIVE", "etag": "E2"
+            })))
+            .mount(&server)
+            .await;
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+
+        // A digest computed against the *old* (E1) actual — what the human echoed.
+        let stale_resolved = ResolvedActual {
+            urn: "google:cloudresourcemanager:project:st-prod".to_string(),
+            present: true,
+            actual: serde_json::json!({
+                "project_id": "st-prod", "parent": "folders/2", "display_name": "renamed"
+            }),
+            etag: Some("E1".to_string()),
+            state: Some("ACTIVE".to_string()),
+        };
+        let stale_digest = adopt_plan_digest(
+            "google.cloudresourcemanager.projects.ensure",
+            &stale_resolved,
+        );
+
+        let cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({ "reconcile": "adopt", "dry_run": false, "confirm": stale_digest }),
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        match err {
+            ToolError::ExecutionFailed(msg) => {
+                assert!(msg.contains("REFUSED"), "names the refusal: {msg}");
+                assert!(
+                    msg.contains("changed again since the diff was reviewed"),
+                    "explains staleness: {msg}"
+                );
+                assert!(
+                    msg.contains("No state was written"),
+                    "confirms nothing was written: {msg}"
+                );
+            }
+            other => panic!("expected ExecutionFailed refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_digest_changes_when_actual_drifts() {
+        let mk = |etag: &str, parent: &str| ResolvedActual {
+            urn: "google:cloudresourcemanager:project:p".to_string(),
+            present: true,
+            actual: serde_json::json!({ "project_id": "p", "parent": parent }),
+            etag: Some(etag.to_string()),
+            state: Some("ACTIVE".to_string()),
+        };
+        let action = "google.cloudresourcemanager.projects.ensure";
+        let a = adopt_plan_digest(action, &mk("E1", "folders/1"));
+        // A drifted etag changes the digest.
+        assert_ne!(a, adopt_plan_digest(action, &mk("E2", "folders/1")));
+        // A drifted field changes the digest.
+        assert_ne!(a, adopt_plan_digest(action, &mk("E1", "folders/9")));
+        // A presence flip changes the digest.
+        let mut absent = mk("E1", "folders/1");
+        absent.present = false;
+        assert_ne!(a, adopt_plan_digest(action, &absent));
+    }
+
+    // ---- adopt of an ALREADY-OWNED resource updates last-known-desired ----
+
+    #[tokio::test]
+    async fn adopt_already_owned_updates_last_known_desired() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drifted_project_mock()))
+            .mount(&server)
+            .await;
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+
+        // 1) dry-run → digest (live actual parent folders/2).
+        let plan_cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({
+                "reconcile": "adopt", "dry_run": true, "stack": "prod",
+                "known_desired": { "project_id": "st-prod", "parent": "folders/1", "display_name": "prod" }
+            }),
+        );
+        let plan = tool.execute(&plan_cfg, &ctx).await.unwrap().data.unwrap();
+        let digest = plan["plan_digest"].as_str().unwrap().to_string();
+
+        // 2) apply with the reviewed digest → accepts actual as desired.
+        let apply_cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1" }),
+            serde_json::json!({
+                "reconcile": "adopt", "dry_run": false, "confirm": digest, "stack": "prod",
+                "known_desired": { "project_id": "st-prod", "parent": "folders/1", "display_name": "prod" }
+            }),
+        );
+        let out = tool.execute(&apply_cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(out["adopted"], serde_json::json!(true));
+        assert_eq!(
+            out["changed"],
+            serde_json::json!(false),
+            "adopt makes no cloud change"
+        );
+        assert_eq!(
+            out["import"],
+            serde_json::json!(false),
+            "this URN was already owned"
+        );
+        assert_eq!(
+            out["provider_fact"]["outcome"],
+            serde_json::json!("adopted")
+        );
+        // The new desired is the live actual (parent folders/2, renamed display).
+        assert_eq!(
+            out["provider_fact"]["desired"]["parent"],
+            serde_json::json!("folders/2")
+        );
+
+        // 3) fold [prior ensure(folders/1), this adopt(folders/2)] → owned desired UPDATED.
+        let prior = fact(
+            "google:cloudresourcemanager:project:st-prod",
+            "ensure",
+            "changed",
+            serde_json::json!({ "project_id": "st-prod", "parent": "folders/1", "display_name": "prod" }),
+        );
+        let adopt_fact: ProviderFact =
+            serde_json::from_value(out["provider_fact"].clone()).unwrap();
+        let model = fold_facts(&[prior, adopt_fact]);
+        let owned = model
+            .owned
+            .get("google:cloudresourcemanager:project:st-prod")
+            .expect("still owned after adopt");
+        assert_eq!(
+            owned.last_desired["parent"],
+            serde_json::json!("folders/2"),
+            "adopt refreshed last-known-desired to the accepted actual"
+        );
+    }
+
+    // ---- adopt of an UNTRACKED (console-created) resource → Owned (import) ----
+
+    #[tokio::test]
+    async fn adopt_untracked_transitions_to_owned() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/console-made"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/console-made", "projectId": "console-made",
+                "parent": "folders/7", "displayName": "made-in-console", "state": "ACTIVE", "etag": "Z1"
+            })))
+            .mount(&server)
+            .await;
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+
+        // No `known_desired` → the resource is untracked (created outside NoETL).
+        let plan_cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "console-made", "parent": "folders/7" }),
+            serde_json::json!({ "reconcile": "adopt", "dry_run": true, "stack": "prod" }),
+        );
+        let plan = tool.execute(&plan_cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(
+            plan["import"],
+            serde_json::json!(true),
+            "no owning fact → import"
+        );
+        assert_eq!(plan["drift"]["drift"], serde_json::json!("untracked"));
+        let digest = plan["plan_digest"].as_str().unwrap().to_string();
+
+        let apply_cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "console-made", "parent": "folders/7" }),
+            serde_json::json!({ "reconcile": "adopt", "dry_run": false, "confirm": digest, "stack": "prod" }),
+        );
+        let out = tool.execute(&apply_cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(out["import"], serde_json::json!(true));
+        assert_eq!(
+            out["provider_fact"]["outcome"],
+            serde_json::json!("adopted")
+        );
+
+        // Fold the single adopt fact → the previously-untracked URN is now Owned.
+        let adopt_fact: ProviderFact =
+            serde_json::from_value(out["provider_fact"].clone()).unwrap();
+        let model = fold_facts(&[adopt_fact]);
+        assert!(
+            model
+                .owned
+                .contains_key("google:cloudresourcemanager:project:console-made"),
+            "adopt imported the untracked resource into the ownership model"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_apply_refused_when_resource_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/ghost"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": { "code": 404, "message": "not found" }
+            })))
+            .mount(&server)
+            .await;
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = reconcile_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "ghost", "parent": "folders/1" }),
+            serde_json::json!({ "reconcile": "adopt", "dry_run": true }),
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(ref m)
+                if m.contains("nothing to adopt") && m.contains("No state was written")),
+            "adopt of an absent resource must be refused: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_requires_auth_to_plan() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.projects.ensure",
+            "reconcile": "adopt",
+            "dry_run": true,
+            "input": { "project_id": "p", "parent": "folders/1" },
+        }));
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m)
+                if m.contains("requires an explicit `auth:`") && m.contains("stale")),
+            "adopt plan without auth must be refused: {err:?}"
+        );
+    }
+
+    // ---- fold: adopt asserts ownership (import + update) ----
+
+    #[test]
+    fn fold_facts_adopt_imports_and_updates_ownership() {
+        // Import: a bare adopt fact for a never-seen URN → owned.
+        let import = fact(
+            "urn:x",
+            "adopt",
+            "adopted",
+            serde_json::json!({ "parent": "folders/7" }),
+        );
+        let m1 = fold_facts(&[import]);
+        assert_eq!(
+            m1.owned.get("urn:x").unwrap().last_desired["parent"],
+            serde_json::json!("folders/7"),
+            "adopt imports an untracked URN"
+        );
+
+        // Update: ensure(folders/1) then adopt(folders/2) → last_desired updated.
+        let ensure = fact(
+            "urn:y",
+            "ensure",
+            "changed",
+            serde_json::json!({ "parent": "folders/1" }),
+        );
+        let adopt = fact(
+            "urn:y",
+            "adopt",
+            "adopted",
+            serde_json::json!({ "parent": "folders/2" }),
+        );
+        let m2 = fold_facts(&[ensure, adopt]);
+        assert_eq!(
+            m2.owned.get("urn:y").unwrap().last_desired["parent"],
+            serde_json::json!("folders/2"),
+            "adopt refreshes last-known-desired for an owned URN"
+        );
+    }
+
+    // ---- raw-eventlog-tier adapter: extract nested provider_fact, fold ----
+
+    #[test]
+    fn extract_facts_from_eventlog_pulls_nested_fact_and_folds() {
+        use super::state::{extract_facts_from_eventlog, fold_eventlog};
+        // Three raw eventlog-tier record shapes; each carries a provider_fact
+        // inside a step result payload at a different nesting depth.
+        let records = vec![
+            serde_json::json!({
+                "event_id": 1,
+                "result": { "data": { "provider_fact": {
+                    "urn": "urn:a", "provider": "google", "service": "cloudresourcemanager",
+                    "resource_type": "project", "verb": "ensure", "stack": "prod",
+                    "desired": { "parent": "folders/1" }, "execution_id": 10, "outcome": "changed"
+                } } }
+            }),
+            serde_json::json!({
+                "event_id": 2,
+                "data": { "provider_fact": {
+                    "urn": "urn:a", "provider": "google", "service": "cloudresourcemanager",
+                    "resource_type": "project", "verb": "adopt", "stack": "prod",
+                    "desired": { "parent": "folders/2" }, "execution_id": 11, "outcome": "adopted"
+                } }
+            }),
+            // A record with no provider_fact is ignored.
+            serde_json::json!({ "event_id": 3, "result": { "data": { "note": "unrelated" } } }),
+        ];
+        let facts = extract_facts_from_eventlog(&records);
+        assert_eq!(
+            facts.len(),
+            2,
+            "two provider_facts extracted, unrelated skipped"
+        );
+
+        let model = fold_eventlog(&records);
+        assert_eq!(
+            model.owned.get("urn:a").unwrap().last_desired["parent"],
+            serde_json::json!("folders/2"),
+            "the adopt fact (newest) sets the owned desired"
+        );
     }
 }
