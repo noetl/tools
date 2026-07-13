@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.21.0](https://github.com/noetl/tools/compare/v3.20.0...v3.21.0) (2026-07-13)
+
+### Features
+
+* **provider:** add cloud provider tool kind (Google REST MVP) ([#86](https://github.com/noetl/tools/issues/86)) ([5e427fb](https://github.com/noetl/tools/commit/5e427fb8eb88d9cfbba8b26896fb3c532216c43c)), closes [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189)
+
 ## [3.20.0](https://github.com/noetl/tools/compare/v3.19.3...v3.20.0) (2026-07-13)
 
 ### Features
