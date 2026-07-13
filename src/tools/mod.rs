@@ -17,6 +17,19 @@
 
 mod artifact;
 mod container;
+// The DuckDB tool implementation compiles the bundled DuckDB C++ amalgamation
+// (`libduckdb-sys`) and is therefore gated behind the non-default
+// `duckdb-integration` feature (noetl/ai-meta#185), so builds that never run
+// duckdb steps skip the multi-hour C++ compile.  With the feature OFF the stub
+// is compiled instead: `DuckdbTool` keeps its full public surface but its
+// dispatch path returns a clear opt-in error, so `ducklake`, `transfer`, the
+// registry, and every downstream consumer still compile unchanged.  Runtime
+// consumers of the duckdb kinds (noetl-worker, noetl-cli) enable the feature.
+#[cfg(feature = "duckdb-integration")]
+#[path = "duckdb.rs"]
+mod duckdb;
+#[cfg(not(feature = "duckdb-integration"))]
+#[path = "duckdb_stub.rs"]
 mod duckdb;
 mod ducklake;
 mod http;

@@ -956,6 +956,9 @@ mod tests {
         assert!(tasks[1].contains_key("finish"));
     }
 
+    // Dispatches a real `duckdb` step, so it needs the DuckDB engine compiled
+    // in — gated behind the `duckdb-integration` feature (noetl/ai-meta#185).
+    #[cfg(feature = "duckdb-integration")]
     #[tokio::test]
     async fn test_task_sequence_duckdb_multi_statement() {
         // Regression (noetl/ai-meta#54): duckdb_test.yaml wraps a duckdb
