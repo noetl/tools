@@ -11,6 +11,8 @@
 //! - `transfer` - Transfer data between sources
 //! - `script` - Execute scripts as Kubernetes jobs
 //! - `mcp` - MCP (Model Context Protocol) JSON-RPC bridge
+//! - `provider` - Cloud provider operations (Google Cloud REST APIs; AWS/Azure
+//!   later) with plan/apply modes and explicit-auth-for-mutations
 //! - `subscription` - Bounded-drain message subscription poll (NATS /
 //!   Pub/Sub / Kafka) behind the [`source`] source-client abstraction
 //!   (noetl/ai-meta#90 Phase 1)
@@ -38,6 +40,7 @@ mod nats;
 mod noop;
 mod playbook;
 mod postgres;
+mod provider;
 mod python;
 mod result_fetch;
 mod rhai;
@@ -64,6 +67,7 @@ pub use self::nats::NatsTool;
 pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
 pub use self::postgres::PostgresTool;
+pub use self::provider::ProviderTool;
 pub use self::python::PythonTool;
 pub use self::result_fetch::ResultFetchTool;
 pub use self::rhai::RhaiTool;
@@ -91,6 +95,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(TransferTool::new());
     registry.register(ScriptTool::new());
     registry.register(PlaybookTool::new());
+    registry.register(ProviderTool::new());
     registry.register(NoopTool::new());
     registry.register(TaskSequenceTool::new());
     registry.register(ResultFetchTool::new());

@@ -404,6 +404,7 @@ mod tests {
             "artifact",
             "result_fetch",
             "playbook",
+            "provider",
             "task_sequence",
             // an unknown kind is treated as side-effecting (safe default).
             "some_future_kind",
