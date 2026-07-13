@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.22.0](https://github.com/noetl/tools/compare/v3.21.0...v3.22.0) (2026-07-13)
+
+### Features
+
+* **provider:** apply-mode GET-first converge + bounded LRO polling ([#87](https://github.com/noetl/tools/issues/87)) ([3c8a494](https://github.com/noetl/tools/commit/3c8a4942fa9af2a1040b34d32dbc0acb5ee1df0e)), closes [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189) [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189)
+
 ## [3.21.0](https://github.com/noetl/tools/compare/v3.20.0...v3.21.0) (2026-07-13)
 
 ### Features
