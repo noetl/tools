@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.24.0](https://github.com/noetl/tools/compare/v3.23.0...v3.24.0) (2026-07-13)
+
+### Features
+
+* **provider:** reconcile policy (report/enforce/adopt) + confirm-gated drift adoption ([#89](https://github.com/noetl/tools/issues/89)) ([40ffb63](https://github.com/noetl/tools/commit/40ffb6371ce2a33c27442dfb888cfcf3621b8c9a)), closes [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189) [noetl/ai-meta#189](https://github.com/noetl/ai-meta/issues/189)
+
 ## [3.23.0](https://github.com/noetl/tools/compare/v3.22.0...v3.23.0) (2026-07-13)
 
 ### Features
