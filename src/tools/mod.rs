@@ -68,6 +68,9 @@ pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
 pub use self::postgres::PostgresTool;
 pub use self::provider::ProviderTool;
+/// Provider ownership / drift / orphan projection (Fork 1) — the pure fold over
+/// the provider event stream.  Consumed by the EHDB-backed state adapter.
+pub use self::provider::state as provider_state;
 pub use self::python::PythonTool;
 pub use self::result_fetch::ResultFetchTool;
 pub use self::rhai::RhaiTool;

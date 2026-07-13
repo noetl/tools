@@ -214,6 +214,67 @@ impl Default for ApiEndpoints {
     }
 }
 
+impl ApiEndpoints {
+    /// Resolve the endpoints from an optional config-level override.  With no
+    /// override the real Google hosts are used.  A base-URL override derives the
+    /// three service URLs by appending the same version segments the real hosts
+    /// carry (`/v3` for CRM, `/v1` for billing + service usage) — this is the
+    /// exact shape the wiremock/emulator tests point at, so a playbook validated
+    /// offline exercises the identical URL construction as production.
+    fn resolve(override_cfg: Option<&EndpointOverride>) -> Self {
+        match override_cfg {
+            None => Self::default(),
+            Some(EndpointOverride::Base(base)) => {
+                let base = base.trim_end_matches('/');
+                Self {
+                    crm: format!("{base}/v3"),
+                    billing: format!("{base}/v1"),
+                    serviceusage: format!("{base}/v1"),
+                }
+            }
+            Some(EndpointOverride::PerService {
+                crm,
+                billing,
+                serviceusage,
+            }) => {
+                let d = ApiEndpoints::default();
+                Self {
+                    crm: crm.clone().unwrap_or(d.crm),
+                    billing: billing.clone().unwrap_or(d.billing),
+                    serviceusage: serviceusage.clone().unwrap_or(d.serviceusage),
+                }
+            }
+        }
+    }
+}
+
+/// Config-level API endpoint override.  **For testing / emulators only** — it
+/// points the tool at a mock server (wiremock) or a local Google API emulator so
+/// a playbook can be validated offline in `noetl exec --runtime local` without a
+/// single live cloud call.  Never set this against a real workload.
+///
+/// Two shapes:
+/// - a single base URL string (`endpoint: http://127.0.0.1:8089`) → the three
+///   service URLs are derived by appending `/v3` (CRM) and `/v1` (billing,
+///   service usage), matching the real hosts' version segments;
+/// - an object with any of `crm` / `billing` / `serviceusage` for full control
+///   (unset services fall back to the real Google host).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EndpointOverride {
+    /// Single base URL; service URLs derived by appending version segments.
+    Base(String),
+    /// Explicit per-service override; unset services use the real host.
+    PerService {
+        #[serde(default)]
+        crm: Option<String>,
+        #[serde(default)]
+        billing: Option<String>,
+        #[serde(default)]
+        serviceusage: Option<String>,
+    },
+}
+
 /// Parsed `kind: provider` tool config (deserialized from the flattened,
 /// template-rendered tool block).
 #[derive(Debug, Clone, Deserialize)]
@@ -251,6 +312,30 @@ pub struct ProviderSpec {
     /// Bounds for the inline long-running-Operation poll (apply mode).
     #[serde(default)]
     pub poll: PollConfig,
+
+    /// Config-level API endpoint override — **testing / emulators only**.  Lets
+    /// a playbook be validated offline against wiremock or a Google API emulator
+    /// in `noetl exec --runtime local` without any live cloud call.  See
+    /// [`EndpointOverride`].
+    #[serde(default)]
+    pub endpoint: Option<EndpointOverride>,
+
+    /// Ownership / stack label (Fork 1).  Scopes the resource-ownership
+    /// projection so drift + orphan detection can answer "what does THIS stack
+    /// own".  When unset, ownership facts are still emitted but carry an
+    /// `<unscoped>` stack — set an explicit label to make orphan detection
+    /// meaningful across playbook runs.
+    #[serde(default)]
+    pub stack: Option<String>,
+
+    /// Destroy confirmation digest (Fork 2).  Required to *apply* a destroy
+    /// action (`dry_run: false` on a `*.delete` / `*.disable` / `*.remove_binding`
+    /// verb).  Must equal the `plan_digest` a human reviewed from the destroy
+    /// dry-run.  A blind apply (no `confirm`) is refused; a stale `confirm` (the
+    /// live plan no longer matches the reviewed digest) is refused.  Ignored by
+    /// non-destroy actions.
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 fn default_dry_run() -> bool {
@@ -357,6 +442,13 @@ impl PlannedRequest {
             body,
         }
     }
+    fn delete(url: String) -> Self {
+        Self {
+            method: Method::DELETE,
+            url,
+            body: None,
+        }
+    }
 
     /// Redacted JSON echo for the `would_call` plan (no credentials present).
     fn to_echo(&self) -> serde_json::Value {
@@ -399,6 +491,37 @@ enum ApplyKind {
         set_url: String,
         role: String,
         member: String,
+    },
+    /// Confirm-gated destroy (Fork 2).  Resolved against live state to produce a
+    /// digest-confirmable plan; apply requires a matching `confirm` digest.
+    Destroy(DestroyKind),
+}
+
+/// A destroy verb, resolved against live state before any deletion.  Each kind
+/// targets exactly **one explicit** resource — there are no wildcard, glob, or
+/// bulk deletes.  The resolve step reads live state (requires `auth:` even in
+/// dry-run) so the emitted plan digest reflects what would *actually* be deleted
+/// right now; a `confirm` digest that no longer matches the live-resolved plan
+/// is refused (stale-review guard).
+#[derive(Debug, Clone)]
+enum DestroyKind {
+    /// DELETE an ACTIVE folder resolved by `display_name` under `parent` (LRO).
+    DeleteFolder {
+        parent: String,
+        display_name: String,
+    },
+    /// DELETE a project resolved by id (LRO).
+    DeleteProject { project_id: String },
+    /// `services/{service}:disable` an ENABLED service.
+    DisableService { project: String, service: String },
+    /// `getIamPolicy` → remove `{role, member}` if present → `setIamPolicy`.
+    RemoveIamBinding {
+        get_url: String,
+        set_url: String,
+        role: String,
+        member: String,
+        /// Human-facing resource label for the plan / URN (e.g. `organizations/1`).
+        resource: String,
     },
 }
 
@@ -685,6 +808,114 @@ impl ProviderTool {
                     apply: ApplyKind::EnsureService { project, service },
                 })
             }
+
+            // ---- destroy verbs (Fork 2 — confirm-gated; resolved against live state) ----
+            "google.cloudresourcemanager.folders.delete" => {
+                let parent = require(&get("parent"), "parent", action)?;
+                let display_name = require(
+                    &get("display_name").or_else(|| get("displayName")),
+                    "display_name",
+                    action,
+                )?;
+                reject_wildcard(&display_name, "display_name", action)?;
+                Ok(ActionPlan {
+                    // Echo request is illustrative; the real target folders/<id> is
+                    // resolved live (the folder id is not known until the list read).
+                    request: PlannedRequest::delete(format!("{crm}/folders/<resolved>")),
+                    mutates: true,
+                    apply: ApplyKind::Destroy(DestroyKind::DeleteFolder {
+                        parent,
+                        display_name,
+                    }),
+                })
+            }
+            "google.cloudresourcemanager.projects.delete" => {
+                let project = require(
+                    &get("project_id").or_else(|| get("projectId")),
+                    "project_id",
+                    action,
+                )?;
+                reject_wildcard(&project, "project_id", action)?;
+                Ok(ActionPlan {
+                    request: PlannedRequest::delete(format!("{crm}/projects/{project}")),
+                    mutates: true,
+                    apply: ApplyKind::Destroy(DestroyKind::DeleteProject {
+                        project_id: project,
+                    }),
+                })
+            }
+            "google.serviceusage.services.disable" => {
+                let project = require(
+                    &get("project_id").or_else(|| get("projectId")),
+                    "project_id",
+                    action,
+                )?;
+                let service = require(
+                    &get("service_name").or_else(|| get("service")),
+                    "service_name",
+                    action,
+                )?;
+                reject_wildcard(&service, "service_name", action)?;
+                Ok(ActionPlan {
+                    request: PlannedRequest::post(
+                        format!("{serviceusage}/projects/{project}/services/{service}:disable"),
+                        Some(serde_json::json!({})),
+                    ),
+                    mutates: true,
+                    apply: ApplyKind::Destroy(DestroyKind::DisableService { project, service }),
+                })
+            }
+            "google.cloudresourcemanager.organizations.iam.remove_binding" => {
+                let org = require(
+                    &get("organization").or_else(|| org_from_input(input)),
+                    "organization",
+                    action,
+                )?;
+                let role = require(&get("role"), "role", action)?;
+                let member = require(&get("member"), "member", action)?;
+                reject_wildcard(&member, "member", action)?;
+                reject_wildcard(&role, "role", action)?;
+                Ok(ActionPlan {
+                    request: PlannedRequest::post(
+                        format!("{crm}/{org}:setIamPolicy"),
+                        Some(serde_json::json!({})),
+                    ),
+                    mutates: true,
+                    apply: ApplyKind::Destroy(DestroyKind::RemoveIamBinding {
+                        get_url: format!("{crm}/{org}:getIamPolicy"),
+                        set_url: format!("{crm}/{org}:setIamPolicy"),
+                        role,
+                        member,
+                        resource: org,
+                    }),
+                })
+            }
+            "google.cloudbilling.billing_accounts.iam.remove_binding" => {
+                let ba = require(
+                    &get("billing_account").or_else(|| get("billingAccount")),
+                    "billing_account",
+                    action,
+                )?;
+                let role = require(&get("role"), "role", action)?;
+                let member = require(&get("member"), "member", action)?;
+                reject_wildcard(&member, "member", action)?;
+                reject_wildcard(&role, "role", action)?;
+                Ok(ActionPlan {
+                    request: PlannedRequest::post(
+                        format!("{billing}/{ba}:setIamPolicy"),
+                        Some(serde_json::json!({})),
+                    ),
+                    mutates: true,
+                    apply: ApplyKind::Destroy(DestroyKind::RemoveIamBinding {
+                        get_url: format!("{billing}/{ba}:getIamPolicy"),
+                        set_url: format!("{billing}/{ba}:setIamPolicy"),
+                        role,
+                        member,
+                        resource: ba,
+                    }),
+                })
+            }
+
             other => Err(ToolError::Configuration(format!(
                 "unknown google provider action: {other:?}"
             ))),
@@ -780,6 +1011,11 @@ impl ProviderTool {
                 self.apply_ensure_iam_binding(get_url, set_url, role, member, creds)
                     .await
             }
+            // Destroy is confirm-gated and dispatched via `run_destroy`, never
+            // through the ensure/read apply path.
+            ApplyKind::Destroy(_) => Err(ToolError::ExecutionFailed(
+                "internal error: destroy action reached the ensure apply path".to_string(),
+            )),
         }
     }
 
@@ -1057,6 +1293,32 @@ impl Tool for ProviderTool {
         let start = std::time::Instant::now();
         let spec = self.parse_spec(config, ctx)?;
 
+        // Config-level endpoint override (testing / emulators only): dispatch on
+        // a tool instance pointed at the override so every URL construction is
+        // exercised exactly as production, but against a mock / emulator.  With
+        // no override this is `self` — production hits the real Google hosts.
+        let endpoint_override = spec.endpoint.clone();
+        match endpoint_override {
+            None => self.run_spec(config, ctx, spec, start).await,
+            Some(over) => {
+                let scoped = ProviderTool::with_endpoints(ApiEndpoints::resolve(Some(&over)));
+                scoped.run_spec(config, ctx, spec, start).await
+            }
+        }
+    }
+}
+
+impl ProviderTool {
+    /// Dispatch a parsed spec (post endpoint-scoping).  Splits into the
+    /// destroy-gated path (Fork 2) and the ensure/read path, both of which emit
+    /// an ownership fact (Fork 1) for mutating actions.
+    async fn run_spec(
+        &self,
+        config: &ToolConfig,
+        ctx: &ExecutionContext,
+        spec: ProviderSpec,
+        start: std::time::Instant,
+    ) -> Result<ToolResult, ToolError> {
         // Cross-cloud seam: only Google is implemented in round 1.
         if spec.provider != ProviderFamily::Google {
             return Err(ToolError::Configuration(format!(
@@ -1079,12 +1341,24 @@ impl Tool for ProviderTool {
             provider = "google",
             action = %action,
             dry_run = spec.dry_run,
+            destroy = matches!(plan.apply, ApplyKind::Destroy(_)),
         );
         let _guard = span.enter();
 
+        // ---- Confirm-gated destroy (Fork 2) ----
+        if let ApplyKind::Destroy(kind) = &plan.apply {
+            return self
+                .run_destroy(&action, kind, &spec, config, ctx, backend, start)
+                .await;
+        }
+
+        let stack = spec.stack.as_deref().unwrap_or("<unscoped>");
+        let (service, resource_type) = service_and_type(&plan.apply);
+        let urn = urn_for_apply(&plan.apply);
+
         // ---- Plan / dry-run: no credentials, no network. ----
         if spec.dry_run {
-            let data = serde_json::json!({
+            let mut data = serde_json::json!({
                 "provider": "google",
                 "action": action,
                 "dry_run": true,
@@ -1094,6 +1368,20 @@ impl Tool for ProviderTool {
                 "would_call": plan.request.to_echo(),
                 "input": redact_sensitive(&spec.input),
             });
+            if plan.mutates {
+                if let Some(urn) = urn {
+                    data["provider_fact"] = build_fact(
+                        &urn,
+                        service,
+                        resource_type,
+                        "ensure",
+                        stack,
+                        redact_sensitive(&spec.input),
+                        ctx.execution_id,
+                        "planned",
+                    );
+                }
+            }
             return Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64));
         }
 
@@ -1109,7 +1397,7 @@ impl Tool for ProviderTool {
         let creds = self.auth_resolver.resolve(auth_config, ctx).await?;
         let (resource, changed) = self.apply_action(&plan, &creds, &spec.poll).await?;
 
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "provider": "google",
             "action": action,
             "dry_run": false,
@@ -1121,7 +1409,369 @@ impl Tool for ProviderTool {
             "converge": apply_strategy_label(&plan.apply),
             "resource": resource,
         });
+        if plan.mutates {
+            if let Some(urn) = urn {
+                let outcome = if changed { "changed" } else { "noop" };
+                data["provider_fact"] = build_fact(
+                    &urn,
+                    service,
+                    resource_type,
+                    "ensure",
+                    stack,
+                    redact_sensitive(&spec.input),
+                    ctx.execution_id,
+                    outcome,
+                );
+            }
+        }
         Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64))
+    }
+
+    /// Confirm-gated destroy dispatch (Fork 2).
+    ///
+    /// Destroy needs `auth:` even to *plan*, because the plan digest must be
+    /// resolved against live state — that is the only way a stale confirmation
+    /// (cloud drifted since review) can be detected and refused.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_destroy(
+        &self,
+        action: &str,
+        kind: &DestroyKind,
+        spec: &ProviderSpec,
+        config: &ToolConfig,
+        ctx: &ExecutionContext,
+        backend: &str,
+        start: std::time::Instant,
+    ) -> Result<ToolResult, ToolError> {
+        let stack = spec.stack.as_deref().unwrap_or("<unscoped>");
+        let (service, resource_type) = service_and_type(&ApplyKind::Destroy(kind.clone()));
+
+        let auth_config = config.auth.as_ref().ok_or_else(|| {
+            ToolError::Configuration(format!(
+                "destroy action {action:?} requires an explicit `auth:` block even to plan: \
+                 the deletion plan is resolved against live cloud state so a stale \
+                 confirmation can be refused. Add an `auth:` block (dry_run:true still \
+                 performs no deletion — only the read needed to resolve the plan)."
+            ))
+        })?;
+        let creds = self.auth_resolver.resolve(auth_config, ctx).await?;
+
+        // Resolve the plan against live state → the confirmable digest.
+        let resolved = self.resolve_destroy(action, kind, &creds).await?;
+        let digest = destroy_plan_digest(action, &resolved);
+        let urn = resolved.urn.clone();
+
+        // ---- Destroy dry-run: emit the explicit plan + digest for review. ----
+        if spec.dry_run {
+            let data = serde_json::json!({
+                "provider": "google",
+                "action": action,
+                "dry_run": true,
+                "changed": false,
+                "destroy": true,
+                "backend": backend,
+                "converge": "destroy",
+                "plan_digest": digest,
+                "plan": resolved.to_plan_echo(),
+                "present": resolved.present,
+                "confirm_hint": "review the plan above, then re-run with dry_run:false and \
+                                 confirm:<plan_digest> to apply this exact reviewed deletion. \
+                                 If the cloud state changes before you apply, the digest will \
+                                 no longer match and the apply will be refused.",
+                "provider_fact": build_fact(
+                    &urn, service, resource_type, "delete", stack,
+                    serde_json::Value::Null, ctx.execution_id, "planned",
+                ),
+            });
+            return Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64));
+        }
+
+        // ---- Destroy apply: require a confirm digest bound to THIS live plan. ----
+        let confirm = spec.confirm.as_deref().ok_or_else(|| {
+            ToolError::Configuration(format!(
+                "destroy apply REFUSED for {urn}: no `confirm` digest supplied. A destroy \
+                 apply must echo the `plan_digest` from a reviewed dry-run — blind applies are \
+                 not permitted. Run dry_run:true first, review the plan, then re-run with \
+                 confirm:<plan_digest>. No deletion was performed."
+            ))
+        })?;
+        if confirm != digest {
+            return Err(ToolError::ExecutionFailed(format!(
+                "destroy apply REFUSED for {urn}: the supplied confirm digest ({confirm}) does \
+                 not match the live-resolved plan digest ({digest}). The cloud state changed \
+                 since the plan was reviewed (or the confirm value is wrong) — re-run \
+                 dry_run:true, review the fresh plan, and confirm its new digest. No deletion \
+                 was performed."
+            )));
+        }
+
+        // Digest matched.  If the resource is already absent, the reviewed plan
+        // itself was a no-op deletion — honor it as such (idempotent).
+        if !resolved.present {
+            let data = serde_json::json!({
+                "provider": "google",
+                "action": action,
+                "dry_run": false,
+                "changed": false,
+                "destroy": true,
+                "already_absent": true,
+                "backend": backend,
+                "converge": "destroy",
+                "resource": serde_json::Value::Null,
+                "provider_fact": build_fact(
+                    &urn, service, resource_type, "delete", stack,
+                    serde_json::Value::Null, ctx.execution_id, "absent",
+                ),
+            });
+            return Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64));
+        }
+
+        // Execute the resolved deletion.
+        let (resource, changed) = self
+            .execute_destroy(&resolved, kind, &creds, &spec.poll)
+            .await?;
+        let data = serde_json::json!({
+            "provider": "google",
+            "action": action,
+            "dry_run": false,
+            "changed": changed,
+            "destroy": true,
+            "backend": backend,
+            "converge": "destroy",
+            "resource": resource,
+            "provider_fact": build_fact(
+                &urn, service, resource_type, "delete", stack,
+                serde_json::Value::Null, ctx.execution_id, "deleted",
+            ),
+        });
+        Ok(ToolResult::success(data).with_duration(start.elapsed().as_millis() as u64))
+    }
+
+    /// Resolve a destroy target against live cloud state.  Reads only — issues no
+    /// deletion.  Refuses an ambiguous target (a folder display-name matching
+    /// more than one ACTIVE folder is not "explicit").
+    async fn resolve_destroy(
+        &self,
+        action: &str,
+        kind: &DestroyKind,
+        creds: &crate::auth::AuthCredentials,
+    ) -> Result<ResolvedDestroy, ToolError> {
+        let urn = urn_for_destroy(kind);
+        match kind {
+            DestroyKind::DeleteFolder {
+                parent,
+                display_name,
+            } => {
+                let list = self
+                    .execute_request(
+                        &PlannedRequest::get(format!(
+                            "{}/folders?parent={}",
+                            self.endpoints.crm,
+                            urlencode(parent)
+                        )),
+                        creds,
+                    )
+                    .await?;
+                let matches = active_folders_named(&list, display_name);
+                if matches.len() > 1 {
+                    return Err(ToolError::Configuration(format!(
+                        "destroy action {action:?} is ambiguous: {} ACTIVE folders match \
+                         display_name {display_name:?} under {parent}. Destroy targets must \
+                         resolve to exactly one explicit resource — no bulk deletes.",
+                        matches.len()
+                    )));
+                }
+                match matches.into_iter().next() {
+                    None => Ok(ResolvedDestroy {
+                        urn,
+                        resolved_name: "<absent>".to_string(),
+                        etag: None,
+                        state: None,
+                        present: false,
+                        request: PlannedRequest::delete(format!(
+                            "{}/folders/<absent>",
+                            self.endpoints.crm
+                        )),
+                    }),
+                    Some(folder) => {
+                        let name = folder
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Ok(ResolvedDestroy {
+                            urn,
+                            resolved_name: name.clone(),
+                            etag: folder
+                                .get("etag")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            state: folder
+                                .get("state")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            present: true,
+                            request: PlannedRequest::delete(format!(
+                                "{}/{name}",
+                                self.endpoints.crm
+                            )),
+                        })
+                    }
+                }
+            }
+            DestroyKind::DeleteProject { project_id } => {
+                let (status, body) = self
+                    .send(
+                        &PlannedRequest::get(format!(
+                            "{}/projects/{project_id}",
+                            self.endpoints.crm
+                        )),
+                        creds,
+                    )
+                    .await?;
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(ResolvedDestroy {
+                        urn,
+                        resolved_name: "<absent>".to_string(),
+                        etag: None,
+                        state: None,
+                        present: false,
+                        request: PlannedRequest::delete(format!(
+                            "{}/projects/{project_id}",
+                            self.endpoints.crm
+                        )),
+                    });
+                }
+                if !status.is_success() {
+                    return Err(ToolError::Http(format!(
+                        "google API {} resolving destroy target projects/{project_id}: {}",
+                        status.as_u16(),
+                        redact_sensitive(&body)
+                    )));
+                }
+                Ok(ResolvedDestroy {
+                    urn,
+                    resolved_name: format!("projects/{project_id}"),
+                    etag: body.get("etag").and_then(|v| v.as_str()).map(String::from),
+                    state: body.get("state").and_then(|v| v.as_str()).map(String::from),
+                    present: true,
+                    request: PlannedRequest::delete(format!(
+                        "{}/projects/{project_id}",
+                        self.endpoints.crm
+                    )),
+                })
+            }
+            DestroyKind::DisableService { project, service } => {
+                let current = self
+                    .execute_request(
+                        &PlannedRequest::get(format!(
+                            "{}/projects/{project}/services/{service}",
+                            self.endpoints.serviceusage
+                        )),
+                        creds,
+                    )
+                    .await?;
+                let state = current
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("STATE_UNSPECIFIED");
+                let present = state == "ENABLED";
+                Ok(ResolvedDestroy {
+                    urn,
+                    resolved_name: format!("projects/{project}/services/{service}"),
+                    etag: None,
+                    state: Some(state.to_string()),
+                    present,
+                    request: PlannedRequest::post(
+                        format!(
+                            "{}/projects/{project}/services/{service}:disable",
+                            self.endpoints.serviceusage
+                        ),
+                        Some(serde_json::json!({})),
+                    ),
+                })
+            }
+            DestroyKind::RemoveIamBinding {
+                get_url,
+                set_url,
+                role,
+                member,
+                ..
+            } => {
+                let policy = self
+                    .execute_request(
+                        &PlannedRequest::post(get_url.clone(), Some(serde_json::json!({}))),
+                        creds,
+                    )
+                    .await?;
+                let present = binding_present(&policy, role, member);
+                Ok(ResolvedDestroy {
+                    urn,
+                    resolved_name: format!("{role} → {member}"),
+                    etag: policy
+                        .get("etag")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    state: Some(if present { "bound" } else { "absent" }.to_string()),
+                    present,
+                    request: PlannedRequest::post(set_url.clone(), Some(serde_json::json!({}))),
+                })
+            }
+        }
+    }
+
+    /// Execute a resolved deletion (only reached after the digest matched and the
+    /// resource is present).  Returns `(resource, changed)`.
+    async fn execute_destroy(
+        &self,
+        resolved: &ResolvedDestroy,
+        kind: &DestroyKind,
+        creds: &crate::auth::AuthCredentials,
+        poll: &PollConfig,
+    ) -> Result<(serde_json::Value, bool), ToolError> {
+        match kind {
+            DestroyKind::DeleteFolder { .. } | DestroyKind::DeleteProject { .. } => {
+                let op = self.execute_request(&resolved.request, creds).await?;
+                let resource = self.await_operation(op, creds, poll).await?;
+                Ok((resource, true))
+            }
+            DestroyKind::DisableService { .. } => {
+                // Disable returns an LRO on serviceusage; poll it to done.
+                let op = self.execute_request(&resolved.request, creds).await?;
+                let resource = self.await_operation(op, creds, poll).await?;
+                Ok((resource, true))
+            }
+            DestroyKind::RemoveIamBinding {
+                get_url,
+                set_url,
+                role,
+                member,
+                ..
+            } => {
+                // Read-modify-write: re-read the policy (preserving etag) and
+                // write it back without the {role, member} binding.
+                let policy = self
+                    .execute_request(
+                        &PlannedRequest::post(get_url.clone(), Some(serde_json::json!({}))),
+                        creds,
+                    )
+                    .await?;
+                if !binding_present(&policy, role, member) {
+                    return Ok((policy, false));
+                }
+                let new_policy = remove_binding(&policy, role, member);
+                let updated = self
+                    .execute_request(
+                        &PlannedRequest::post(
+                            set_url.clone(),
+                            Some(serde_json::json!({ "policy": new_policy })),
+                        ),
+                        creds,
+                    )
+                    .await?;
+                Ok((updated, true))
+            }
+        }
     }
 }
 
@@ -1137,6 +1787,7 @@ fn apply_strategy_label(apply: &ApplyKind) -> &'static str {
         ApplyKind::EnsureService { .. } => "ensure_service",
         ApplyKind::EnsureBillingLink { .. } => "ensure_billing_link",
         ApplyKind::EnsureIamBinding { .. } => "ensure_iam_binding",
+        ApplyKind::Destroy(_) => "destroy",
     }
 }
 
@@ -1218,6 +1869,86 @@ fn upsert_binding(policy: &serde_json::Value, role: &str, member: &str) -> serde
     }
 
     out
+}
+
+/// Return a copy of `policy` with the `{role, member}` grant removed — dropping
+/// the member from the role's binding, and dropping the binding entirely if it
+/// becomes empty.  Preserves `etag` and every other binding for a minimal,
+/// optimistic-concurrency-safe `setIamPolicy`.  The inverse of [`upsert_binding`].
+fn remove_binding(policy: &serde_json::Value, role: &str, member: &str) -> serde_json::Value {
+    let mut out = policy.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    let Some(bindings) = obj.get_mut("bindings").and_then(|b| b.as_array_mut()) else {
+        return out;
+    };
+    for binding in bindings.iter_mut() {
+        if binding.get("role").and_then(|v| v.as_str()) == Some(role) {
+            if let Some(members) = binding.get_mut("members").and_then(|m| m.as_array_mut()) {
+                members.retain(|m| m.as_str() != Some(member));
+            }
+        }
+    }
+    // Drop any binding whose members list is now empty.
+    bindings.retain(|b| {
+        b.get("members")
+            .and_then(|m| m.as_array())
+            .map(|m| !m.is_empty())
+            .unwrap_or(true)
+    });
+    out
+}
+
+/// All ACTIVE folders in a `folders.list` response matching `display_name`.
+/// A folder with no `state` field is treated as ACTIVE (some API projections
+/// omit it).  Used by destroy resolution to detect an ambiguous (>1) match.
+fn active_folders_named(list: &serde_json::Value, display_name: &str) -> Vec<serde_json::Value> {
+    list.get("folders")
+        .and_then(|f| f.as_array())
+        .map(|folders| {
+            folders
+                .iter()
+                .filter(|f| {
+                    let name_matches =
+                        f.get("displayName").and_then(|v| v.as_str()) == Some(display_name);
+                    let active = match f.get("state").and_then(|v| v.as_str()) {
+                        Some(s) => s == "ACTIVE",
+                        None => true,
+                    };
+                    name_matches && active
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the secret-free ownership fact embedded in a converge result and later
+/// folded by the EHDB ownership projection (Fork 1).  `desired` is already
+/// redacted; the fact carries only resource identity + desired spec + outcome.
+#[allow(clippy::too_many_arguments)]
+fn build_fact(
+    urn: &str,
+    service: &str,
+    resource_type: &str,
+    verb: &str,
+    stack: &str,
+    desired: serde_json::Value,
+    execution_id: i64,
+    outcome: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "urn": urn,
+        "provider": "google",
+        "service": service,
+        "resource_type": resource_type,
+        "verb": verb,
+        "stack": stack,
+        "desired": desired,
+        "execution_id": execution_id,
+        "outcome": outcome,
+    })
 }
 
 /// Extract the pollable operation name (`operations/...`) from an envelope.
@@ -1324,6 +2055,322 @@ pub fn redact_sensitive(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(redact_sensitive).collect())
         }
         other => other.clone(),
+    }
+}
+
+/// Reject a destroy target that carries a wildcard / glob metacharacter.  There
+/// are **no** bulk / wildcard deletes — every destroy target is an explicit,
+/// literal resource identifier.
+fn reject_wildcard(value: &str, field: &str, action: &str) -> Result<(), ToolError> {
+    if value.contains('*')
+        || value.contains('?')
+        || value.contains('[')
+        || value.contains(']')
+        || value.trim().is_empty()
+    {
+        return Err(ToolError::Configuration(format!(
+            "provider destroy action {action:?} refuses field {field:?} value {value:?}: \
+             destroy targets must be explicit literal identifiers — no wildcard, glob, or \
+             bulk deletes are permitted."
+        )));
+    }
+    Ok(())
+}
+
+/// Resource URN for the ownership projection — a stable identity derived from
+/// the *declared* desired identity (not the post-create resource id, which is
+/// unknown at plan time).  Same shape for an ensure and its matching delete so
+/// the fold links create → drift → orphan → destroy for one resource.
+fn urn_for_apply(apply: &ApplyKind) -> Option<String> {
+    match apply {
+        ApplyKind::Single => None,
+        ApplyKind::EnsureFolder {
+            parent,
+            display_name,
+        } => Some(format!(
+            "google:cloudresourcemanager:folder:{parent}/{display_name}"
+        )),
+        ApplyKind::EnsureProject { project_id, .. } => {
+            Some(format!("google:cloudresourcemanager:project:{project_id}"))
+        }
+        ApplyKind::EnsureService { project, service } => {
+            Some(format!("google:serviceusage:service:{project}/{service}"))
+        }
+        ApplyKind::EnsureBillingLink { project, .. } => {
+            Some(format!("google:cloudbilling:billing-link:{project}"))
+        }
+        ApplyKind::EnsureIamBinding {
+            get_url,
+            role,
+            member,
+            ..
+        } => Some(format!("google:iam:binding:{get_url}/{role}/{member}")),
+        ApplyKind::Destroy(kind) => Some(urn_for_destroy(kind)),
+    }
+}
+
+fn urn_for_destroy(kind: &DestroyKind) -> String {
+    match kind {
+        DestroyKind::DeleteFolder {
+            parent,
+            display_name,
+        } => format!("google:cloudresourcemanager:folder:{parent}/{display_name}"),
+        DestroyKind::DeleteProject { project_id } => {
+            format!("google:cloudresourcemanager:project:{project_id}")
+        }
+        DestroyKind::DisableService { project, service } => {
+            format!("google:serviceusage:service:{project}/{service}")
+        }
+        DestroyKind::RemoveIamBinding {
+            resource,
+            role,
+            member,
+            ..
+        } => format!("google:iam:binding:{resource}/{role}/{member}"),
+    }
+}
+
+/// The `(service, resource_type)` pair for a URN, for the ownership fact.
+fn service_and_type(apply: &ApplyKind) -> (&'static str, &'static str) {
+    match apply {
+        ApplyKind::Single => ("", ""),
+        ApplyKind::EnsureFolder { .. } => ("cloudresourcemanager", "folder"),
+        ApplyKind::EnsureProject { .. } => ("cloudresourcemanager", "project"),
+        ApplyKind::EnsureService { .. } => ("serviceusage", "service"),
+        ApplyKind::EnsureBillingLink { .. } => ("cloudbilling", "billing-link"),
+        ApplyKind::EnsureIamBinding { .. } => ("iam", "binding"),
+        ApplyKind::Destroy(kind) => match kind {
+            DestroyKind::DeleteFolder { .. } => ("cloudresourcemanager", "folder"),
+            DestroyKind::DeleteProject { .. } => ("cloudresourcemanager", "project"),
+            DestroyKind::DisableService { .. } => ("serviceusage", "service"),
+            DestroyKind::RemoveIamBinding { .. } => ("iam", "binding"),
+        },
+    }
+}
+
+/// One destroy target, resolved against live cloud state.  The digest is
+/// computed over this so a `confirm` reviewed at one point in time is refused if
+/// live state has drifted (etag / lifecycle-state / presence changed).
+#[derive(Debug, Clone)]
+struct ResolvedDestroy {
+    urn: String,
+    /// The real resource id resolved from live state (e.g. `folders/12345`), or
+    /// `<absent>` when the resource is already gone.
+    resolved_name: String,
+    /// Optimistic-concurrency token where the API exposes one (folders /
+    /// projects / IAM policy) — changes on any modification.
+    etag: Option<String>,
+    /// Lifecycle state fingerprint (`ACTIVE` / `ENABLED` / `bound` / …).
+    state: Option<String>,
+    /// Whether the target currently exists (and would actually be deleted).
+    present: bool,
+    /// The concrete request(s) apply mode would issue.  For IAM removal this is
+    /// re-derived at execute time (read-modify-write); the echo is the write.
+    request: PlannedRequest,
+}
+
+impl ResolvedDestroy {
+    /// The exact, human-reviewable plan echoed in a destroy dry-run.
+    fn to_plan_echo(&self) -> serde_json::Value {
+        serde_json::json!({
+            "urn": self.urn,
+            "resolved_name": self.resolved_name,
+            "etag": self.etag,
+            "state": self.state,
+            "present": self.present,
+            "request": self.request.to_echo(),
+        })
+    }
+}
+
+/// SHA-256 (hex) over the canonical live-resolved destroy plan.  Every field
+/// that would make the deletion "a different deletion than the one reviewed" is
+/// folded in: the URN, the resolved resource id, the etag, the lifecycle state,
+/// presence, and the request method + url.  A change in any of them yields a
+/// different digest, so a stale `confirm` is refused.
+fn destroy_plan_digest(action: &str, resolved: &ResolvedDestroy) -> String {
+    use sha2::{Digest, Sha256};
+    // Fixed-order canonical string (independent of serde_json map ordering).
+    let canonical = format!(
+        "v1|action={}|urn={}|name={}|etag={}|state={}|present={}|method={}|url={}",
+        action,
+        resolved.urn,
+        resolved.resolved_name,
+        resolved.etag.as_deref().unwrap_or(""),
+        resolved.state.as_deref().unwrap_or(""),
+        resolved.present,
+        resolved.request.method.as_str(),
+        resolved.request.url,
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Ownership / drift / orphan projection over the provider event stream
+/// (Fork 1).  This is the **pure fold** half — it consumes an ordered slice of
+/// [`ProviderFact`]s (the shape a converge emits and the EHDB *raw eventlog
+/// tier* later surfaces) and answers ownership / drift / orphan questions
+/// without any I/O.  The I/O adapter (query the tier, GET live state) lives at
+/// the call boundary and is documented in the provider-tool wiki.
+///
+/// ## Why the raw eventlog tier, not `/api/ehdb/events`
+///
+/// The #178 projection read-model (`/api/ehdb/events`) is **secret-free by
+/// construction** — it deliberately excludes `result` / `context` payload
+/// bodies from its DTOs.  A provider fact rides *inside* a step result payload,
+/// so folding it requires the **raw eventlog tier** (`/api/ehdb/tiers/eventlog`,
+/// worker-served) which carries full records.  This reuses the #178 surface
+/// (it is one of its tiers) and keeps the control-plane read-model secret-free
+/// — no parallel store, no relaxation of the secret-free guarantee.  See the
+/// design note recorded on the umbrella issue.
+pub mod state {
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    /// A provider ownership fact — emitted in a converge result's
+    /// `provider_fact` field, and (per the design) surfaced from the EHDB raw
+    /// eventlog tier for folding.  Secret-free by construction: it carries only
+    /// resource identity + desired spec + outcome, never a credential.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ProviderFact {
+        pub urn: String,
+        pub provider: String,
+        pub service: String,
+        pub resource_type: String,
+        /// `ensure` | `delete`.
+        pub verb: String,
+        pub stack: String,
+        /// Declared desired spec (normalized).  Empty for a delete.
+        #[serde(default)]
+        pub desired: serde_json::Value,
+        pub execution_id: i64,
+        /// `planned` (dry-run intent) | `changed` | `noop` | `deleted` | `absent`.
+        pub outcome: String,
+    }
+
+    /// Current ownership record for one URN after folding its fact history.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Owned {
+        pub urn: String,
+        pub stack: String,
+        pub resource_type: String,
+        pub last_desired: serde_json::Value,
+        pub last_execution_id: i64,
+    }
+
+    /// The folded ownership state: what a stack currently owns (live) and what it
+    /// has tombstoned (deleted).
+    #[derive(Debug, Default, Clone)]
+    pub struct OwnershipModel {
+        pub owned: BTreeMap<String, Owned>,
+        pub tombstoned: BTreeMap<String, Owned>,
+    }
+
+    /// Drift verdict for a single owned URN vs its live actual state.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    #[serde(tag = "drift", rename_all = "snake_case")]
+    pub enum Drift {
+        /// Live actual matches last-known-desired.
+        InSync,
+        /// We own it (believe it live) but the live GET found nothing.
+        Missing,
+        /// Desired vs actual differ on these normalized fields.
+        Modified { fields: Vec<String> },
+        /// A live resource exists that no ownership record covers.
+        Untracked,
+        /// Neither owned nor live — nothing to reconcile.
+        NotManaged,
+    }
+
+    /// Fold an ordered (oldest→newest) fact stream into an ownership model.
+    /// Only **applied** facts move the live model — a `planned` dry-run fact is
+    /// intent, not ownership.  A terminal `delete`/`absent` tombstones the URN.
+    pub fn fold_facts(facts: &[ProviderFact]) -> OwnershipModel {
+        let mut model = OwnershipModel::default();
+        for f in facts {
+            match (f.verb.as_str(), f.outcome.as_str()) {
+                // An applied ensure asserts (or refreshes) live ownership.
+                ("ensure", "changed") | ("ensure", "noop") => {
+                    model.tombstoned.remove(&f.urn);
+                    model.owned.insert(
+                        f.urn.clone(),
+                        Owned {
+                            urn: f.urn.clone(),
+                            stack: f.stack.clone(),
+                            resource_type: f.resource_type.clone(),
+                            last_desired: f.desired.clone(),
+                            last_execution_id: f.execution_id,
+                        },
+                    );
+                }
+                // An applied delete (or a confirmed already-absent) tombstones it.
+                ("delete", "deleted") | ("delete", "absent") => {
+                    let prior = model.owned.remove(&f.urn);
+                    let rec = prior.unwrap_or(Owned {
+                        urn: f.urn.clone(),
+                        stack: f.stack.clone(),
+                        resource_type: f.resource_type.clone(),
+                        last_desired: serde_json::Value::Null,
+                        last_execution_id: f.execution_id,
+                    });
+                    model.tombstoned.insert(f.urn.clone(), rec);
+                }
+                // planned / other outcomes are intent only — no live-model change.
+                _ => {}
+            }
+        }
+        model
+    }
+
+    /// Compute drift for one URN.  `live_actual` is the live GET already
+    /// **normalized into the desired key space** by the adapter (the GCP→desired
+    /// field mapping is the adapter's job; this fold stays pure and generic).
+    pub fn compute_drift(
+        model: &OwnershipModel,
+        urn: &str,
+        live_actual: Option<&serde_json::Value>,
+    ) -> Drift {
+        match model.owned.get(urn) {
+            None => match live_actual {
+                Some(_) => Drift::Untracked,
+                None => Drift::NotManaged,
+            },
+            Some(owned) => match live_actual {
+                None => Drift::Missing,
+                Some(actual) => {
+                    let mut diffs = Vec::new();
+                    if let Some(desired) = owned.last_desired.as_object() {
+                        for (k, want) in desired {
+                            let got = actual.get(k);
+                            if got != Some(want) {
+                                diffs.push(k.clone());
+                            }
+                        }
+                    }
+                    if diffs.is_empty() {
+                        Drift::InSync
+                    } else {
+                        diffs.sort();
+                        Drift::Modified { fields: diffs }
+                    }
+                }
+            },
+        }
+    }
+
+    /// URNs the model owns (live) that are **not** in the currently-declared set
+    /// → orphaned (declared in a prior run, no longer declared).  `declared_urns`
+    /// is the union of URNs the current stack converge run declares.
+    pub fn detect_orphans(model: &OwnershipModel, declared_urns: &[String]) -> Vec<Owned> {
+        let declared: std::collections::BTreeSet<&String> = declared_urns.iter().collect();
+        model
+            .owned
+            .values()
+            .filter(|o| !declared.contains(&o.urn))
+            .cloned()
+            .collect()
     }
 }
 
@@ -1533,7 +2580,9 @@ mod tests {
             "dry_run": true,
         }));
         let err = tool.execute(&cfg, &ctx).await.unwrap_err();
-        assert!(matches!(err, ToolError::Configuration(m) if m.contains("not yet implemented")));
+        assert!(
+            matches!(err, ToolError::Configuration(ref m) if m.contains("not yet implemented"))
+        );
     }
 
     #[tokio::test]
@@ -1547,7 +2596,7 @@ mod tests {
         }));
         let err = tool.execute(&cfg, &ctx).await.unwrap_err();
         assert!(
-            matches!(err, ToolError::Configuration(m) if m.contains("unknown google provider action"))
+            matches!(err, ToolError::Configuration(ref m) if m.contains("unknown google provider action"))
         );
     }
 
@@ -2020,5 +3069,492 @@ mod tests {
             }
             other => panic!("expected ExecutionFailed timeout, got {other:?}"),
         }
+    }
+
+    // ================= Round 3 =================
+
+    // ---- endpoint-override knob: apply routes to a mock, no live cloud ----
+
+    #[test]
+    fn endpoint_override_deserializes_base_and_per_service() {
+        let base: ProviderSpec = serde_json::from_value(serde_json::json!({
+            "provider": "google", "action": "x", "endpoint": "http://127.0.0.1:8089",
+        }))
+        .unwrap();
+        let ep = ApiEndpoints::resolve(base.endpoint.as_ref());
+        assert_eq!(ep.crm, "http://127.0.0.1:8089/v3");
+        assert_eq!(ep.billing, "http://127.0.0.1:8089/v1");
+        assert_eq!(ep.serviceusage, "http://127.0.0.1:8089/v1");
+
+        let per: ProviderSpec = serde_json::from_value(serde_json::json!({
+            "provider": "google", "action": "x",
+            "endpoint": { "crm": "http://mock/crm" },
+        }))
+        .unwrap();
+        let ep = ApiEndpoints::resolve(per.endpoint.as_ref());
+        assert_eq!(ep.crm, "http://mock/crm");
+        // Unset services fall back to the real Google host.
+        assert_eq!(ep.billing, BILLING_V1);
+    }
+
+    #[tokio::test]
+    async fn endpoint_override_routes_apply_to_mock_server() {
+        // Prove the *config-level* endpoint override reroutes a real
+        // `ProviderTool::new()` (defaulted to Google hosts) onto a mock — the
+        // path a `noetl exec --runtime local` offline validation exercises.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p/services/youtube.googleapis.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/p/services/youtube.googleapis.com", "state": "ENABLED"
+            })))
+            .mount(&server)
+            .await;
+
+        // Note: tool built with the REAL default endpoints; only the spec's
+        // `endpoint` override points it at the mock.
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let mut cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.serviceusage.services.enable",
+            "dry_run": false,
+            "endpoint": server.uri(),
+            "input": { "project_id": "p", "service_name": "youtube.googleapis.com" }
+        }));
+        cfg.auth = Some(gcp_auth());
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(
+            data["changed"],
+            serde_json::json!(false),
+            "already-ENABLED service converges to a no-op — proving the override routed to the mock"
+        );
+    }
+
+    // ---- ownership fact emission (Fork 1) ----
+
+    #[tokio::test]
+    async fn ensure_dry_run_emits_ownership_fact() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.projects.ensure",
+            "dry_run": true,
+            "stack": "shastaratech-prod",
+            "input": { "project_id": "st-prod", "parent": "folders/20" }
+        }));
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        let fact = &data["provider_fact"];
+        assert_eq!(
+            fact["urn"],
+            serde_json::json!("google:cloudresourcemanager:project:st-prod")
+        );
+        assert_eq!(fact["verb"], serde_json::json!("ensure"));
+        assert_eq!(fact["stack"], serde_json::json!("shastaratech-prod"));
+        assert_eq!(fact["outcome"], serde_json::json!("planned"));
+        assert_eq!(fact["resource_type"], serde_json::json!("project"));
+    }
+
+    #[tokio::test]
+    async fn read_action_emits_no_ownership_fact() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.folders.list",
+            "dry_run": true,
+            "input": { "parent": "organizations/1" }
+        }));
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert!(
+            data.get("provider_fact").is_none(),
+            "a pure read asserts no ownership"
+        );
+    }
+
+    // ---- destroy: no-wildcard, auth-required-to-plan ----
+
+    #[tokio::test]
+    async fn destroy_rejects_wildcard_target() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let mut cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.projects.delete",
+            "dry_run": true,
+            "input": { "project_id": "st-*" }
+        }));
+        cfg.auth = Some(gcp_auth());
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m) if m.contains("wildcard")),
+            "wildcard destroy target must be refused: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_plan_requires_auth() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        // dry_run:true destroy with NO auth → refused (plan must resolve live).
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.projects.delete",
+            "dry_run": true,
+            "input": { "project_id": "st-prod" }
+        }));
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m)
+                if m.contains("requires an explicit `auth:`") && m.contains("stale")),
+            "destroy plan without auth must be refused (no live resolution possible): {err:?}"
+        );
+    }
+
+    // ---- destroy happy path: resolve → digest → confirm → delete (LRO) ----
+
+    fn destroy_cfg(action: &str, input: serde_json::Value, extra: serde_json::Value) -> ToolConfig {
+        let mut body = serde_json::json!({
+            "provider": "google",
+            "action": action,
+            "input": input,
+            "poll": { "max_attempts": 3, "interval_ms": 5, "max_wait_secs": 2 },
+        });
+        // Merge dry_run / confirm / endpoint overrides.
+        for (k, v) in extra.as_object().unwrap() {
+            body[k.as_str()] = v.clone();
+        }
+        let mut cfg = spec_config(body);
+        cfg.auth = Some(gcp_auth());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn destroy_folder_dryrun_then_confirmed_apply_deletes() {
+        // dry-run and apply hit the SAME endpoint (as in production), so the
+        // digest is stable across the review→apply gap when live state is
+        // unchanged.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/folders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "folders": [
+                    { "name": "folders/99", "displayName": "20-media", "state": "ACTIVE", "etag": "ETAG-1" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v3/folders/99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/folder-del", "done": false
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/operations/folder-del"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/folder-del", "done": true,
+                "response": { "name": "folders/99", "state": "DELETE_REQUESTED" }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+
+        // 1) dry-run → explicit plan + digest.
+        let plan_cfg = destroy_cfg(
+            "google.cloudresourcemanager.folders.delete",
+            serde_json::json!({ "parent": "organizations/1", "display_name": "20-media" }),
+            serde_json::json!({ "dry_run": true }),
+        );
+        let plan = tool.execute(&plan_cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(plan["destroy"], serde_json::json!(true));
+        assert_eq!(plan["present"], serde_json::json!(true));
+        assert_eq!(
+            plan["plan"]["resolved_name"],
+            serde_json::json!("folders/99")
+        );
+        assert_eq!(
+            plan["plan"]["request"]["method"],
+            serde_json::json!("DELETE")
+        );
+        let digest = plan["plan_digest"].as_str().unwrap().to_string();
+
+        // 2) apply with the reviewed digest → DELETE + LRO poll to done.
+        let apply_cfg = destroy_cfg(
+            "google.cloudresourcemanager.folders.delete",
+            serde_json::json!({ "parent": "organizations/1", "display_name": "20-media" }),
+            serde_json::json!({ "dry_run": false, "confirm": digest }),
+        );
+        let out = tool.execute(&apply_cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(out["changed"], serde_json::json!(true));
+        assert_eq!(
+            out["provider_fact"]["outcome"],
+            serde_json::json!("deleted")
+        );
+    }
+
+    // ---- CORE SAFETY: blind apply (no confirm) is refused ----
+
+    #[tokio::test]
+    async fn destroy_blind_apply_without_confirm_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/st-prod", "projectId": "st-prod", "state": "ACTIVE", "etag": "E1"
+            })))
+            .mount(&server)
+            .await;
+        // No DELETE mock — if a deletion were attempted it would 404.
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = destroy_cfg(
+            "google.cloudresourcemanager.projects.delete",
+            serde_json::json!({ "project_id": "st-prod" }),
+            serde_json::json!({ "dry_run": false }), // no confirm
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m)
+                if m.contains("no `confirm`") && m.contains("blind applies are")),
+            "a destroy apply with no confirm must be refused: {err:?}"
+        );
+    }
+
+    // ---- CORE SAFETY: stale / mismatched confirm digest is refused ----
+
+    #[tokio::test]
+    async fn destroy_stale_confirm_digest_is_refused() {
+        // The human reviewed a plan when the project etag was E1; by apply time
+        // the cloud drifted (etag now E2) → the live digest differs → refuse.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/st-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/st-prod", "projectId": "st-prod", "state": "ACTIVE", "etag": "E2"
+            })))
+            .mount(&server)
+            .await;
+        // No DELETE mock — proving no deletion is attempted.
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+
+        // A digest computed against the *old* (E1) state — what the human echoed.
+        let stale_resolved = ResolvedDestroy {
+            urn: "google:cloudresourcemanager:project:st-prod".to_string(),
+            resolved_name: "projects/st-prod".to_string(),
+            etag: Some("E1".to_string()),
+            state: Some("ACTIVE".to_string()),
+            present: true,
+            request: PlannedRequest::delete(format!("{}/projects/st-prod", tool.endpoints.crm)),
+        };
+        let stale_digest = destroy_plan_digest(
+            "google.cloudresourcemanager.projects.delete",
+            &stale_resolved,
+        );
+
+        let cfg = destroy_cfg(
+            "google.cloudresourcemanager.projects.delete",
+            serde_json::json!({ "project_id": "st-prod" }),
+            serde_json::json!({ "dry_run": false, "confirm": stale_digest }),
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        match err {
+            ToolError::ExecutionFailed(msg) => {
+                assert!(msg.contains("REFUSED"), "names the refusal: {msg}");
+                assert!(
+                    msg.contains("changed since the plan was reviewed"),
+                    "explains staleness: {msg}"
+                );
+                assert!(
+                    msg.contains("No deletion was performed"),
+                    "confirms nothing was deleted: {msg}"
+                );
+            }
+            other => panic!("expected ExecutionFailed refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn destroy_digest_changes_when_live_state_drifts() {
+        // Same target, two different live etags → two different digests.  This is
+        // the property that makes the stale-confirm refusal work.
+        let mk = |etag: &str| ResolvedDestroy {
+            urn: "google:cloudresourcemanager:project:p".to_string(),
+            resolved_name: "projects/p".to_string(),
+            etag: Some(etag.to_string()),
+            state: Some("ACTIVE".to_string()),
+            present: true,
+            request: PlannedRequest::delete("https://x/v3/projects/p".to_string()),
+        };
+        let a = destroy_plan_digest("google.cloudresourcemanager.projects.delete", &mk("E1"));
+        let b = destroy_plan_digest("google.cloudresourcemanager.projects.delete", &mk("E2"));
+        assert_ne!(a, b, "a drifted etag must produce a different plan digest");
+        // Presence flip also changes the digest.
+        let mut absent = mk("E1");
+        absent.present = false;
+        let c = destroy_plan_digest("google.cloudresourcemanager.projects.delete", &absent);
+        assert_ne!(a, c, "presence change must produce a different plan digest");
+    }
+
+    #[tokio::test]
+    async fn destroy_ambiguous_folder_match_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/folders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "folders": [
+                    { "name": "folders/1", "displayName": "dup", "state": "ACTIVE" },
+                    { "name": "folders/2", "displayName": "dup", "state": "ACTIVE" },
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = destroy_cfg(
+            "google.cloudresourcemanager.folders.delete",
+            serde_json::json!({ "parent": "organizations/1", "display_name": "dup" }),
+            serde_json::json!({ "dry_run": true }),
+        );
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Configuration(ref m) if m.contains("ambiguous")),
+            "a display-name matching >1 folder is not an explicit target: {err:?}"
+        );
+    }
+
+    // ---- IAM remove_binding pure logic ----
+
+    #[test]
+    fn remove_binding_drops_member_and_empty_binding() {
+        let policy = serde_json::json!({
+            "etag": "BwXyz",
+            "bindings": [
+                { "role": "roles/owner", "members": ["user:a@x.com", "user:b@x.com"] },
+                { "role": "roles/viewer", "members": ["user:c@x.com"] },
+            ]
+        });
+        // Drop one of two members — binding survives.
+        let r1 = remove_binding(&policy, "roles/owner", "user:b@x.com");
+        assert!(binding_present(&r1, "roles/owner", "user:a@x.com"));
+        assert!(!binding_present(&r1, "roles/owner", "user:b@x.com"));
+        assert_eq!(r1["etag"], serde_json::json!("BwXyz"));
+        // Drop the sole member — the whole binding is removed.
+        let r2 = remove_binding(&policy, "roles/viewer", "user:c@x.com");
+        let has_viewer = r2["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["role"] == serde_json::json!("roles/viewer"));
+        assert!(!has_viewer, "an emptied binding is dropped entirely");
+    }
+
+    // ---- Fork 1: ownership fold / drift / orphan (pure) ----
+
+    use super::state::{compute_drift, detect_orphans, fold_facts, Drift, ProviderFact};
+
+    fn fact(urn: &str, verb: &str, outcome: &str, desired: serde_json::Value) -> ProviderFact {
+        ProviderFact {
+            urn: urn.to_string(),
+            provider: "google".to_string(),
+            service: "cloudresourcemanager".to_string(),
+            resource_type: "project".to_string(),
+            verb: verb.to_string(),
+            stack: "prod".to_string(),
+            desired,
+            execution_id: 1,
+            outcome: outcome.to_string(),
+        }
+    }
+
+    #[test]
+    fn fold_facts_asserts_and_tombstones_ownership() {
+        let facts = vec![
+            // planned (intent) — does NOT assert live ownership.
+            fact(
+                "urn:a",
+                "ensure",
+                "planned",
+                serde_json::json!({"parent": "folders/1"}),
+            ),
+            // applied ensure — asserts ownership.
+            fact(
+                "urn:a",
+                "ensure",
+                "changed",
+                serde_json::json!({"parent": "folders/1"}),
+            ),
+            fact(
+                "urn:b",
+                "ensure",
+                "noop",
+                serde_json::json!({"parent": "folders/2"}),
+            ),
+            // applied delete — tombstones urn:b.
+            fact("urn:b", "delete", "deleted", serde_json::Value::Null),
+        ];
+        let model = fold_facts(&facts);
+        assert!(model.owned.contains_key("urn:a"), "urn:a is owned");
+        assert!(!model.owned.contains_key("urn:b"), "urn:b was deleted");
+        assert!(model.tombstoned.contains_key("urn:b"));
+
+        // A planned-only URN never enters the live model.
+        let planned_only = vec![fact("urn:c", "ensure", "planned", serde_json::json!({}))];
+        assert!(fold_facts(&planned_only).owned.is_empty());
+    }
+
+    #[test]
+    fn compute_drift_detects_missing_modified_insync_untracked() {
+        let facts = vec![fact(
+            "urn:a",
+            "ensure",
+            "changed",
+            serde_json::json!({ "parent": "folders/1", "displayName": "prod" }),
+        )];
+        let model = fold_facts(&facts);
+
+        // In sync: actual matches desired on all desired keys.
+        let actual =
+            serde_json::json!({ "parent": "folders/1", "displayName": "prod", "state": "ACTIVE" });
+        assert_eq!(compute_drift(&model, "urn:a", Some(&actual)), Drift::InSync);
+
+        // Missing: owned but live GET found nothing.
+        assert_eq!(compute_drift(&model, "urn:a", None), Drift::Missing);
+
+        // Modified: a desired field diverged.
+        let drifted = serde_json::json!({ "parent": "folders/999", "displayName": "prod" });
+        assert_eq!(
+            compute_drift(&model, "urn:a", Some(&drifted)),
+            Drift::Modified {
+                fields: vec!["parent".to_string()]
+            }
+        );
+
+        // Untracked: a live resource with no ownership record.
+        let orphan_live = serde_json::json!({ "parent": "folders/1" });
+        assert_eq!(
+            compute_drift(&model, "urn:unknown", Some(&orphan_live)),
+            Drift::Untracked
+        );
+    }
+
+    #[test]
+    fn detect_orphans_finds_owned_but_undeclared() {
+        let facts = vec![
+            fact("urn:a", "ensure", "changed", serde_json::json!({})),
+            fact("urn:b", "ensure", "changed", serde_json::json!({})),
+            fact("urn:c", "ensure", "changed", serde_json::json!({})),
+        ];
+        let model = fold_facts(&facts);
+        // Current stack declares only a and c → b is orphaned.
+        let declared = vec!["urn:a".to_string(), "urn:c".to_string()];
+        let orphans = detect_orphans(&model, &declared);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].urn, "urn:b");
     }
 }
