@@ -49,8 +49,10 @@ workflow:
       #   credential: "gcp_org_admin"
       #   scopes: ["https://www.googleapis.com/auth/cloud-platform"]
 
-  # 2. Ensure the project exists under the folder (mutation; plan-able now,
-  #    apply is a documented round-1 stub for the multi-step ensure path).
+  # 2. Ensure the project exists under the folder (mutation; idempotent
+  #    GET-first converge — apply GETs the project and only creates it under
+  #    `parent` on a 404, polling the create Operation to completion.  Re-running
+  #    against an existing project is a no-op, `changed: false`).
   - step: ensure_project
     tool:
       kind: provider
@@ -62,9 +64,15 @@ workflow:
         project_id: "{{ workload.project_id }}"
         display_name: "{{ workload.display_name }}"
         parent: "folders/by-display-name/{{ workload.folder_name }}"
+      # Optional: bound the long-running create-Operation poll (defaults shown).
+      poll:
+        max_attempts: 30
+        interval_ms: 2000
+        max_wait_secs: 120
 
-  # 3. Enable a service API on the project (single-request idempotent mutation;
-  #    apply supported once an explicit `auth:` alias is added).
+  # 3. Enable a service API on the project (idempotent GET-first converge — apply
+  #    reads the service state and only issues `:enable` if it is not already
+  #    ENABLED; requires an explicit `auth:` alias for a real call).
   - step: enable_api
     tool:
       kind: provider

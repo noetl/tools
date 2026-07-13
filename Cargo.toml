@@ -209,3 +209,7 @@ noetl-arrow-flight-client = "0.5"
 [dev-dependencies]
 tokio-test = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# In-process mock HTTP server for the provider tool's apply-mode + LRO tests
+# (idempotent GET-first converge and bounded operation polling are exercised
+# against sequenced mock responses — no live cloud calls).
+wiremock = "0.6"
