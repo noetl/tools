@@ -2943,6 +2943,45 @@ pub mod state {
         pub tombstoned: BTreeMap<String, Owned>,
     }
 
+    impl OwnershipModel {
+        /// Narrow this model to a single ownership stack (Round 5 — scoping fix).
+        ///
+        /// Ownership facts carry a `stack` label; a fold over a multi-stack fact
+        /// stream mixes them.  Orphan detection **must** scope to one stack or it
+        /// reports another stack's resources as orphans of the current run.
+        /// `<unscoped>` (the default when a step sets no `stack:`) behaves as a
+        /// single global stack — `for_stack("<unscoped>")` returns exactly the
+        /// unscoped resources.
+        ///
+        /// Note on contention: the fold is last-writer-wins per URN, so if two
+        /// stacks own the same URN with no intervening delete the folded model
+        /// attributes it to the most-recent owning stack; `for_stack` follows
+        /// that attribution.  Use [`detect_stack_conflicts`] on the fact stream
+        /// to surface such contention before it bites.
+        pub fn for_stack(&self, stack: &str) -> OwnershipModel {
+            let keep = |m: &BTreeMap<String, Owned>| -> BTreeMap<String, Owned> {
+                m.iter()
+                    .filter(|(_, o)| o.stack == stack)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            OwnershipModel {
+                owned: keep(&self.owned),
+                tombstoned: keep(&self.tombstoned),
+            }
+        }
+
+        /// The distinct stacks present in this model's live-owned set.
+        pub fn stacks(&self) -> Vec<String> {
+            self.owned
+                .values()
+                .map(|o| o.stack.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        }
+    }
+
     /// Drift verdict for a single owned URN vs its live actual state.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     #[serde(tag = "drift", rename_all = "snake_case")]
@@ -3087,6 +3126,106 @@ pub mod state {
         fold_facts(&extract_facts_from_eventlog(records))
     }
 
+    /// Extract facts from **wire-shape** EHDB eventlog-tier records — the
+    /// `EventLogRecordView` rows served by `GET /api/ehdb/tiers/eventlog`
+    /// (Round 5 — the query I/O adapter's server-facing half).
+    ///
+    /// Two things differ from [`extract_facts_from_eventlog`], and both bite in
+    /// production:
+    ///
+    /// 1. **The event body is a JSON *string* in `payload`.**  The tier row is
+    ///    `{ global_sequence, execution_id, transaction_id, byte_len, payload }`
+    ///    where `payload` is the caller's whole event body serialized to a
+    ///    string.  This unwraps and re-parses it before probing.
+    /// 2. **The real nesting is deeper than the fixed paths.**  A `call.done`
+    ///    event nests the tool result as
+    ///    `context.result.context.data.provider_fact` (worker
+    ///    `emit_call_done` → `build_call_done_result` → `ToolResult.data`), which
+    ///    the fixed [`fact_in_record`] paths do **not** reach.  So this falls
+    ///    back to a bounded recursive search for a `provider_fact` object that
+    ///    deserializes to a strict [`ProviderFact`] — robust to the exact
+    ///    envelope nesting (and to future envelope changes) without guessing a
+    ///    path.  A stray key merely *named* `provider_fact` that isn't a real
+    ///    fact is rejected because it fails the strict deserialize.
+    ///
+    /// Feeding already-decoded records (a bare body, or the shapes
+    /// [`extract_facts_from_eventlog`] handles) still works — the payload-string
+    /// unwrap is best-effort and the fixed-path probe runs first.
+    pub fn extract_facts_from_tier_records(records: &[serde_json::Value]) -> Vec<ProviderFact> {
+        records.iter().filter_map(fact_in_tier_record).collect()
+    }
+
+    /// Convenience: extract + fold wire-shape tier records into an ownership
+    /// model in one call.
+    pub fn fold_tier_records(records: &[serde_json::Value]) -> OwnershipModel {
+        fold_facts(&extract_facts_from_tier_records(records))
+    }
+
+    /// Orphan detection **scoped to one stack** (Round 5 — scoping fix).
+    ///
+    /// The correct multi-stack shape: owned-by-`stack` URNs that the current run
+    /// no longer declares.  Plain [`detect_orphans`] over a multi-stack model
+    /// would report *another* stack's resources as orphans of this run, then a
+    /// `--prune` built on that would delete live infra another stack owns.  This
+    /// narrows to `stack` first (see [`OwnershipModel::for_stack`]).
+    pub fn detect_orphans_scoped(
+        model: &OwnershipModel,
+        stack: &str,
+        declared_urns: &[String],
+    ) -> Vec<Owned> {
+        detect_orphans(&model.for_stack(stack), declared_urns)
+    }
+
+    /// A URN asserted-owned by more than one stack with no intervening delete —
+    /// two stacks are managing the same resource and will fight over it (each
+    /// `enforce` reconciles it to its own desired; each stack-scoped orphan scan
+    /// sees only its own view).  Surfaced as a warning so an operator can split
+    /// ownership before the conflict bites.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct StackConflict {
+        pub urn: String,
+        /// The distinct stacks observed contending for this URN (sorted).
+        pub stacks: Vec<String>,
+    }
+
+    /// Detect cross-stack ownership contention from an ordered (oldest→newest)
+    /// fact stream (Round 5).  A conflict is recorded when an owning fact from
+    /// stack X lands while the URN is already owned by stack Y ≠ X **without a
+    /// tombstoning delete in between** — so a legitimate ownership *transfer*
+    /// (stack A deletes, stack B adopts) is **not** flagged, only genuine
+    /// simultaneous ownership.  A single-stack (or all-`<unscoped>`) stream
+    /// yields no conflicts.
+    pub fn detect_stack_conflicts(facts: &[ProviderFact]) -> Vec<StackConflict> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut current: BTreeMap<String, String> = BTreeMap::new();
+        let mut contended: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for f in facts {
+            match (f.verb.as_str(), f.outcome.as_str()) {
+                ("ensure", "changed") | ("ensure", "noop") | ("adopt", "adopted") => {
+                    if let Some(prev) = current.get(&f.urn) {
+                        if prev != &f.stack {
+                            let set = contended.entry(f.urn.clone()).or_default();
+                            set.insert(prev.clone());
+                            set.insert(f.stack.clone());
+                        }
+                    }
+                    current.insert(f.urn.clone(), f.stack.clone());
+                }
+                ("delete", "deleted") | ("delete", "absent") => {
+                    current.remove(&f.urn);
+                }
+                _ => {}
+            }
+        }
+        contended
+            .into_iter()
+            .map(|(urn, stacks)| StackConflict {
+                urn,
+                stacks: stacks.into_iter().collect(),
+            })
+            .collect()
+    }
+
     fn fact_in_record(record: &serde_json::Value) -> Option<ProviderFact> {
         const PATHS: [&[&str]; 3] = [
             &["result", "data", "provider_fact"],
@@ -3112,6 +3251,49 @@ pub mod state {
             }
         }
         None
+    }
+
+    /// Extract a fact from one wire-shape tier record: unwrap the `payload`
+    /// JSON string when present, then probe (fixed paths first, recursive search
+    /// as the fallback for the real deeper envelope nesting).
+    fn fact_in_tier_record(record: &serde_json::Value) -> Option<ProviderFact> {
+        if let Some(body) = record
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        {
+            if let Some(fact) = fact_in_record(&body).or_else(|| fact_in_value_recursive(&body, 0)) {
+                return Some(fact);
+            }
+        }
+        fact_in_record(record).or_else(|| fact_in_value_recursive(record, 0))
+    }
+
+    /// Bounded recursive search for a `provider_fact` object anywhere in a value.
+    /// A match must deserialize to the strict [`ProviderFact`] (all required
+    /// fields present), so a stray key merely named `provider_fact` is rejected.
+    /// Depth-bounded to avoid pathological nesting; the real `call.done`
+    /// envelope reaches it at `context.result.context.data.provider_fact`.
+    fn fact_in_value_recursive(value: &serde_json::Value, depth: usize) -> Option<ProviderFact> {
+        const MAX_DEPTH: usize = 12;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(pf) = map.get("provider_fact") {
+                    if let Ok(fact) = serde_json::from_value::<ProviderFact>(pf.clone()) {
+                        return Some(fact);
+                    }
+                }
+                map.values()
+                    .find_map(|v| fact_in_value_recursive(v, depth + 1))
+            }
+            serde_json::Value::Array(arr) => {
+                arr.iter().find_map(|v| fact_in_value_recursive(v, depth + 1))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -4848,5 +5030,111 @@ mod tests {
             serde_json::json!("folders/2"),
             "the adopt fact (newest) sets the owned desired"
         );
+    }
+
+    // ---- Round 5: wire-shape tier adapter + stack scoping ----
+
+    #[test]
+    fn extract_facts_from_tier_records_unwraps_payload_and_deep_nesting() {
+        use super::state::{extract_facts_from_tier_records, fold_tier_records};
+        // The REAL `call.done` envelope nests the fact four levels deep
+        // (`context.result.context.data.provider_fact`) — deeper than the fixed
+        // `fact_in_record` paths — AND the tier serves the whole body as a JSON
+        // *string* in `payload`.  Both must be handled or the fact is invisible.
+        let body = serde_json::json!({
+            "execution_id": "555",
+            "event_type": "call.done",
+            "context": { "command_id": "c1", "call_index": 0, "result": {
+                "status": "success",
+                "context": { "status": "success", "data": {
+                    "provider": "google", "resource": { "state": "ACTIVE" },
+                    "provider_fact": {
+                        "urn": "urn:deep", "provider": "google",
+                        "service": "cloudresourcemanager", "resource_type": "folder",
+                        "verb": "ensure", "stack": "prod",
+                        "desired": { "parent": "folders/1", "display_name": "media" },
+                        "execution_id": 555, "outcome": "changed"
+                    }
+                } }
+            } }
+        });
+        let records = vec![
+            serde_json::json!({
+                "global_sequence": 1, "execution_id": "555", "transaction_id": "t1",
+                "byte_len": 512, "payload": serde_json::to_string(&body).unwrap()
+            }),
+            // A record whose payload has no provider_fact is skipped.
+            serde_json::json!({
+                "global_sequence": 2, "execution_id": "555", "transaction_id": "t2",
+                "byte_len": 20, "payload": "{\"event_type\":\"execution.start\"}"
+            }),
+        ];
+        let facts = extract_facts_from_tier_records(&records);
+        assert_eq!(facts.len(), 1, "the deeply-nested fact is found; the other skipped");
+        assert_eq!(facts[0].urn, "urn:deep");
+
+        let model = fold_tier_records(&records);
+        assert!(model.owned.contains_key("urn:deep"));
+        assert_eq!(model.owned["urn:deep"].stack, "prod");
+    }
+
+    #[test]
+    fn for_stack_and_scoped_orphans_respect_stack() {
+        use super::state::{detect_orphans, detect_orphans_scoped, fold_facts, ProviderFact};
+        let f = |urn: &str, stack: &str| ProviderFact {
+            urn: urn.to_string(),
+            provider: "google".to_string(),
+            service: "cloudresourcemanager".to_string(),
+            resource_type: "project".to_string(),
+            verb: "ensure".to_string(),
+            stack: stack.to_string(),
+            desired: serde_json::json!({}),
+            execution_id: 1,
+            outcome: "changed".to_string(),
+        };
+        // prod owns a,b; staging owns c.
+        let model = fold_facts(&[f("urn:a", "prod"), f("urn:b", "prod"), f("urn:c", "staging")]);
+        assert_eq!(model.stacks(), vec!["prod".to_string(), "staging".to_string()]);
+        assert_eq!(model.for_stack("prod").owned.len(), 2);
+        assert_eq!(model.for_stack("staging").owned.len(), 1);
+
+        // prod's run declares only a → b is prod's orphan; c (staging) is NOT.
+        let declared = vec!["urn:a".to_string()];
+        let scoped = detect_orphans_scoped(&model, "prod", &declared);
+        assert_eq!(scoped.len(), 1, "only prod's undeclared resource");
+        assert_eq!(scoped[0].urn, "urn:b");
+
+        // Un-scoped detect over the mixed model would wrongly flag staging's c.
+        let unscoped = detect_orphans(&model, &declared);
+        assert_eq!(unscoped.len(), 2, "unscoped conflates stacks — the bug this fixes");
+    }
+
+    #[test]
+    fn detect_stack_conflicts_flags_contention_not_transfer() {
+        use super::state::{detect_stack_conflicts, ProviderFact};
+        let f = |urn: &str, stack: &str, verb: &str, outcome: &str| ProviderFact {
+            urn: urn.to_string(),
+            provider: "google".to_string(),
+            service: "cloudresourcemanager".to_string(),
+            resource_type: "project".to_string(),
+            verb: verb.to_string(),
+            stack: stack.to_string(),
+            desired: serde_json::json!({}),
+            execution_id: 1,
+            outcome: outcome.to_string(),
+        };
+        // Contention: prod owns urn:x, then staging asserts it with no delete.
+        // Transfer: prod owns urn:y, deletes it, staging adopts — NOT a conflict.
+        let facts = vec![
+            f("urn:x", "prod", "ensure", "changed"),
+            f("urn:x", "staging", "ensure", "changed"),
+            f("urn:y", "prod", "ensure", "changed"),
+            f("urn:y", "prod", "delete", "deleted"),
+            f("urn:y", "staging", "adopt", "adopted"),
+        ];
+        let conflicts = detect_stack_conflicts(&facts);
+        assert_eq!(conflicts.len(), 1, "only the un-transferred contention");
+        assert_eq!(conflicts[0].urn, "urn:x");
+        assert_eq!(conflicts[0].stacks, vec!["prod".to_string(), "staging".to_string()]);
     }
 }
