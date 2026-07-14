@@ -336,6 +336,32 @@ pub enum ReconcilePolicy {
     Adopt,
 }
 
+/// Wrong-target safety guard (see [`ProviderSpec::guard`]).  Pins the
+/// organization and billing account a run is allowed to touch.  Mirrors the
+/// confirm-gate discipline: make a wrong-target write structurally impossible,
+/// not merely unlikely.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GuardSpec {
+    /// Organization the run is pinned to (`organizations/<id>` or bare `<id>`).
+    /// Any action whose input references a *different* `organizations/<id>` is
+    /// refused offline, before any request is built or credential minted.
+    #[serde(default)]
+    pub require_org: Option<String>,
+
+    /// Expected `displayName` of `require_org`.  Checked live (read-only GET) in
+    /// apply mode as belt-and-braces against a re-pointed / typo'd numeric id
+    /// that happens to exist elsewhere.
+    #[serde(default)]
+    pub require_org_display_name: Option<String>,
+
+    /// Billing account the run is pinned to (`billingAccounts/<id>` or bare
+    /// `<id>`).  Any action referencing a different billing account is refused
+    /// offline; in apply mode the account's `parent` is checked to equal
+    /// `require_org`.
+    #[serde(default)]
+    pub require_billing_account: Option<String>,
+}
+
 /// Parsed `kind: provider` tool config (deserialized from the flattened,
 /// template-rendered tool block).
 #[derive(Debug, Clone, Deserialize)]
@@ -416,6 +442,14 @@ pub struct ProviderSpec {
     /// (which derives desired from the step's own `input`).
     #[serde(default)]
     pub known_desired: Option<serde_json::Value>,
+
+    /// Multi-org / multi-billing safety guard.  When set, every action is
+    /// checked structurally offline (no network, fires in dry-run) and, in apply
+    /// mode, against live state — so a run can only touch the pinned
+    /// organization and billing account.  A mismatch is refused before any
+    /// request is built.
+    #[serde(default)]
+    pub guard: Option<GuardSpec>,
 }
 
 fn default_dry_run() -> bool {
@@ -751,6 +785,20 @@ impl ProviderTool {
                     },
                 })
             }
+            "google.cloudresourcemanager.organizations.get" => {
+                // Read-only org describe.  Backs the guard's live display-name
+                // check and is a first-class action a playbook can call directly.
+                let org = require(
+                    &get("organization").or_else(|| org_from_input(input)),
+                    "organization",
+                    action,
+                )?;
+                Ok(ActionPlan {
+                    request: PlannedRequest::get(format!("{crm}/{org}")),
+                    mutates: false,
+                    apply: ApplyKind::Single,
+                })
+            }
             "google.cloudresourcemanager.projects.describe" => {
                 let project = require(
                     &get("project_id").or_else(|| get("projectId")),
@@ -1021,6 +1069,67 @@ impl ProviderTool {
         let json: serde_json::Value =
             serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!(text));
         Ok((status, json))
+    }
+
+    /// Live (read-only) belt-and-braces pass of the wrong-target guard.  Runs in
+    /// apply mode after credentials resolve.  Confirms the pinned org's
+    /// `displayName` and, when a billing account is pinned, that its `parent`
+    /// equals the pinned org.  A mismatch is refused before any mutating call.
+    async fn verify_guard_live(
+        &self,
+        guard: &GuardSpec,
+        creds: &crate::auth::AuthCredentials,
+    ) -> Result<(), ToolError> {
+        if let (Some(org), Some(want_name)) = (
+            guard.require_org.as_deref(),
+            guard.require_org_display_name.as_deref(),
+        ) {
+            let org = normalize_resource(org, "organizations/");
+            let req = PlannedRequest::get(format!("{}/{}", self.endpoints.crm, org));
+            let (status, body) = self.send(&req, creds).await?;
+            if !status.is_success() {
+                return Err(ToolError::Configuration(format!(
+                    "org guard live check could not verify {org}: GET returned {status}; \
+                     refusing to proceed"
+                )));
+            }
+            let got = body
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if got != want_name {
+                return Err(ToolError::Configuration(format!(
+                    "org guard REFUSED (live): {org} displayName is {got:?} but \
+                     require_org_display_name pins {want_name:?}"
+                )));
+            }
+        }
+
+        if let (Some(ba), Some(org)) = (
+            guard.require_billing_account.as_deref(),
+            guard.require_org.as_deref(),
+        ) {
+            let ba = normalize_resource(ba, "billingAccounts/");
+            let org = normalize_resource(org, "organizations/");
+            let req = PlannedRequest::get(format!("{}/{}", self.endpoints.billing, ba));
+            let (status, body) = self.send(&req, creds).await?;
+            if !status.is_success() {
+                return Err(ToolError::Configuration(format!(
+                    "billing guard live check could not verify {ba}: GET returned \
+                     {status}; refusing to proceed"
+                )));
+            }
+            if let Some(parent) = body.get("parent").and_then(|v| v.as_str()) {
+                if parent != org {
+                    return Err(ToolError::Configuration(format!(
+                        "billing guard REFUSED (live): {ba} parent is {parent:?} but \
+                         require_org pins {org:?}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Execute the planned request against the live API, erroring on non-2xx.
@@ -1408,6 +1517,14 @@ impl ProviderTool {
         }
 
         let action = spec.canonical_action()?;
+
+        // ---- Wrong-target guard, structural pass (Stage-1 safety) ----
+        // Purely offline: fires here, before any request is built or credential
+        // minted, so it protects dry-run, report, adopt, destroy, and apply
+        // alike.  Refuses if any input references an org / billing account other
+        // than the pinned one.
+        enforce_guard_offline(spec.guard.as_ref(), &action, &spec.input)?;
+
         let plan = self.plan_google(&action, &spec.input)?;
         let backend = match spec.runtime {
             Backend::Rest => "rest",
@@ -1497,6 +1614,14 @@ impl ProviderTool {
         })?;
 
         let creds = self.auth_resolver.resolve(auth_config, ctx).await?;
+
+        // ---- Wrong-target guard, live pass (belt-and-braces) ----
+        // Read-only GETs confirm the pinned org's displayName and the pinned
+        // billing account's parent before any mutating call for this step.
+        if let Some(g) = spec.guard.as_ref() {
+            self.verify_guard_live(g, &creds).await?;
+        }
+
         let (resource, changed) = self.apply_action(&plan, &creds, &spec.poll).await?;
 
         let mut data = serde_json::json!({
@@ -2485,6 +2610,94 @@ fn org_from_input(input: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// Normalize a resource reference to the `<prefix><id>` form, accepting either a
+/// bare id or an already-prefixed value (`561323743912` or
+/// `organizations/561323743912` → `organizations/561323743912`).
+fn normalize_resource(v: &str, prefix: &str) -> String {
+    let v = v.trim();
+    if v.starts_with(prefix) {
+        v.to_string()
+    } else {
+        format!("{prefix}{v}")
+    }
+}
+
+/// First path segment following `prefix` in `s`, if present (stops at `/` or
+/// `:`).  `organizations/561323743912:getIamPolicy` → `561323743912`.
+fn segment_after(s: &str, prefix: &str) -> Option<String> {
+    let idx = s.find(prefix)?;
+    let rest = &s[idx + prefix.len()..];
+    let seg = rest.split(['/', ':']).next().unwrap_or("").trim();
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
+/// Structural (offline, no-network) pass of the wrong-target guard.  Scans an
+/// action's input for `organizations/<id>` and `billingAccounts/<id>` references
+/// and refuses if any disagrees with the pinned guard values.  Returns `Ok(())`
+/// when there is no guard or every reference matches.  Because it needs no
+/// network, it fires in dry-run and before any credential is minted.
+fn enforce_guard_offline(
+    guard: Option<&GuardSpec>,
+    action: &str,
+    input: &serde_json::Value,
+) -> Result<(), ToolError> {
+    let Some(g) = guard else {
+        return Ok(());
+    };
+
+    // Candidate resource strings: every top-level string input value, plus the
+    // normalized `org_id` form (a bare `org_id` becomes `organizations/<id>`).
+    let mut refs: Vec<String> = Vec::new();
+    if let Some(obj) = input.as_object() {
+        for v in obj.values() {
+            if let serde_json::Value::String(s) = v {
+                if !s.is_empty() {
+                    refs.push(s.clone());
+                }
+            }
+        }
+    }
+    if let Some(org) = org_from_input(input) {
+        refs.push(org);
+    }
+
+    if let Some(want) = g.require_org.as_deref() {
+        let want_id = want.trim().trim_start_matches("organizations/");
+        for r in &refs {
+            if let Some(id) = segment_after(r, "organizations/") {
+                if id != want_id {
+                    return Err(ToolError::Configuration(format!(
+                        "org guard REFUSED: action {action:?} targets \
+                         organizations/{id} but require_org pins \
+                         organizations/{want_id}; no request built, no network call"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(want) = g.require_billing_account.as_deref() {
+        let want_id = want.trim().trim_start_matches("billingAccounts/");
+        for r in &refs {
+            if let Some(id) = segment_after(r, "billingAccounts/") {
+                if id != want_id {
+                    return Err(ToolError::Configuration(format!(
+                        "billing guard REFUSED: action {action:?} targets \
+                         billingAccounts/{id} but require_billing_account pins \
+                         billingAccounts/{want_id}; no request built"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Require a field, mapping absence to a clear config error.
 fn require(v: &Option<String>, field: &str, action: &str) -> Result<String, ToolError> {
     v.clone().ok_or_else(|| {
@@ -3262,7 +3475,8 @@ pub mod state {
             .and_then(|v| v.as_str())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         {
-            if let Some(fact) = fact_in_record(&body).or_else(|| fact_in_value_recursive(&body, 0)) {
+            if let Some(fact) = fact_in_record(&body).or_else(|| fact_in_value_recursive(&body, 0))
+            {
                 return Some(fact);
             }
         }
@@ -3289,9 +3503,9 @@ pub mod state {
                 map.values()
                     .find_map(|v| fact_in_value_recursive(v, depth + 1))
             }
-            serde_json::Value::Array(arr) => {
-                arr.iter().find_map(|v| fact_in_value_recursive(v, depth + 1))
-            }
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .find_map(|v| fact_in_value_recursive(v, depth + 1)),
             _ => None,
         }
     }
@@ -3461,6 +3675,229 @@ mod tests {
                 "https://cloudresourcemanager.googleapis.com/v3/folders?parent=organizations/561323743912"
             )
         );
+    }
+
+    // ---- wrong-target guard (Stage-1 safety) ----
+
+    #[tokio::test]
+    async fn guard_wrong_org_id_refused_offline() {
+        // The acting identity can see three orgs; a wrong ORG_ID must be refused
+        // structurally, before any request is built (dry-run → no network).
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        for wrong in ["103794563683", "712221118891"] {
+            let cfg = spec_config(serde_json::json!({
+                "provider": "google",
+                "action": "google.cloudresourcemanager.folders.ensure",
+                "dry_run": true,
+                "reconcile": "enforce",
+                "guard": { "require_org": "organizations/561323743912",
+                           "require_org_display_name": "shastaratech-org" },
+                "input": { "parent": format!("organizations/{wrong}"), "display_name": "20-media" }
+            }));
+            let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+            match err {
+                ToolError::Configuration(msg) => {
+                    assert!(msg.contains("org guard REFUSED"), "names the guard: {msg}");
+                    assert!(msg.contains(wrong), "names the wrong org {wrong}: {msg}");
+                    assert!(msg.contains("561323743912"), "names the pinned org: {msg}");
+                }
+                other => panic!("expected Configuration refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_correct_org_id_passes_offline() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.folders.ensure",
+            "dry_run": true,
+            "reconcile": "enforce",
+            "guard": { "require_org": "organizations/561323743912" },
+            "input": { "parent": "organizations/561323743912", "display_name": "20-media" }
+        }));
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(data["dry_run"], serde_json::json!(true));
+        assert_eq!(data["would_call"]["method"], serde_json::json!("POST"));
+    }
+
+    #[tokio::test]
+    async fn guard_wrong_billing_account_refused_offline() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudbilling.projects.link",
+            "dry_run": true,
+            "reconcile": "enforce",
+            "guard": { "require_org": "organizations/561323743912",
+                       "require_billing_account": "0153F3-73E360-BD0B38" },
+            "input": { "project_id": "shastaratech-youtube-prod",
+                       "billing_account": "billingAccounts/AAAAAA-BBBBBB-CCCCCC" }
+        }));
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        match err {
+            ToolError::Configuration(msg) => {
+                assert!(
+                    msg.contains("billing guard REFUSED"),
+                    "names the guard: {msg}"
+                );
+                assert!(
+                    msg.contains("AAAAAA-BBBBBB-CCCCCC"),
+                    "names the wrong account: {msg}"
+                );
+            }
+            other => panic!("expected Configuration refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_absent_is_noop() {
+        // No guard block → unchanged behavior (any org planned).
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.folders.ensure",
+            "dry_run": true,
+            "reconcile": "enforce",
+            "input": { "parent": "organizations/103794563683", "display_name": "x" }
+        }));
+        assert!(tool.execute(&cfg, &ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn organizations_get_builds_read_only_url() {
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.organizations.get",
+            "dry_run": true,
+            "input": { "organization": "organizations/561323743912" }
+        }));
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(data["would_call"]["method"], serde_json::json!("GET"));
+        assert_eq!(
+            data["would_call"]["url"],
+            serde_json::json!(
+                "https://cloudresourcemanager.googleapis.com/v3/organizations/561323743912"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_live_display_name_mismatch_refused() {
+        // Belt-and-braces: even if the pinned numeric ORG_ID passes the offline
+        // check, a live GET whose displayName doesn't match is refused before any
+        // mutating call.  Routed to a mock via the endpoint override.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/organizations/561323743912"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "organizations/561323743912", "displayName": "some-other-org"
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let mut cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.folders.ensure",
+            "dry_run": false,
+            "reconcile": "enforce",
+            "endpoint": server.uri(),
+            "guard": { "require_org": "organizations/561323743912",
+                       "require_org_display_name": "shastaratech-org" },
+            "input": { "parent": "organizations/561323743912", "display_name": "20-media" }
+        }));
+        cfg.auth = Some(gcp_auth());
+        let err = tool.execute(&cfg, &ctx).await.unwrap_err();
+        match err {
+            ToolError::Configuration(msg) => {
+                assert!(
+                    msg.contains("org guard REFUSED (live)"),
+                    "live refusal: {msg}"
+                );
+                assert!(
+                    msg.contains("some-other-org"),
+                    "names actual displayName: {msg}"
+                );
+            }
+            other => panic!("expected live guard refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_live_display_name_match_proceeds() {
+        // Matching displayName → the live guard passes and the folders.ensure
+        // converge proceeds against the mock.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/organizations/561323743912"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "organizations/561323743912", "displayName": "shastaratech-org"
+            })))
+            .mount(&server)
+            .await;
+        // folders list (converge GET-first): report the folder already present so
+        // the ensure is a no-op and no create is attempted.
+        Mock::given(method("GET"))
+            .and(path("/v3/folders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "folders": [ { "name": "folders/111", "displayName": "20-media", "state": "ACTIVE" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = ProviderTool::new();
+        let ctx = ExecutionContext::default();
+        let mut cfg = spec_config(serde_json::json!({
+            "provider": "google",
+            "action": "google.cloudresourcemanager.folders.ensure",
+            "dry_run": false,
+            "reconcile": "enforce",
+            "endpoint": server.uri(),
+            "guard": { "require_org": "organizations/561323743912",
+                       "require_org_display_name": "shastaratech-org" },
+            "input": { "parent": "organizations/561323743912", "display_name": "20-media" }
+        }));
+        cfg.auth = Some(gcp_auth());
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(
+            data["changed"],
+            serde_json::json!(false),
+            "already-present → no-op"
+        );
+    }
+
+    #[test]
+    fn enforce_guard_offline_unit() {
+        let g = GuardSpec {
+            require_org: Some("organizations/561323743912".into()),
+            require_org_display_name: None,
+            require_billing_account: Some("0153F3-73E360-BD0B38".into()),
+        };
+        // matching org via bare org_id form
+        assert!(enforce_guard_offline(
+            Some(&g),
+            "google.cloudresourcemanager.folders.ensure",
+            &serde_json::json!({ "org_id": "561323743912", "display_name": "x" })
+        )
+        .is_ok());
+        // wrong org via resource form
+        assert!(enforce_guard_offline(
+            Some(&g),
+            "google.cloudresourcemanager.organizations.iam.ensure_binding",
+            &serde_json::json!({ "resource": "organizations/999", "role": "r", "member": "m" })
+        )
+        .is_err());
+        // no guard → ok
+        assert!(enforce_guard_offline(None, "x", &serde_json::json!({})).is_ok());
     }
 
     // ---- explicit-auth decision: apply mode without auth: → Configuration, no network ----
@@ -5070,7 +5507,11 @@ mod tests {
             }),
         ];
         let facts = extract_facts_from_tier_records(&records);
-        assert_eq!(facts.len(), 1, "the deeply-nested fact is found; the other skipped");
+        assert_eq!(
+            facts.len(),
+            1,
+            "the deeply-nested fact is found; the other skipped"
+        );
         assert_eq!(facts[0].urn, "urn:deep");
 
         let model = fold_tier_records(&records);
@@ -5093,8 +5534,15 @@ mod tests {
             outcome: "changed".to_string(),
         };
         // prod owns a,b; staging owns c.
-        let model = fold_facts(&[f("urn:a", "prod"), f("urn:b", "prod"), f("urn:c", "staging")]);
-        assert_eq!(model.stacks(), vec!["prod".to_string(), "staging".to_string()]);
+        let model = fold_facts(&[
+            f("urn:a", "prod"),
+            f("urn:b", "prod"),
+            f("urn:c", "staging"),
+        ]);
+        assert_eq!(
+            model.stacks(),
+            vec!["prod".to_string(), "staging".to_string()]
+        );
         assert_eq!(model.for_stack("prod").owned.len(), 2);
         assert_eq!(model.for_stack("staging").owned.len(), 1);
 
@@ -5106,7 +5554,11 @@ mod tests {
 
         // Un-scoped detect over the mixed model would wrongly flag staging's c.
         let unscoped = detect_orphans(&model, &declared);
-        assert_eq!(unscoped.len(), 2, "unscoped conflates stacks — the bug this fixes");
+        assert_eq!(
+            unscoped.len(),
+            2,
+            "unscoped conflates stacks — the bug this fixes"
+        );
     }
 
     #[test]
@@ -5135,6 +5587,9 @@ mod tests {
         let conflicts = detect_stack_conflicts(&facts);
         assert_eq!(conflicts.len(), 1, "only the un-transferred contention");
         assert_eq!(conflicts[0].urn, "urn:x");
-        assert_eq!(conflicts[0].stacks, vec!["prod".to_string(), "staging".to_string()]);
+        assert_eq!(
+            conflicts[0].stacks,
+            vec!["prod".to_string(), "staging".to_string()]
+        );
     }
 }
