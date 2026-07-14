@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.25.0](https://github.com/noetl/tools/compare/v3.24.0...v3.25.0) (2026-07-14)
+
+### Features
+
+* **provider:** wire-shape eventlog-tier fold adapter + stack-scoped ownership ([#90](https://github.com/noetl/tools/issues/90)) ([b4d4ebc](https://github.com/noetl/tools/commit/b4d4ebc514ed25102f18b99f5fd691ae88b722bb))
+
 ## [3.24.0](https://github.com/noetl/tools/compare/v3.23.0...v3.24.0) (2026-07-13)
 
 ### Features
