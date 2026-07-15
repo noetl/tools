@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.26.0](https://github.com/noetl/tools/compare/v3.25.0...v3.26.0) (2026-07-15)
+
+### Features
+
+* **provider:** wrong-target org/billing guard + organizations.get, and two apply-path fixes ([#91](https://github.com/noetl/tools/issues/91)) ([eada49c](https://github.com/noetl/tools/commit/eada49c1f21ab43e87fcc7c8b098a5ddb268dd0b))
+
 ## [3.25.0](https://github.com/noetl/tools/compare/v3.24.0...v3.25.0) (2026-07-14)
 
 ### Features
