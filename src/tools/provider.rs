@@ -1238,7 +1238,9 @@ impl ProviderTool {
                 creds,
             )
             .await?;
-        let resource = self.await_operation(op, creds, poll).await?;
+        let resource = self
+            .await_operation(op, creds, poll, &self.endpoints.crm)
+            .await?;
         Ok((resource, true))
     }
 
@@ -1263,7 +1265,13 @@ impl ProviderTool {
             // is a destructive-adjacent verb out of round-2 scope.
             return Ok((body, false));
         }
-        if status != StatusCode::NOT_FOUND {
+        // `projects.get` returns **403 (not 404)** for a project that does not
+        // exist — Google's anti-enumeration behavior ("...denied on resource X
+        // (or it may not exist)").  So treat FORBIDDEN and NOT_FOUND alike as
+        // "not present → attempt create".  The create is the definitive test:
+        // it succeeds for a globally-free id and fails with a clear
+        // already-exists / permission error for a taken one.
+        if status != StatusCode::NOT_FOUND && status != StatusCode::FORBIDDEN {
             return Err(ToolError::Http(format!(
                 "google API {} for GET {}/projects/{project_id}: {}",
                 status.as_u16(),
@@ -1271,7 +1279,7 @@ impl ProviderTool {
                 redact_sensitive(&body)
             )));
         }
-        // 404 → create.
+        // Absent (404 or 403-may-not-exist) → create.
         let op = self
             .execute_request(
                 &PlannedRequest::post(
@@ -1285,7 +1293,9 @@ impl ProviderTool {
                 creds,
             )
             .await?;
-        let resource = self.await_operation(op, creds, poll).await?;
+        let resource = self
+            .await_operation(op, creds, poll, &self.endpoints.crm)
+            .await?;
         Ok((resource, true))
     }
 
@@ -1321,7 +1331,10 @@ impl ProviderTool {
                 creds,
             )
             .await?;
-        let resource = self.await_operation(op, creds, poll).await?;
+        // Service Usage operation → poll serviceusage, NOT crm.
+        let resource = self
+            .await_operation(op, creds, poll, &self.endpoints.serviceusage)
+            .await?;
         Ok((resource, true))
     }
 
@@ -1402,6 +1415,10 @@ impl ProviderTool {
         initial: serde_json::Value,
         creds: &crate::auth::AuthCredentials,
         poll: &PollConfig,
+        // Base URL to poll the operation against — MUST match the service that
+        // created it (Service Usage operations poll serviceusage, CRM operations
+        // poll crm).  Polling the wrong host 400s ("unsupported operation name").
+        poll_base: &str,
     ) -> Result<serde_json::Value, ToolError> {
         let op_name = operation_name(&initial);
         let mut current = initial;
@@ -1431,10 +1448,7 @@ impl ProviderTool {
             };
             tokio::time::sleep(Duration::from_millis(poll.interval_ms)).await;
             let (status, body) = self
-                .send(
-                    &PlannedRequest::get(format!("{}/{name}", self.endpoints.crm)),
-                    creds,
-                )
+                .send(&PlannedRequest::get(format!("{poll_base}/{name}")), creds)
                 .await?;
             if !status.is_success() {
                 return Err(ToolError::Http(format!(
@@ -1959,13 +1973,17 @@ impl ProviderTool {
         match kind {
             DestroyKind::DeleteFolder { .. } | DestroyKind::DeleteProject { .. } => {
                 let op = self.execute_request(&resolved.request, creds).await?;
-                let resource = self.await_operation(op, creds, poll).await?;
+                let resource = self
+                    .await_operation(op, creds, poll, &self.endpoints.crm)
+                    .await?;
                 Ok((resource, true))
             }
             DestroyKind::DisableService { .. } => {
                 // Disable returns an LRO on serviceusage; poll it to done.
                 let op = self.execute_request(&resolved.request, creds).await?;
-                let resource = self.await_operation(op, creds, poll).await?;
+                let resource = self
+                    .await_operation(op, creds, poll, &self.endpoints.crm)
+                    .await?;
                 Ok((resource, true))
             }
             DestroyKind::RemoveIamBinding {
@@ -4194,6 +4212,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_service_polls_serviceusage_not_crm() {
+        // Regression: services.enable returns a pending Service Usage operation
+        // that MUST be polled at serviceusage (/v1/operations/...), NOT crm
+        // (/v3/...).  Only the serviceusage poll path is mounted — if the tool
+        // polled crm the poll would 404 and the test would fail.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p/services/youtube.googleapis.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/p/services/youtube.googleapis.com", "state": "DISABLED"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/p/services/youtube.googleapis.com:enable",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/su.enable-1", "done": false
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/operations/su.enable-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/su.enable-1", "done": true,
+                "response": { "name": "projects/p/services/youtube.googleapis.com", "state": "ENABLED" }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = apply_cfg(
+            "google.serviceusage.services.enable",
+            serde_json::json!({ "project_id": "p", "service_name": "youtube.googleapis.com" }),
+        );
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(
+            data["changed"],
+            serde_json::json!(true),
+            "enable converged via serviceusage poll"
+        );
+    }
+
+    #[tokio::test]
     async fn ensure_folder_is_noop_when_already_present() {
         let server = MockServer::start().await;
         // List → the folder already exists → no create should be issued.
@@ -4273,6 +4337,43 @@ mod tests {
             data2["changed"],
             serde_json::json!(false),
             "re-running projects.ensure against an existing project must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_project_creates_on_403_may_not_exist() {
+        // Google returns 403 (not 404) for a project that does not exist yet
+        // ("...denied on resource X (or it may not exist)"). The GET-first
+        // converge must treat that as absent and proceed to create.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/shastaratech-youtube-prod"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "code": 403, "status": "PERMISSION_DENIED",
+                    "message": "Permission 'resourcemanager.projects.get' denied on resource ... (or it may not exist)." }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v3/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "operations/pc.1", "done": true,
+                "response": { "name": "projects/shastaratech-youtube-prod", "projectId": "shastaratech-youtube-prod" }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = tool_for(&server);
+        let ctx = ExecutionContext::default();
+        let cfg = apply_cfg(
+            "google.cloudresourcemanager.projects.ensure",
+            serde_json::json!({ "project_id": "shastaratech-youtube-prod", "parent": "folders/654659624272" }),
+        );
+        let data = tool.execute(&cfg, &ctx).await.unwrap().data.unwrap();
+        assert_eq!(
+            data["changed"],
+            serde_json::json!(true),
+            "a 403-may-not-exist on GET must be treated as absent → create"
         );
     }
 
