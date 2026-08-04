@@ -304,13 +304,56 @@ pub struct ContainerEnvVar {
     pub name: String,
     /// Literal value.  Templating runs against this before the
     /// Job spec is built.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Deserialized through [`scalar_to_string`] because the value that reaches
+    /// here has already been through the server's template renderer, which
+    /// TYPES what it renders: `PGPORT: "5432"` arrives as a JSON number, and
+    /// `EXECUTION_ID: "{{ execution_id }}"` renders to a bare integer and does
+    /// the same.  A plain `Option<String>` rejected both with
+    /// `invalid type: integer \`5432\`, expected a string`, so the fixture had to
+    /// drop `PGPORT` and prefix the id with `exec-` to keep the values
+    /// non-numeric (noetl/ai-meta#186 Bug 3).
+    ///
+    /// A K8s env var is a string at the API boundary regardless, so accepting a
+    /// scalar and stringifying it loses nothing — it just stops the playbook
+    /// author having to defeat the renderer's typing.
+    #[serde(default, deserialize_with = "scalar_to_string", skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// Reference to a Secret already on the cluster.  When set,
     /// `value` MUST be `None`; the playbook spec is invalid
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_from: Option<EnvValueFrom>,
+}
+
+/// Deserialize a JSON scalar into `Option<String>`.
+///
+/// Accepts a string, a number, or a bool and renders it the way K8s will see
+/// it anyway.  Rejects arrays and objects, which are a genuine authoring
+/// mistake rather than a typing artefact — an env var has no meaningful
+/// container-shaped value, and silently stringifying `{}` would hide it.
+///
+/// `null` maps to `None`, matching `#[serde(default)]`.
+fn scalar_to_string<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = Option::<serde_json::Value>::deserialize(de)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(other) => Err(D::Error::custom(format!(
+            "env value must be a scalar (string, number or bool); got {}",
+            match other {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::Object(_) => "an object",
+                _ => "an unsupported value",
+            }
+        ))),
+    }
 }
 
 /// `valueFrom` subset we support today.  Future rounds may add
@@ -823,6 +866,64 @@ impl Tool for ContainerTool {
         }));
         result.pending_callback = Some(true);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod env_scalar_tests {
+    use super::*;
+
+    fn env(json: serde_json::Value) -> Result<ContainerEnvVar, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    /// noetl/ai-meta#186 Bug 3. The server's renderer TYPES what it renders, so
+    /// `PGPORT: "5432"` reaches the tool as a JSON number and
+    /// `EXECUTION_ID: "{{ execution_id }}"` renders to a bare integer. A plain
+    /// `Option<String>` rejected both with
+    /// `invalid type: integer 5432, expected a string`, which is why the
+    /// fixture had to drop PGPORT and prefix the id with `exec-`.
+    #[test]
+    fn a_numeric_env_value_is_accepted() {
+        let v = env(serde_json::json!({"name": "PGPORT", "value": 5432})).expect("number accepted");
+        assert_eq!(v.value.as_deref(), Some("5432"));
+
+        let v = env(serde_json::json!({"name": "EXECUTION_ID", "value": 343151592536543232i64}))
+            .expect("a bare execution_id must not need an `exec-` prefix to parse");
+        assert_eq!(v.value.as_deref(), Some("343151592536543232"));
+
+        let v = env(serde_json::json!({"name": "RATIO", "value": 1.5})).expect("float accepted");
+        assert_eq!(v.value.as_deref(), Some("1.5"));
+
+        let v = env(serde_json::json!({"name": "DEBUG", "value": true})).expect("bool accepted");
+        assert_eq!(v.value.as_deref(), Some("true"));
+    }
+
+    /// The ordinary case must be untouched.
+    #[test]
+    fn a_string_env_value_still_works() {
+        let v = env(serde_json::json!({"name": "PGHOST", "value": "postgres"})).unwrap();
+        assert_eq!(v.value.as_deref(), Some("postgres"));
+        let v = env(serde_json::json!({"name": "EMPTY", "value": ""})).unwrap();
+        assert_eq!(v.value.as_deref(), Some(""), "an empty string is a value, not absence");
+    }
+
+    /// The control. Widening to "any scalar" must not become "anything":
+    /// a container-shaped env value is an authoring mistake, and silently
+    /// stringifying `{}` into the Job spec would hide it.
+    #[test]
+    fn a_container_shaped_env_value_is_still_rejected() {
+        assert!(env(serde_json::json!({"name": "A", "value": {"k": "v"}})).is_err());
+        assert!(env(serde_json::json!({"name": "A", "value": ["x"]})).is_err());
+    }
+
+    /// `valueFrom` and an absent value keep working — `null` is absence.
+    #[test]
+    fn absence_still_means_absence() {
+        let v = env(serde_json::json!({"name": "A"})).unwrap();
+        assert!(v.value.is_none());
+        let v = env(serde_json::json!({"name": "A", "value": null})).unwrap();
+        assert!(v.value.is_none());
     }
 }
 
