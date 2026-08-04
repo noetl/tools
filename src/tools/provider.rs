@@ -3344,17 +3344,77 @@ pub mod state {
     /// adapter (out of scope for this pure crate); feeding the fetched records
     /// here yields the same fact stream a converge emits.
     ///
-    /// A `provider_fact` rides *inside* a step result payload, so the common
-    /// nesting shapes are probed: `result.data.provider_fact`,
-    /// `data.provider_fact`, and a bare top-level `provider_fact`.
+    /// A `provider_fact` rides *inside* a step result payload. This used to probe
+    /// only three fixed shapes — `result.data.provider_fact`,
+    /// `data.provider_fact`, and a bare top-level `provider_fact` — and returned
+    /// **zero facts, silently**, against real event data, because a `call.done`
+    /// event nests the tool result at `context.result.context.data.provider_fact`
+    /// and none of the three reach it
+    /// ([noetl/ai-meta#191](https://github.com/noetl/ai-meta/issues/191)).
+    ///
+    /// It now shares [`fact_in_tier_record`] with
+    /// [`extract_facts_from_tier_records`], so both entry points understand the
+    /// same shapes. Keeping two extractors, one of them known broken, is how a
+    /// caller picks the broken one by accident.
     pub fn extract_facts_from_eventlog(records: &[serde_json::Value]) -> Vec<ProviderFact> {
-        records.iter().filter_map(fact_in_record).collect()
+        records.iter().filter_map(fact_in_tier_record).collect()
     }
 
     /// Convenience: extract + fold raw eventlog-tier records into an ownership
     /// model in one call.
     pub fn fold_eventlog(records: &[serde_json::Value]) -> OwnershipModel {
         fold_facts(&extract_facts_from_eventlog(records))
+    }
+
+    /// What a fold understood, so an empty result is not ambiguous.
+    ///
+    /// An empty [`OwnershipModel`] is a perfectly valid state — nothing is
+    /// tracked yet — which is exactly why a fold that silently fails to parse
+    /// looks identical to a clean slate. That ambiguity was the dangerous half
+    /// of noetl/ai-meta#191, and it survived the extraction fix: neither
+    /// extractor errors, logs, or reports how much it looked at.
+    ///
+    /// This carries the counts so the caller can tell the two apart:
+    /// `considered > 0 && matched == 0` means "records were present and none was
+    /// understood", which is a bug, not a clean slate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FoldCoverage {
+        /// Records handed to the fold.
+        pub considered: usize,
+        /// Records that yielded a strict [`ProviderFact`].
+        pub matched: usize,
+    }
+
+    impl FoldCoverage {
+        /// Records were present and **none** was understood — indistinguishable
+        /// from a clean slate in the return value alone, so callers should treat
+        /// it as a failure to parse rather than an empty world.
+        pub fn is_suspicious(&self) -> bool {
+            self.considered > 0 && self.matched == 0
+        }
+    }
+
+    /// [`fold_eventlog`] plus the coverage counts — the non-silent entry point.
+    ///
+    /// Prefer this wherever an empty model would be acted on. It also logs at
+    /// WARN when the fold is suspicious, so the condition is visible even to a
+    /// caller that ignores the return value.
+    pub fn fold_eventlog_with_coverage(
+        records: &[serde_json::Value],
+    ) -> (OwnershipModel, FoldCoverage) {
+        let facts = extract_facts_from_eventlog(records);
+        let coverage = FoldCoverage {
+            considered: records.len(),
+            matched: facts.len(),
+        };
+        if coverage.is_suspicious() {
+            tracing::warn!(
+                considered = coverage.considered,
+                "provider_state fold understood none of the records it was given — \
+                 this is a parse failure, not an empty ownership model (noetl/ai-meta#191)"
+            );
+        }
+        (fold_facts(&facts), coverage)
     }
 
     /// Extract facts from **wire-shape** EHDB eventlog-tier records — the
@@ -5529,6 +5589,77 @@ mod tests {
     }
 
     // ---- raw-eventlog-tier adapter: extract nested provider_fact, fold ----
+
+    #[test]
+    fn eventlog_fold_reaches_the_real_call_done_nesting() {
+        use super::state::{extract_facts_from_eventlog, fold_eventlog};
+        // The shape that made noetl/ai-meta#191 silent: a `call.done` event nests
+        // the tool result at `context.result.context.data.provider_fact`, which
+        // none of the three fixed paths reached.
+        let records = vec![serde_json::json!({
+            "event_id": 1,
+            "event_type": "call.done",
+            "context": { "result": { "context": { "data": { "provider_fact":
+                {"urn": "gcp:project/deep-nested", "provider": "gcp", "service": "cloudresourcemanager", "resource_type": "project", "verb": "ensure", "stack": "s1", "execution_id": 1, "outcome": "changed"}
+            }}}}
+        })];
+        let facts = extract_facts_from_eventlog(&records);
+        assert_eq!(facts.len(), 1, "the real call.done nesting must be reached");
+        assert_eq!(facts[0].urn, "gcp:project/deep-nested");
+        assert_eq!(fold_eventlog(&records).owned.len(), 1);
+    }
+
+    /// The two entry points must not disagree — keeping a second, weaker
+    /// extractor exported is how a caller picks the broken one by accident.
+    #[test]
+    fn both_eventlog_entry_points_agree() {
+        use super::state::{extract_facts_from_eventlog, extract_facts_from_tier_records};
+        let records = vec![
+            serde_json::json!({"result": {"data": {"provider_fact": {"urn": "gcp:project/a", "provider": "gcp", "service": "cloudresourcemanager", "resource_type": "project", "verb": "ensure", "stack": "s1", "execution_id": 1, "outcome": "changed"}}}}),
+            serde_json::json!({"context": {"result": {"context": {"data": {"provider_fact": {"urn": "gcp:project/b", "provider": "gcp", "service": "cloudresourcemanager", "resource_type": "project", "verb": "ensure", "stack": "s1", "execution_id": 1, "outcome": "changed"}}}}}}),
+        ];
+        assert_eq!(
+            extract_facts_from_eventlog(&records).len(),
+            extract_facts_from_tier_records(&records).len()
+        );
+    }
+
+    /// noetl/ai-meta#191's dangerous half: an empty fold over a NON-empty record
+    /// set must be distinguishable from a genuinely clean slate.
+    #[test]
+    fn coverage_separates_a_parse_failure_from_an_empty_world() {
+        use super::state::fold_eventlog_with_coverage;
+        // Records present, none understood -> suspicious.
+        let junk = vec![
+            serde_json::json!({"event_id": 1, "unrelated": {"nope": true}}),
+            serde_json::json!({"event_id": 2, "provider_fact": {"urn": "missing-fields"}}),
+        ];
+        let (model, cov) = fold_eventlog_with_coverage(&junk);
+        assert!(model.owned.is_empty());
+        assert_eq!(cov.considered, 2);
+        assert_eq!(cov.matched, 0);
+        assert!(
+            cov.is_suspicious(),
+            "a parse failure must be reported as one"
+        );
+
+        // Genuinely nothing to fold -> NOT suspicious.
+        let (_, cov) = fold_eventlog_with_coverage(&[]);
+        assert_eq!(cov.considered, 0);
+        assert!(
+            !cov.is_suspicious(),
+            "a clean slate must not read as a failure"
+        );
+
+        // Records present and understood -> not suspicious.
+        let good = vec![
+            serde_json::json!({"result": {"data": {"provider_fact": {"urn": "gcp:project/x", "provider": "gcp", "service": "cloudresourcemanager", "resource_type": "project", "verb": "ensure", "stack": "s1", "execution_id": 1, "outcome": "changed"}}}}),
+        ];
+        let (model, cov) = fold_eventlog_with_coverage(&good);
+        assert_eq!(model.owned.len(), 1);
+        assert_eq!((cov.considered, cov.matched), (1, 1));
+        assert!(!cov.is_suspicious());
+    }
 
     #[test]
     fn extract_facts_from_eventlog_pulls_nested_fact_and_folds() {
