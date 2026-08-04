@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.26.1](https://github.com/noetl/tools/compare/v3.26.0...v3.26.1) (2026-08-04)
+
+### Bug Fixes
+
+* **provider:** one eventlog extractor, and make an empty fold say why ([f1eb15c](https://github.com/noetl/tools/commit/f1eb15c34951f1922552b59ce5ebbb7c5390dc0b)), closes [noetl/ai-meta#191](https://github.com/noetl/ai-meta/issues/191)
+
 ## [3.26.0](https://github.com/noetl/tools/compare/v3.25.0...v3.26.0) (2026-07-15)
 
 ### Features
