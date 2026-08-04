@@ -3443,13 +3443,54 @@ pub mod state {
     /// [`extract_facts_from_eventlog`] handles) still works — the payload-string
     /// unwrap is best-effort and the fixed-path probe runs first.
     pub fn extract_facts_from_tier_records(records: &[serde_json::Value]) -> Vec<ProviderFact> {
-        records.iter().filter_map(fact_in_tier_record).collect()
+        let (facts, _) = extract_facts_from_tier_records_with_coverage(records);
+        facts
+    }
+
+    /// [`extract_facts_from_tier_records`] plus the coverage counts.
+    ///
+    /// This is the path the CLI actually takes — `--facts-file` and `--server`
+    /// both land here — so this is where the silence in noetl/ai-meta#191 has to
+    /// be closed. The `fold_eventlog_with_coverage` added earlier warns on the
+    /// *other* extractor, which no production caller reaches; a fix only reachable
+    /// from tests leaves the live path exactly as silent as it was.
+    ///
+    /// The WARN fires from the plain entry point too, so an existing caller that
+    /// ignores coverage still gets the signal without a code change. That is
+    /// deliberate: the failure this guards is one where the return value is a
+    /// *valid* value, so a caller has no reason to look.
+    pub fn extract_facts_from_tier_records_with_coverage(
+        records: &[serde_json::Value],
+    ) -> (Vec<ProviderFact>, FoldCoverage) {
+        let facts: Vec<ProviderFact> = records.iter().filter_map(fact_in_tier_record).collect();
+        let coverage = FoldCoverage {
+            considered: records.len(),
+            matched: facts.len(),
+        };
+        if coverage.is_suspicious() {
+            tracing::warn!(
+                considered = coverage.considered,
+                "provider_state fold understood none of the {} tier record(s) it was given — \
+                 this is a parse failure, not an empty ownership model (noetl/ai-meta#191)",
+                coverage.considered
+            );
+        }
+        (facts, coverage)
     }
 
     /// Convenience: extract + fold wire-shape tier records into an ownership
     /// model in one call.
     pub fn fold_tier_records(records: &[serde_json::Value]) -> OwnershipModel {
         fold_facts(&extract_facts_from_tier_records(records))
+    }
+
+    /// [`fold_tier_records`] plus the coverage counts — the non-silent entry
+    /// point for the tier path, mirroring [`fold_eventlog_with_coverage`].
+    pub fn fold_tier_records_with_coverage(
+        records: &[serde_json::Value],
+    ) -> (OwnershipModel, FoldCoverage) {
+        let (facts, coverage) = extract_facts_from_tier_records_with_coverage(records);
+        (fold_facts(&facts), coverage)
     }
 
     /// Orphan detection **scoped to one stack** (Round 5 — scoping fix).
@@ -5622,6 +5663,53 @@ mod tests {
             extract_facts_from_eventlog(&records).len(),
             extract_facts_from_tier_records(&records).len()
         );
+    }
+
+    /// The same guarantee on the path the CLI actually takes.
+    ///
+    /// This is the test that would have caught the gap. `fold_eventlog_with_coverage`
+    /// closed the silence on an extractor with **no production caller** —
+    /// `provider_cli.rs::load_facts` reaches `extract_facts_from_tier_records`
+    /// on both its `--facts-file` and `--server` branches, and that one was still
+    /// a bare `filter_map().collect()`. A fix reachable only from tests leaves the
+    /// live path exactly as silent as it was, and passes its own test doing it.
+    #[test]
+    fn the_tier_path_the_cli_uses_is_also_non_silent() {
+        use super::state::{extract_facts_from_tier_records_with_coverage, fold_tier_records_with_coverage};
+        // Records present, none understood: a parse failure wearing the shape of
+        // an empty world.
+        let junk = vec![
+            serde_json::json!({"global_sequence": 1, "payload": "{\"event_type\":\"call.done\",\"context\":{\"nope\":true}}"}),
+            serde_json::json!({"global_sequence": 2, "unrelated": {"x": 1}}),
+        ];
+        let (facts, cov) = extract_facts_from_tier_records_with_coverage(&junk);
+        assert!(facts.is_empty());
+        assert_eq!(cov.considered, 2);
+        assert_eq!(cov.matched, 0);
+        assert!(cov.is_suspicious(), "records present and none understood must be suspicious");
+
+        // A genuinely clean slate must NOT be suspicious — otherwise the signal
+        // fires on the normal case and gets ignored, which is the same failure.
+        let (_, empty_cov) = fold_tier_records_with_coverage(&[]);
+        assert!(!empty_cov.is_suspicious(), "an empty world is not a parse failure");
+
+        // And a real tier record still folds, with coverage agreeing.
+        let good = vec![serde_json::json!({
+            "global_sequence": 3,
+            "payload": serde_json::to_string(&serde_json::json!({
+                "event_type": "call.done",
+                "context": {"result": {"context": {"data": {"provider_fact": {
+                    "urn": "gcp:project/tier-real", "provider": "gcp",
+                    "service": "cloudresourcemanager", "resource_type": "project",
+                    "verb": "ensure", "stack": "s1", "execution_id": 3,
+                    "outcome": "changed"}}}}}
+            })).unwrap()
+        })];
+        let (model, cov) = fold_tier_records_with_coverage(&good);
+        assert_eq!(cov.considered, 1);
+        assert_eq!(cov.matched, 1);
+        assert!(!cov.is_suspicious());
+        assert_eq!(model.owned.len(), 1, "a real tier record must still fold");
     }
 
     /// noetl/ai-meta#191's dangerous half: an empty fold over a NON-empty record
