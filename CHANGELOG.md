@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.26.3](https://github.com/noetl/tools/compare/v3.26.2...v3.26.3) (2026-08-05)
+
+### Bug Fixes
+
+* **provider:** close the [#191](https://github.com/noetl/tools/issues/191) silence on the path the CLI actually takes ([94c6b99](https://github.com/noetl/tools/commit/94c6b99c5c712978d5f99f7b12b6cfb0c1146dd6))
+
 ## [3.26.2](https://github.com/noetl/tools/compare/v3.26.1...v3.26.2) (2026-08-05)
 
 ### Bug Fixes
