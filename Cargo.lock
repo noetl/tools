@@ -2467,7 +2467,7 @@ version = "0.1.1"
 
 [[package]]
 name = "noetl-tools"
-version = "3.26.1"
+version = "3.26.2"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.26.2](https://github.com/noetl/tools/compare/v3.26.1...v3.26.2) (2026-08-05)
+
+### Bug Fixes
+
+* **container:** accept a scalar env value instead of demanding a string ([1de9180](https://github.com/noetl/tools/commit/1de9180a8652176506169850f4c9e1b5e7bd3642)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186)
+
 ## [3.26.1](https://github.com/noetl/tools/compare/v3.26.0...v3.26.1) (2026-08-04)
 
 ### Bug Fixes
