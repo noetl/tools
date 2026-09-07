@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.27.0](https://github.com/noetl/tools/compare/v3.26.3...v3.27.0) (2026-09-07)
+
+### Features
+
+* **playbook:** carry the spawned child's execution id on ToolResult ([#328](https://github.com/noetl/tools/issues/328)) ([f6f66fa](https://github.com/noetl/tools/commit/f6f66fad72c9bc35d957083cf0c365cbb8e2fdbe)), closes [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326) [#389](https://github.com/noetl/tools/issues/389)
+
 ## [3.26.3](https://github.com/noetl/tools/compare/v3.26.2...v3.26.3) (2026-08-05)
 
 ### Bug Fixes
