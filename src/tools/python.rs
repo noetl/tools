@@ -766,6 +766,7 @@ except Exception as __noetl_err:
             exit_code: Some(exit_code),
             duration_ms: Some(duration_ms),
             pending_callback: None,
+            child_execution_id: None,
         })
     }
 

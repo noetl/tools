@@ -93,6 +93,32 @@ pub struct ToolResult {
     /// just see early completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_callback: Option<bool>,
+
+    /// The execution this tool spawned, when it spawned one
+    /// (noetl/ai-meta#328).
+    ///
+    /// # Why this is a field and not a key in `data`
+    ///
+    /// A `kind: playbook` step with `return_result: true` **unwraps** the
+    /// child's async-start envelope and returns the child's own payload
+    /// instead. The envelope is the only place the child's `execution_id`
+    /// appeared, so unwrapping it erased the one record of *which* execution
+    /// this step spawned — leaving the parent's `call.done` naming no child.
+    ///
+    /// That is not cosmetic. When the child's own `parent_execution_id`
+    /// column was lost (noetl/ai-meta#326), the spawn relationship had **no
+    /// second copy anywhere in `noetl.*`** and ten executions were permanently
+    /// unrecoverable. A playbook whose parent records the child survives that;
+    /// one whose parent does not, does not.
+    ///
+    /// Carried beside `data` rather than inside it so the value reaches the
+    /// event log without altering the payload a step's consumer parses — the
+    /// child's result is the contract, and widening it to fix an observability
+    /// gap would make every `return_result` caller's data shape depend on this.
+    ///
+    /// `None` for every tool that spawns nothing, which is all of them but one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_execution_id: Option<String>,
 }
 
 impl ToolResult {
@@ -107,7 +133,18 @@ impl ToolResult {
             exit_code: None,
             duration_ms: None,
             pending_callback: None,
+            child_execution_id: None,
         }
+    }
+
+    /// Record the execution this tool spawned.
+    ///
+    /// ⚠ Chainable and explicit: a tool that spawns a child and does not call
+    /// this produces a `call.done` that names no child, which is exactly the
+    /// noetl/ai-meta#328 gap.
+    pub fn with_child_execution_id(mut self, id: impl Into<String>) -> Self {
+        self.child_execution_id = Some(id.into());
+        self
     }
 
     /// Create an error result with message.
@@ -121,6 +158,7 @@ impl ToolResult {
             exit_code: None,
             duration_ms: None,
             pending_callback: None,
+            child_execution_id: None,
         }
     }
 
@@ -138,6 +176,7 @@ impl ToolResult {
             exit_code: None,
             duration_ms: Some(duration_seconds * 1000),
             pending_callback: None,
+            child_execution_id: None,
         }
     }
 
@@ -166,6 +205,7 @@ impl ToolResult {
             exit_code: Some(exit_code),
             duration_ms: None,
             pending_callback: None,
+            child_execution_id: None,
         }
     }
 
@@ -198,6 +238,7 @@ impl Default for ToolResult {
             exit_code: None,
             duration_ms: None,
             pending_callback: None,
+            child_execution_id: None,
         }
     }
 }
