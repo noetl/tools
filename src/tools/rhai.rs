@@ -256,6 +256,7 @@ impl RhaiTool {
                     exit_code: None,
                     duration_ms: Some(duration_ms),
                     pending_callback: None,
+                    child_execution_id: None,
                 })
             }
             Err(e) => {

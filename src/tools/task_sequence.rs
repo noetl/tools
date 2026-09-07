@@ -271,6 +271,7 @@ impl Tool for TaskSequenceTool {
                     exit_code: Some(1),
                     duration_ms: Some(duration_ms),
                     pending_callback: None,
+                    child_execution_id: None,
                 });
             }
 
@@ -616,6 +617,7 @@ impl Tool for TaskSequenceTool {
                                 exit_code: Some(1),
                                 duration_ms: Some(duration_ms),
                                 pending_callback: None,
+                                child_execution_id: None,
                             });
                         }
                     }
@@ -651,6 +653,7 @@ impl Tool for TaskSequenceTool {
                             exit_code: Some(total_exit_code),
                             duration_ms: Some(duration_ms),
                             pending_callback: None,
+                            child_execution_id: None,
                         });
                     }
                     let delay_secs = calc_retry_delay(&backoff, delay, *count);
@@ -690,6 +693,7 @@ impl Tool for TaskSequenceTool {
                         exit_code: Some(if task_errored { total_exit_code } else { 1 }),
                         duration_ms: Some(duration_ms),
                         pending_callback: None,
+                        child_execution_id: None,
                     });
                 }
             }
@@ -863,6 +867,7 @@ fn build_pipeline_result(
         exit_code: Some(exit_code),
         duration_ms: Some(duration_ms),
         pending_callback: None,
+        child_execution_id: None,
     }
 }
 

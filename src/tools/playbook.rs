@@ -389,7 +389,12 @@ impl Tool for PlaybookTool {
                 "execution_id": child_execution_id,
                 "path": playbook_config.path,
                 "async": true
-            })));
+            }))
+            // Redundant here — the payload already names the child — but set on
+            // BOTH paths so the field means "this tool spawned that execution"
+            // unconditionally, rather than "…except on the path that happens to
+            // inline it", which is the shape that made #328 invisible.
+            .with_child_execution_id(child_execution_id));
         }
 
         // Blocking wait mode.  `return_result` (#136) defaults to a longer
@@ -416,11 +421,16 @@ impl Tool for PlaybookTool {
                     // fails loudly instead of rendering placeholders.
                     return Err(ToolError::Timeout(timeout_seconds));
                 }
+                // Caught by the source guard below, not by review: this
+                // return names the child in its payload but did not carry the
+                // field, so a timed-out spawn would still have produced a
+                // `call.done` the field could not be read from.
                 return Ok(ToolResult::success(serde_json::json!({
                     "status": "timeout",
                     "execution_id": child_execution_id,
                     "timeout_seconds": timeout_seconds
-                })));
+                }))
+                .with_child_execution_id(child_execution_id.clone()));
             }
 
             tokio::time::sleep(Duration::from_secs(poll_interval)).await;
@@ -446,7 +456,8 @@ impl Tool for PlaybookTool {
             // Legacy `return_step` path (or kill-switch off): hand back the
             // status payload exactly as before.
             if !want_child_result {
-                return Ok(ToolResult::success(payload));
+                return Ok(ToolResult::success(payload)
+                    .with_child_execution_id(child_execution_id.clone()));
             }
 
             // #136 blocking-with-result path.
@@ -503,7 +514,13 @@ impl Tool for PlaybookTool {
                 result_step = ?playbook_config.result_step,
                 "playbook tool resolved child result (#136)"
             );
-            return Ok(ToolResult::success(payload));
+            // noetl/ai-meta#328 — THE fix. This path replaced the async-start
+            // envelope with the child's own payload, and the envelope was the
+            // only thing naming the child. Ten prod executions were permanently
+            // unrecoverable because of it (#326): their parent's `call.done`
+            // named no child, so when the child's own `parent_execution_id`
+            // column was lost there was no second copy anywhere in `noetl.*`.
+            return Ok(ToolResult::success(payload).with_child_execution_id(child_execution_id));
         }
     }
 }
@@ -511,6 +528,107 @@ impl Tool for PlaybookTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠ The #328 regression, pinned at the shape that caused it.
+    ///
+    /// The `return_result` path returns the CHILD'S payload, which does not
+    /// name the child. If the spawn id is not carried beside it, the parent's
+    /// `call.done` names no child — and when the child's own
+    /// `parent_execution_id` was lost (noetl/ai-meta#326) there was then no
+    /// second copy anywhere in `noetl.*`. Ten prod executions were permanently
+    /// unrecoverable for exactly this reason.
+    #[test]
+    fn a_result_carrying_the_child_id_does_not_put_it_in_the_payload() {
+        let child_payload = serde_json::json!({"hotels": [], "source": "hotelbeds"});
+        let r = ToolResult::success(child_payload.clone())
+            .with_child_execution_id("354004070719037440");
+
+        assert_eq!(
+            r.child_execution_id.as_deref(),
+            Some("354004070719037440"),
+            "the spawn id must survive the unwrap"
+        );
+        assert_eq!(
+            r.data.as_ref(),
+            Some(&child_payload),
+            "⚠ and it must NOT be smuggled into `data` — the child's result is a \
+             contract its consumer parses, and widening it to close an \
+             observability gap makes every return_result caller's shape depend \
+             on this field"
+        );
+    }
+
+    /// ⚠⚠ The tests above are pure-function tests and are **structurally unable**
+    /// to see whether the `return_result` path actually calls the builder — that
+    /// needs a live child execution. Removing `.with_child_execution_id(...)`
+    /// from that path leaves every one of them green, which is precisely the
+    /// noetl/ai-meta#389 shape (a metric registered on the wrong registry, with
+    /// a full suite of pure tests that could not see the wiring).
+    ///
+    /// So this reads the source instead: every success return in this tool must
+    /// carry the spawn id, because every one of them follows a child start.
+    #[test]
+    fn every_success_return_in_this_tool_carries_the_spawn_id() {
+        let src = include_str!("playbook.rs");
+        // Cut the test module off first, or this guard matches its own fixtures.
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let needle = format!("ToolResult{}success(", "::");
+        let mut checked = 0;
+        let mut bare = Vec::new();
+        for (i, _) in body.match_indices(&needle) {
+            checked += 1;
+            // The builder may sit on the next line, so look at a window rather
+            // than the same line.
+            // ⚠ 1600, not 400: the first version cut at 400 and reported a
+            // FALSE POSITIVE on a return whose builder sat past a `json!` macro
+            // and a comment block. An under-reaching window makes a compliant
+            // site look like an offender, which is the noisy-check failure that
+            // teaches people to skim past the one finding that is real.
+            let window: String = body[i..].chars().take(1600).collect();
+            let call_end = window.find(';').unwrap_or(window.len());
+            if !window[..call_end].contains("with_child_execution_id") {
+                let line = body[..i].matches('\n').count() + 1;
+                bare.push(line);
+            }
+        }
+        assert!(
+            checked >= 3,
+            "only {checked} success returns found — the extraction broke and a \
+             guard measuring nothing passes"
+        );
+        assert!(
+            bare.is_empty(),
+            "success returns at lines {bare:?} do not carry the spawn id. Every \
+             return from this tool follows a child start, so a bare one means the \
+             parent's `call.done` will name no child — noetl/ai-meta#328, which \
+             left ten prod executions permanently unrecoverable."
+        );
+    }
+
+    /// Positive control for the assertion above: a result with no spawn is
+    /// `None`, so the `Some(...)` in that test is about the builder and not
+    /// about some default that is always set.
+    #[test]
+    fn a_tool_that_spawns_nothing_carries_no_child_id() {
+        let r = ToolResult::success(serde_json::json!({"ok": true}));
+        assert_eq!(r.child_execution_id, None);
+    }
+
+    /// The field must not appear on the wire when unset, so every existing
+    /// tool's serialised result stays byte-identical.
+    #[test]
+    fn the_field_is_absent_from_the_wire_when_unset() {
+        let r = ToolResult::success(serde_json::json!({"ok": true}));
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(
+            !j.contains("child_execution_id"),
+            "an unset field must not widen every other tool's payload: {j}"
+        );
+        let r2 = r.with_child_execution_id("42");
+        assert!(serde_json::to_string(&r2)
+            .unwrap()
+            .contains("child_execution_id"));
+    }
 
     // --- Terminal-status helper ---
 
