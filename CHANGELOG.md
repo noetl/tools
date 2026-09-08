@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.0.0](https://github.com/noetl/tools/compare/v3.27.0...v4.0.0) (2026-09-08)
+
+### ⚠ BREAKING CHANGES
+
+* `ToolResult` is `#[non_exhaustive]`.  Downstream crates can no
+longer build one with a struct literal and must use the constructors and
+`with_*` builders, which now cover every field.
+
+WHY THIS IS WORTH A MAJOR.  Adding a public field to a struct that downstream
+crates construct by literal is breaking by Rust's rules, and nothing in the
+release pipeline knows that -- semantic-release reads the commit prefix, so
+`feat:` ships it as a MINOR.  That is exactly what 3.27.0 did with
+`child_execution_id`: it did not compile in noetl-executor, and the breakage was
+LATENT, waiting for whoever next resolved a caret range.  One breaking release
+now buys non-breaking additions forever.
+
+New builders so sealing does not just move the breakage from "downstream cannot
+compile" to "downstream cannot express what it needs": with_exit_code,
+with_pending_callback, with_error, alongside the existing with_data,
+with_duration and with_child_execution_id.
+
+⚠⚠ THE GUARD CAUGHT NOTHING ON ITS FIRST WRITE, AND I ALMOST SHIPPED IT.  The
+property is about what OTHER crates may do, which no test inside this crate can
+exercise -- a literal is still legal in the defining crate, so a unit test passes
+with or without the attribute.  So it is a source guard.  But the first version
+searched for the attribute as a SUBSTRING, and the doc comment on this very
+struct explains the attribute by name: the mutation that removed
+`#[non_exhaustive]` left the test GREEN, because it was matching prose.
+
+That is "comments counting as callers" occurring inside the guard written to
+prevent a different instance of the same class.  Fixed by stripping comment
+lines and requiring the attribute on a line of its own; re-run, the mutation
+fails it.
+
+### Features
+
+* seal ToolResult so a field addition stops being breaking ([#330](https://github.com/noetl/tools/issues/330)) ([d3ba4c5](https://github.com/noetl/tools/commit/d3ba4c5fcf67ed80f827295fa53d5ced52e03bbb))
+
 ## [3.27.0](https://github.com/noetl/tools/compare/v3.26.3...v3.27.0) (2026-09-07)
 
 ### Features
