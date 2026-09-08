@@ -42,7 +42,21 @@ impl std::fmt::Display for ToolStatus {
 }
 
 /// Result of a tool execution.
+///
+/// # `#[non_exhaustive]` — noetl/ai-meta#330
+///
+/// ⚠ Adding a public field to a struct that downstream crates build with a
+/// **struct literal** is a breaking change by Rust's rules. Nothing in the
+/// release pipeline knows that: semantic-release reads the commit prefix, so
+/// `feat:` ships it as a MINOR. That is exactly what happened with
+/// `child_execution_id` in 3.27.0 — it did not compile in `noetl-executor`, and
+/// the breakage was *latent*, waiting for whoever next resolved a caret range.
+///
+/// `#[non_exhaustive]` forbids literal construction from outside this crate, so
+/// a field addition is genuinely non-breaking from here on. The cost is one
+/// breaking release now; the builders below are the replacement for the literal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolResult {
     /// Execution status.
     pub status: ToolStatus,
@@ -216,6 +230,29 @@ impl ToolResult {
     }
 
     /// Set additional data on the result.
+    /// Set the process exit code (noetl/ai-meta#330).
+    ///
+    /// Exists so a downstream crate can build any `ToolResult` it needs without
+    /// a struct literal — which `#[non_exhaustive]` forbids, and which is the
+    /// whole point: a field added here must stop being a breaking change.
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// Set the marker that suppresses the worker's own `call.done`
+    /// (noetl/ai-meta#43 Round 4).
+    pub fn with_pending_callback(mut self, pending: bool) -> Self {
+        self.pending_callback = Some(pending);
+        self
+    }
+
+    /// Attach an error message without changing the status.
+    pub fn with_error(mut self, message: impl Into<String>) -> Self {
+        self.error = Some(message.into());
+        self
+    }
+
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
         self
@@ -245,6 +282,64 @@ impl Default for ToolResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// ⚠⚠ noetl/ai-meta#330. This is the guard, and it is a SOURCE guard because
+    /// the property is about what *other crates* may do — which no test inside
+    /// this crate can exercise. Inside the defining crate a literal is still
+    /// legal, so a unit test would pass with or without the attribute.
+    ///
+    /// Removing `#[non_exhaustive]` silently restores the old hazard: a later
+    /// `feat:` adding a field ships as a MINOR and fails to compile downstream,
+    /// latently, for whoever next resolves a caret range.
+    #[test]
+    fn tool_result_is_sealed_against_downstream_literals() {
+        let src = include_str!("result.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let marker = format!("#[non{}exhaustive]", "_");
+        let at = body
+            .find("pub struct ToolResult {")
+            .expect("ToolResult not found — the extraction broke");
+        // ⚠ Strip comments first. The doc comment on this very struct EXPLAINS
+        // the attribute, so a substring search finds it whether or not the
+        // attribute is there — this guard passed a mutation that removed it,
+        // which is "comments counting as callers" in the guard itself.
+        // Require the attribute on its own line instead.
+        let window: Vec<&str> = body[at.saturating_sub(600)..at]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .collect();
+        assert!(
+            window.iter().any(|l| *l == marker),
+            "ToolResult must stay non_exhaustive: without it, adding a public \
+             field is a BREAKING change that semantic-release publishes as a \
+             minor (noetl/ai-meta#330)."
+        );
+    }
+
+    /// Every field must be reachable through a builder, or sealing the struct
+    /// just moves the breakage from "downstream cannot compile" to "downstream
+    /// cannot express what it needs".
+    #[test]
+    fn every_field_is_reachable_without_a_literal() {
+        let r = ToolResult::error("boom")
+            .with_data(serde_json::json!({"k": "v"}))
+            .with_exit_code(1)
+            .with_duration(5)
+            .with_pending_callback(true)
+            .with_child_execution_id("42")
+            .with_error("boom");
+        assert_eq!(r.exit_code, Some(1));
+        assert_eq!(r.duration_ms, Some(5));
+        assert_eq!(r.pending_callback, Some(true));
+        assert_eq!(r.child_execution_id.as_deref(), Some("42"));
+        assert_eq!(r.error.as_deref(), Some("boom"));
+        assert!(r.data.is_some());
+        // stdout/stderr come from the shell constructor.
+        let sh = ToolResult::from_shell(0, "out".into(), "err".into());
+        assert_eq!(sh.stdout.as_deref(), Some("out"));
+        assert_eq!(sh.stderr.as_deref(), Some("err"));
+    }
     use super::*;
 
     #[test]
