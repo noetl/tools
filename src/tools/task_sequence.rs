@@ -361,9 +361,39 @@ impl Tool for TaskSequenceTool {
                 auth: raw_task_config.auth,
             };
 
-            let task_result = registry
-                .execute_from_config(&task_config, &task_ctx)
-                .await?;
+            // noetl/server#434 — a Rust `Err` must reach the policy engine.
+            //
+            // ⚠ This used to be `.await?`, which propagated a transport-style
+            // failure straight out of the sequence BEFORE the rule loop below
+            // ran. So `then: { do: retry }` and `then: { do: fail }` could never
+            // fire on a tool that fails that way — and `postgres` fails ONLY
+            // that way (0 occurrences of `ToolStatus::Error` in `postgres.rs`).
+            // That is why the issue's retry probe failed on attempt 1 with the
+            // attempt counter still reading 1: the rule was never consulted.
+            //
+            // The failure is turned into a `ToolResult` so the rules can match
+            // on it. `transport_error` remembers that it arrived as an `Err`,
+            // because the UNHANDLED outcome must stay byte-identical — see the
+            // `ControlAction::Fail` arm.
+            let mut transport_error: Option<crate::error::ToolError> = None;
+            let task_result = match registry.execute_from_config(&task_config, &task_ctx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    transport_error = Some(e);
+                    crate::result::ToolResult {
+                        status: crate::result::ToolStatus::Error,
+                        data: None,
+                        error: Some(message),
+                        stdout: None,
+                        stderr: None,
+                        exit_code: Some(1),
+                        duration_ms: None,
+                        pending_callback: None,
+                        child_execution_id: None,
+                    }
+                }
+            };
 
             // Carry forward stdout / stderr / exit code from each
             // sub-task — the pipeline's final ToolResult collects
@@ -430,7 +460,9 @@ impl Tool for TaskSequenceTool {
                             .chain(std::iter::once(("output", result_data.clone()))),
                     );
                     for (key, expr) in set_obj {
-                        let rendered = self.template_engine.render_value_with(expr, &set_eval_ctx)?;
+                        let rendered = self
+                            .template_engine
+                            .render_value_with(expr, &set_eval_ctx)?;
                         set_nested_var(&mut running_ctx.variables, key, rendered);
                     }
                 }
@@ -509,9 +541,7 @@ impl Tool for TaskSequenceTool {
                     } else if let Some(else_val) = rule_obj.get("else") {
                         // `else:` catch-all — always matches;
                         // `then:` is nested under the `else` key.
-                        let then_val = else_val
-                            .as_object()
-                            .and_then(|o| o.get("then"));
+                        let then_val = else_val.as_object().and_then(|o| o.get("then"));
                         (true, then_val)
                     } else {
                         (false, None)
@@ -539,8 +569,7 @@ impl Tool for TaskSequenceTool {
                                     // Record the mutation for cross-step
                                     // propagation via `_context_updates`
                                     // in the result payload.
-                                    context_updates
-                                        .insert(key.clone(), rendered);
+                                    context_updates.insert(key.clone(), rendered);
                                 }
                             }
                         }
@@ -636,6 +665,12 @@ impl Tool for TaskSequenceTool {
                             attempts,
                             "task_sequence: retry exhausted"
                         );
+                        // Same preservation as the `Fail` arm: a transport
+                        // failure that survives its retries must still fail the
+                        // execution the way it always has.
+                        if let Some(e) = transport_error {
+                            return Err(e);
+                        }
                         let duration_ms = start.elapsed().as_millis() as u64;
                         return Ok(ToolResult {
                             status: ToolStatus::Error,
@@ -676,6 +711,21 @@ impl Tool for TaskSequenceTool {
                 }
 
                 ControlAction::Fail => {
+                    // ⚠ Behaviour preservation (noetl/server#434). A failure that
+                    // arrived as a Rust `Err` used to propagate out of this
+                    // function untouched, and the worker turns an `Err` into
+                    // `command.failed` — which is what actually FAILS the
+                    // execution. Returning `Ok(ToolResult{status: Error})` here
+                    // instead would land it in `command.completed`, and with
+                    // `NOETL_EXECUTION_FAIL_ON_STEP_ERROR` off (its default) the
+                    // DAG would advance past it. That would SILENCE a currently
+                    // failing path — the opposite of this issue.
+                    //
+                    // So the rules gain the ability to fire, and the unhandled
+                    // outcome stays exactly what it was.
+                    if let Some(e) = transport_error {
+                        return Err(e);
+                    }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     return Ok(ToolResult {
                         status: ToolStatus::Error,
@@ -749,7 +799,10 @@ enum ControlAction {
 /// one) falls back to `Continue` so a malformed rule never wedges
 /// the pipeline.
 fn parse_control_action(then_obj: &serde_json::Map<String, serde_json::Value>) -> ControlAction {
-    let do_str = then_obj.get("do").and_then(|v| v.as_str()).unwrap_or("continue");
+    let do_str = then_obj
+        .get("do")
+        .and_then(|v| v.as_str())
+        .unwrap_or("continue");
     match do_str {
         "break" => ControlAction::Break,
         "fail" => ControlAction::Fail,
@@ -770,10 +823,7 @@ fn parse_control_action(then_obj: &serde_json::Map<String, serde_json::Value>) -
                 .and_then(|v| v.as_str())
                 .unwrap_or("none")
                 .to_string();
-            let delay = then_obj
-                .get("delay")
-                .and_then(json_to_f64)
-                .unwrap_or(1.0);
+            let delay = then_obj.get("delay").and_then(json_to_f64).unwrap_or(1.0);
             ControlAction::Retry {
                 attempts,
                 backoff,
@@ -1318,9 +1368,7 @@ mod tests {
 
         assert!(result.is_success());
         let data = result.data.expect("data present");
-        let from_input = data
-            .get("consume")
-            .and_then(|v| v.get("from_input"));
+        let from_input = data.get("consume").and_then(|v| v.get("from_input"));
         assert_eq!(from_input, Some(&serde_json::json!(99)));
     }
 
@@ -1451,11 +1499,14 @@ mod tests {
         });
         let mut ctx: HashMap<String, serde_json::Value> = HashMap::new();
         ctx.insert("output".to_string(), output);
-        ctx.insert("iter".to_string(), serde_json::json!({
-            "item": {"name": "item1", "value": 100},
-            "_index": 0,
-            "_total": 3,
-        }));
+        ctx.insert(
+            "iter".to_string(),
+            serde_json::json!({
+                "item": {"name": "item1", "value": 100},
+                "_index": 0,
+                "_total": 3,
+            }),
+        );
 
         // Step 1: Render {{ output.data }} — this is what the set: block does
         let expr = serde_json::json!("{{ output.data }}");
@@ -1478,7 +1529,8 @@ mod tests {
         set_nested_var(&mut ctx, "iter.processed_item", rendered);
 
         // Step 3: Verify we can access iter.processed_item.item_name
-        let result = engine.render("{{ iter.processed_item.item_name }}", &ctx)
+        let result = engine
+            .render("{{ iter.processed_item.item_name }}", &ctx)
             .expect("nested field resolves");
         assert_eq!(result, "item1", "nested field access should work");
     }
@@ -1541,7 +1593,9 @@ mod tests {
             auth: None,
         };
 
-        let tasks = tool.parse_tasks(&tool_config).expect("parse_tasks should work");
+        let tasks = tool
+            .parse_tasks(&tool_config)
+            .expect("parse_tasks should work");
         assert_eq!(tasks.len(), 2, "should have 2 tasks");
 
         // Check process_item has spec.policy.rules
@@ -1567,9 +1621,7 @@ mod tests {
 
         // Verify the rule has a set block
         let rule = &policy_rules.unwrap()[0];
-        let set_block = rule
-            .get("then")
-            .and_then(|t| t.get("set"));
+        let set_block = rule.get("then").and_then(|t| t.get("set"));
         assert!(set_block.is_some(), "rule should have a set block");
     }
 
@@ -1629,7 +1681,9 @@ mod tests {
             other => panic!("expected retry, got {other:?}"),
         }
         // Retry with explicit fields; attempts as a string coerces.
-        match parse_control_action(&mk(r#"{"do":"retry","attempts":"5","backoff":"exponential","delay":2}"#)) {
+        match parse_control_action(&mk(
+            r#"{"do":"retry","attempts":"5","backoff":"exponential","delay":2}"#,
+        )) {
             ControlAction::Retry {
                 attempts,
                 backoff,
@@ -1796,7 +1850,11 @@ mod tests {
         };
         let ctx = ExecutionContext::default();
         let result = tool.execute(&config, &ctx).await.expect("execute ok");
-        assert!(result.is_success(), "retries then continues: {:?}", result.error);
+        assert!(
+            result.is_success(),
+            "retries then continues: {:?}",
+            result.error
+        );
         let data = result.data.expect("data present");
         let final_attempt = data
             .get("_context_updates")
@@ -1874,6 +1932,96 @@ mod tests {
                 .contains("not found"),
             "error should name the missing jump target: {:?}",
             result.error
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_errors_reach_the_policy {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use crate::registry::Tool;
+
+    /// A sub-task that fails the way `postgres` does: a Rust `Err` out of the
+    /// registry rather than `Ok(ToolResult { status: Error })`.
+    fn sequence(rules: Option<serde_json::Value>) -> ToolConfig {
+        let mut spec = serde_json::json!({});
+        if let Some(r) = rules {
+            spec = serde_json::json!({ "policy": { "rules": r } });
+        }
+        ToolConfig {
+            kind: "task_sequence".to_string(),
+            config: serde_json::json!([
+                { "boom": { "kind": "no_such_tool_kind", "spec": spec } },
+                { "after": { "kind": "python", "code": "result = {'ran': True}" } },
+            ]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        }
+    }
+
+    /// ⚠⚠ BEHAVIOUR PRESERVATION, and the most important test here.
+    ///
+    /// With no rule to handle it, a transport failure must STILL leave this
+    /// function as a Rust `Err`. The worker turns an `Err` into
+    /// `command.failed`, which is what actually fails the execution; an
+    /// `Ok(ToolResult { status: Error })` lands in `command.completed`, and
+    /// with `NOETL_EXECUTION_FAIL_ON_STEP_ERROR` off — its default — the DAG
+    /// advances past it.
+    ///
+    /// So a "fix" that merely converted the error into a result would SILENCE a
+    /// currently-failing path. That is the opposite of noetl/server#434, and it
+    /// is the regression this test exists to catch.
+    #[tokio::test]
+    async fn an_unhandled_transport_failure_still_propagates_as_an_error() {
+        let tool = TaskSequenceTool::new();
+        let ctx = ExecutionContext::default();
+        let outcome = tool.execute(&sequence(None), &ctx).await;
+        assert!(
+            outcome.is_err(),
+            "an unhandled transport failure must stay an Err — returning Ok here \
+             would move it from command.failed to command.completed and stop \
+             failing the execution. Got: {:?}",
+            outcome.map(|r| r.status)
+        );
+    }
+
+    /// ⭐ noetl/server#434. The rule can now see the failure at all.
+    ///
+    /// Before this change the `?` propagated the `Err` BEFORE the rule loop ran,
+    /// so no `then:` verb could fire on a tool that fails this way — and
+    /// `postgres` fails only this way. `continue` is used as the demonstrator
+    /// because its effect is unambiguous: the sequence proceeds to the next
+    /// task, which is impossible if the rule never ran.
+    #[tokio::test]
+    async fn a_rule_can_now_handle_a_transport_failure() {
+        let rules = serde_json::json!([{
+            "else": { "then": { "do": "continue" } }
+        }]);
+        let tool = TaskSequenceTool::new();
+        let ctx = ExecutionContext::default();
+        let result = tool
+            .execute(&sequence(Some(rules)), &ctx)
+            .await
+            .expect("a rule that handles the failure must keep the sequence alive");
+
+        assert!(
+            result.is_success(),
+            "the handled sequence should complete: {:?}",
+            result.error
+        );
+        // The success shape carries each task's result under its own label.
+        let data = result.data.expect("aggregated data");
+        assert!(
+            data.get("after").is_some(),
+            "the task AFTER the failing one must have run — that is the proof the \
+             rule fired, because the old `?` returned before ever reaching it: {data:?}"
+        );
+        assert!(
+            data.get("boom").is_some(),
+            "the failed task must still be recorded rather than vanishing — a \
+             handled failure is not a hidden one: {data:?}"
         );
     }
 }
