@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.0.1](https://github.com/noetl/tools/compare/v4.0.0...v4.0.1) (2026-09-16)
+
+### Bug Fixes
+
+* **pubsub:** a poll wait long enough for real Pub/Sub, and a visible clamp ([e703043](https://github.com/noetl/tools/commit/e70304309cecac5483b8b00f18db8ba9d97054a8)), closes [noetl/tools#57](https://github.com/noetl/tools/issues/57)
+* **task_sequence:** let policy rules see a transport failure ([49c748f](https://github.com/noetl/tools/commit/49c748fbcef73a2d03d5424e26b4adad7f2da577)), closes [noetl/server#434](https://github.com/noetl/server/issues/434)
+
 ## [4.0.0](https://github.com/noetl/tools/compare/v3.27.0...v4.0.0) (2026-09-08)
 
 ### ⚠ BREAKING CHANGES
