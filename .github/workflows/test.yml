@@ -42,11 +42,25 @@ jobs:
       # --all-targets, not the default: plain cargo build/test skip integration
       # tests and cfg(test)-only code, so a binary can be broken while the lib
       # compiles clean.
+      #
+      # ⚠ --workspace, and it is NOT redundant with --all-targets. The two
+      # widen different axes: --all-targets widens TARGET KINDS (lib, bins,
+      # tests, examples) within the selected packages; --workspace widens the
+      # PACKAGE SELECTION. This repo's root Cargo.toml is a real `[package]`
+      # (noetl-tools) as well as a `[workspace]`, so the default selection is
+      # that root package ALONE — `noetl-directives` (13 tests) and
+      # `noetl-locator` (16) were never built or tested here. Measured: 512
+      # before, 541 after.
+      #
+      # Those two members exist precisely so edge consumers can parse a result
+      # locator WITHOUT noetl-tools' heavy graph (duckdb/kube/arrow-flight/
+      # tonic/rhai). Their whole value is being usable standalone, which is
+      # exactly the property CI was not checking.
       - name: build (all targets)
-        run: cargo build --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
 
       - name: test
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked
 
       - name: clippy (visible, non-gating)
-        run: cargo clippy --all-targets --locked || true
+        run: cargo clippy --workspace --all-targets --locked || true
