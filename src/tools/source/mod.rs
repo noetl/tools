@@ -71,11 +71,63 @@ pub fn clamp_batch(requested: Option<u32>) -> u32 {
         .clamp(1, POLL_BATCH_MAX)
 }
 
+/// The poll wait a `pubsub` source gets when it asks for nothing — noetl/tools#57.
+///
+/// ⚠ `POLL_TIMEOUT_DEFAULT_MS` is 1s, which was validated against the Pub/Sub
+/// **emulator** only. Real Pub/Sub synchronous-pull latency routinely exceeds a
+/// 1.5s client deadline (`timeout_ms + 500`), and when it does the messages are
+/// leased and then released without ever being dispatched — the poll returns an
+/// empty drain while `num_undelivered` stays at the backlog. Nothing errors, so
+/// a deployment stalls while looking healthy.
+///
+/// Set to the cap, because on this backend a short wait is not a cheaper
+/// success — it is a silent failure.
+pub const PUBSUB_POLL_TIMEOUT_DEFAULT_MS: u64 = POLL_TIMEOUT_MAX_MS;
+
+/// The default poll wait for a given source kind.
+pub fn default_timeout_ms_for(kind: &str) -> u64 {
+    match kind {
+        "pubsub" => PUBSUB_POLL_TIMEOUT_DEFAULT_MS,
+        _ => POLL_TIMEOUT_DEFAULT_MS,
+    }
+}
+
 /// Clamp a requested timeout into `[0, POLL_TIMEOUT_MAX_MS]`.
+///
+/// ⚠⚠ This truncates SILENTLY, and that has already misled someone.
+/// noetl/tools#57 records `timeout_ms: 10000` as the remedy that made a live
+/// Pub/Sub roundtrip green — but 10000 is clamped to 5000 here, so the
+/// deployment got a 5.5s client deadline, not the 10.5s the fix says it has.
+/// It happened to be enough. Anyone applying that remedy today is relying on a
+/// number the code does not honour.
+///
+/// Use [`clamp_timeout_ms_reported`] on any path where an operator chose the
+/// value, so the truncation is visible rather than inferred from behaviour.
 pub fn clamp_timeout_ms(requested: Option<u64>) -> u64 {
-    requested
-        .unwrap_or(POLL_TIMEOUT_DEFAULT_MS)
-        .min(POLL_TIMEOUT_MAX_MS)
+    clamp_timeout_ms_for(requested, POLL_TIMEOUT_DEFAULT_MS)
+}
+
+/// [`clamp_timeout_ms`] with an explicit default, so a backend can raise its own
+/// floor without changing everyone else's.
+pub fn clamp_timeout_ms_for(requested: Option<u64>, default_ms: u64) -> u64 {
+    requested.unwrap_or(default_ms).min(POLL_TIMEOUT_MAX_MS)
+}
+
+/// Clamp, and say so when the answer is not what was asked for.
+///
+/// Returns the effective value and, when the request was truncated, the value
+/// that was requested — so the caller can log the gap instead of leaving an
+/// operator to deduce it from a stalled subscription.
+///
+/// ⚠ The cap itself is deliberately NOT raised here. `POLL_TIMEOUT_MAX_MS`
+/// exists to honour the execution-model rule that a drain must not hold a
+/// worker slot waiting, so lifting it past 5s is a scheduling decision, not a
+/// Pub/Sub one. If real Pub/Sub needs more than this cap, that is a policy
+/// change to make deliberately — not a constant to nudge.
+pub fn clamp_timeout_ms_reported(requested: Option<u64>, default_ms: u64) -> (u64, Option<u64>) {
+    let effective = clamp_timeout_ms_for(requested, default_ms);
+    let truncated = requested.filter(|r| *r > POLL_TIMEOUT_MAX_MS);
+    (effective, truncated)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,9 +328,28 @@ pub struct PollOptions {
 impl PollOptions {
     /// Build clamped options from the raw playbook fields.
     pub fn new(batch: Option<u32>, timeout_ms: Option<u64>, ack: AckMode) -> Self {
+        Self::for_kind("", batch, timeout_ms, ack)
+    }
+
+    /// Build clamped options, honouring the source kind's own default wait and
+    /// reporting a truncation rather than swallowing it (noetl/tools#57).
+    pub fn for_kind(kind: &str, batch: Option<u32>, timeout_ms: Option<u64>, ack: AckMode) -> Self {
+        let (effective, truncated) =
+            clamp_timeout_ms_reported(timeout_ms, default_timeout_ms_for(kind));
+        if let Some(requested) = truncated {
+            tracing::warn!(
+                source_kind = kind,
+                requested_timeout_ms = requested,
+                effective_timeout_ms = effective,
+                cap_ms = POLL_TIMEOUT_MAX_MS,
+                "poll timeout truncated to the cap; the configured value is NOT \
+                 in effect — a drain that still returns empty will not be fixed \
+                 by raising it further"
+            );
+        }
         Self {
             batch: clamp_batch(batch),
-            timeout_ms: clamp_timeout_ms(timeout_ms),
+            timeout_ms: effective,
             ack,
         }
     }
@@ -429,6 +500,88 @@ mod tests {
         assert_eq!(clamp_batch(Some(99_999)), POLL_BATCH_MAX);
     }
 
+    /// ⭐ noetl/tools#57. A `pubsub` source that asks for nothing must not get
+    /// the emulator-tuned 1s default.
+    #[test]
+    fn pubsub_gets_a_wait_long_enough_for_real_pubsub() {
+        assert_eq!(
+            default_timeout_ms_for("pubsub"),
+            POLL_TIMEOUT_MAX_MS,
+            "real Pub/Sub sync-pull routinely exceeds a 1.5s client deadline, and \
+             when it does the messages are leased then released without being \
+             dispatched — an empty drain with the backlog untouched, and nothing \
+             errors"
+        );
+
+        // ⚠ Every other backend is untouched. The 1s default is correct for
+        // NATS and raising it globally would make every drain hold a worker
+        // slot five times longer to fix one backend.
+        for kind in ["nats", "kafka", "", "sqs"] {
+            assert_eq!(
+                default_timeout_ms_for(kind),
+                POLL_TIMEOUT_DEFAULT_MS,
+                "{kind} must keep the existing default"
+            );
+        }
+    }
+
+    /// ⚠⚠ The truncation that already misled someone must be visible.
+    ///
+    /// noetl/tools#57 records `timeout_ms: 10000` as the remedy that made a live
+    /// roundtrip green. It is clamped to 5000, so that deployment ran on a 5.5s
+    /// client deadline and not the 10.5s the remedy claims. It worked — but
+    /// anyone applying it today is relying on a number the code does not honour,
+    /// and nothing said so.
+    #[test]
+    fn a_truncated_timeout_is_reported_not_swallowed() {
+        let (effective, truncated) = clamp_timeout_ms_reported(Some(10_000), POLL_TIMEOUT_MAX_MS);
+        assert_eq!(effective, POLL_TIMEOUT_MAX_MS);
+        assert_eq!(
+            truncated,
+            Some(10_000),
+            "the REQUESTED value must come back so the caller can name the gap; \
+             leaving an operator to deduce a clamp from a stalled subscription is \
+             how noetl/tools#57 stayed open"
+        );
+
+        // A request inside the cap is not a truncation, and must not be reported
+        // as one — a warning that fires on healthy config trains people to
+        // ignore it.
+        let (effective, truncated) =
+            clamp_timeout_ms_reported(Some(3_000), POLL_TIMEOUT_DEFAULT_MS);
+        assert_eq!(effective, 3_000);
+        assert_eq!(truncated, None);
+
+        // Exactly at the cap is honoured, not truncated.
+        let (effective, truncated) =
+            clamp_timeout_ms_reported(Some(POLL_TIMEOUT_MAX_MS), POLL_TIMEOUT_DEFAULT_MS);
+        assert_eq!(effective, POLL_TIMEOUT_MAX_MS);
+        assert_eq!(truncated, None, "the boundary value is not a truncation");
+    }
+
+    /// The kind-aware builder must reach the options a drain actually uses.
+    #[test]
+    fn a_pubsub_poll_is_built_with_the_longer_wait() {
+        let opts = PollOptions::for_kind("pubsub", None, None, AckMode::Auto);
+        assert_eq!(opts.timeout_ms, POLL_TIMEOUT_MAX_MS);
+
+        let opts = PollOptions::for_kind("nats", None, None, AckMode::Auto);
+        assert_eq!(opts.timeout_ms, POLL_TIMEOUT_DEFAULT_MS);
+
+        // ⚠ An explicit value still wins over the kind default, in both
+        // directions — the default is a floor for the unconfigured, not an
+        // override of someone's choice.
+        let opts = PollOptions::for_kind("pubsub", None, Some(200), AckMode::Auto);
+        assert_eq!(
+            opts.timeout_ms, 200,
+            "an explicit short wait is still honoured"
+        );
+
+        // And the legacy constructor is unchanged for every existing caller.
+        let opts = PollOptions::new(None, None, AckMode::Auto);
+        assert_eq!(opts.timeout_ms, POLL_TIMEOUT_DEFAULT_MS);
+    }
+
     #[test]
     fn clamp_timeout_bounds() {
         assert_eq!(clamp_timeout_ms(None), POLL_TIMEOUT_DEFAULT_MS);
@@ -527,10 +680,7 @@ mod tests {
         );
         assert!(AckDisposition::parse("bogus", None).is_err());
         assert_eq!(AckDisposition::Ack.as_str(), "ack");
-        assert_eq!(
-            AckDisposition::Nack { delay_ms: None }.as_str(),
-            "nack"
-        );
+        assert_eq!(AckDisposition::Nack { delay_ms: None }.as_str(), "nack");
         assert_eq!(AckDisposition::Term.as_str(), "term");
     }
 
