@@ -312,9 +312,7 @@ impl Tool for SubscriptionTool {
             "poll" => self.execute_poll(&cfg, ctx, execution_id).await,
             // Out-of-band disposition of durable handles from a prior `defer`
             // poll — the back half of the deferred-ack capability.
-            "ack" | "nack" | "nak" | "term" => {
-                self.execute_ack(&cfg, ctx, execution_id).await
-            }
+            "ack" | "nack" | "nak" | "term" => self.execute_ack(&cfg, ctx, execution_id).await,
             other => Err(ToolError::Configuration(format!(
                 "subscription: unsupported operation '{}'. Supported: poll, ack, nack, term",
                 other
@@ -333,7 +331,7 @@ impl SubscriptionTool {
         execution_id: i64,
     ) -> Result<ToolResult, ToolError> {
         let ack = super::source::AckMode::parse(cfg.ack.as_ref())?;
-        let opts = PollOptions::new(cfg.batch, cfg.timeout_ms, ack);
+        let opts = PollOptions::for_kind(&cfg.source, cfg.batch, cfg.timeout_ms, ack);
         let source = self.build_source(cfg, ctx)?;
         let source_name = source.source_name();
 
@@ -813,7 +811,10 @@ mod tests {
 
         // 2. No disposition → wait past ack-wait → the SAME work redelivers.
         tokio::time::sleep(Duration::from_millis(2600)).await;
-        let redeliver = tool.execute(&poll_defer, &ctx).await.expect("redeliver poll");
+        let redeliver = tool
+            .execute(&poll_defer, &ctx)
+            .await
+            .expect("redeliver poll");
         let d2 = redeliver.data.unwrap();
         assert_eq!(
             d2["count"], 3,
@@ -848,7 +849,10 @@ mod tests {
 
         // 4. Now the stream is empty — acked work never comes back.
         tokio::time::sleep(Duration::from_millis(2600)).await;
-        let after = tool.execute(&poll_defer, &ctx).await.expect("post-ack poll");
+        let after = tool
+            .execute(&poll_defer, &ctx)
+            .await
+            .expect("post-ack poll");
         assert_eq!(
             after.data.unwrap()["count"],
             0,
