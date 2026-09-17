@@ -28,19 +28,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # ⚠ THE TAG IS AUTHORITATIVE, NOT Cargo.toml (noetl/ai-meta#330).
+          #
+          # This used to assert tag == Cargo.toml, which held only because
+          # semantic-release PUSHED the version bump to `main` first. That push
+          # is what a required status check rejects — the commit is `[skip ci]`
+          # so the check never runs on it and stays "expected" forever (GH006).
+          # The bot no longer pushes, so Cargo.toml's committed value is a FLOOR
+          # and is expected to lag. Asserting equality here would now fail every
+          # release.
+          #
+          # Each job that builds or publishes re-stamps Cargo.toml from this
+          # version via ci/stamp-version.sh — CARGO_PKG_VERSION is compiled into
+          # the binary (reported as `the published crate version`) and is what `cargo publish`
+          # uploads, so skipping the stamp would ship an artifact that builds,
+          # publishes and deploys while carrying the PREVIOUS version.
           INPUT_VERSION="$(jq -r '.inputs.version // empty' "${GITHUB_EVENT_PATH}" 2>/dev/null || true)"
           CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
-            TAG_VERSION="${TAG#v}"
-            [[ "${TAG_VERSION}" == "${CARGO_VERSION}" ]] || (echo "Tag/Cargo version mismatch" && exit 1)
+            VERSION="${TAG#v}"
           elif [[ -n "${INPUT_VERSION}" ]]; then
-            TAG="v${INPUT_VERSION}"
-            [[ "${INPUT_VERSION}" == "${CARGO_VERSION}" ]] || (echo "Input/Cargo version mismatch" && exit 1)
+            VERSION="${INPUT_VERSION}"
+            TAG="v${VERSION}"
           else
-            TAG="v${CARGO_VERSION}"
+            # Manual dispatch with no input: fall back to the committed floor.
+            VERSION="${CARGO_VERSION}"
+            TAG="v${VERSION}"
           fi
-          echo "version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
+          if [[ "${VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "note: releasing ${VERSION}; committed Cargo.toml floor is ${CARGO_VERSION} (expected — the tag is authoritative)"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           if [[ -f Dockerfile ]]; then
             echo "has_dockerfile=true" >> "${GITHUB_OUTPUT}"
@@ -55,6 +74,12 @@ jobs:
       CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - name: Stamp the release version into Cargo.toml
+        # The bot no longer pushes a version bump to `main`, so the checked-out
+        # tree carries a stale floor. CARGO_PKG_VERSION is compiled in and is
+        # what `cargo publish` uploads — without this the artifact ships happily
+        # carrying the previous version.
+        run: ./ci/stamp-version.sh "${{ needs.verify-version.outputs.version }}"
       - uses: dtolnay/rust-toolchain@stable
       # Publish the workspace member `noetl-directives` FIRST — noetl-tools
       # depends on it, so `cargo publish` of the root crate needs it resolvable
@@ -117,6 +142,12 @@ jobs:
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Stamp the release version into Cargo.toml
+        # The bot no longer pushes a version bump to `main`, so the checked-out
+        # tree carries a stale floor. CARGO_PKG_VERSION is compiled in and is
+        # what `cargo publish` uploads — without this the artifact ships happily
+        # carrying the previous version.
+        run: ./ci/stamp-version.sh "${{ needs.verify-version.outputs.version }}"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
