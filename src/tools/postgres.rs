@@ -640,6 +640,13 @@ impl<'a> FromSql<'a> for PgNumericString {
 /// the bug behind noetl/ai-meta#95 for the temporal types below.
 fn pg_value_to_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value {
     // Try different types
+    // tokio-postgres decoders are type-specific: i32/i64 do not accept INT2.
+    // Without this arm every non-null SMALLINT silently became JSON null.
+    if let Ok(v) = row.try_get::<_, Option<i16>>(idx) {
+        return v
+            .map(|n| serde_json::json!(n))
+            .unwrap_or(serde_json::Value::Null);
+    }
     if let Ok(v) = row.try_get::<_, Option<i64>>(idx) {
         return v
             .map(|n| serde_json::json!(n))
