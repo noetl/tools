@@ -79,6 +79,17 @@ jobs:
         # tree carries a stale floor. CARGO_PKG_VERSION is compiled in and is
         # what `cargo publish` uploads — without this the artifact ships happily
         # carrying the previous version.
+        #
+        # ⚠ This stamp is why every `cargo publish` below passes --allow-dirty.
+        # It rewrites Cargo.toml and regenerates Cargo.lock in the runner and
+        # DELIBERATELY never commits them (nothing is pushed to `main`; the tag
+        # is authoritative — noetl/ai-meta#330).  So the tree is always dirty
+        # here, and cargo refuses a dirty publish by default.  Committing the
+        # stamp instead is not an option: it is only useful if pushed, and that
+        # push is the one a required status check rejects (GH006).  A
+        # runner-only commit would also record an unfetchable SHA in the
+        # published crate's .cargo_vcs_info.json, where --allow-dirty records
+        # `main`'s real SHA plus a dirty marker.
         run: ./ci/stamp-version.sh "${{ needs.verify-version.outputs.version }}"
       - uses: dtolnay/rust-toolchain@stable
       # Publish the workspace member `noetl-directives` FIRST — noetl-tools
@@ -95,7 +106,7 @@ jobs:
           if cargo search noetl-directives 2>/dev/null | grep -q "noetl-directives = \"${VER}\""; then
             echo "noetl-directives ${VER} already on crates.io; skipping."
           else
-            OUTPUT="$(cargo publish -p noetl-directives 2>&1)" || {
+            OUTPUT="$(cargo publish -p noetl-directives --allow-dirty 2>&1)" || {
               echo "$OUTPUT"
               echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
             }
@@ -119,7 +130,7 @@ jobs:
           if cargo search noetl-locator 2>/dev/null | grep -q "noetl-locator = \"${VER}\""; then
             echo "noetl-locator ${VER} already on crates.io; skipping."
           else
-            OUTPUT="$(cargo publish -p noetl-locator 2>&1)" || {
+            OUTPUT="$(cargo publish -p noetl-locator --allow-dirty 2>&1)" || {
               echo "$OUTPUT"
               echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
             }
@@ -131,7 +142,7 @@ jobs:
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
-        run: cargo publish -p noetl-tools
+        run: cargo publish -p noetl-tools --allow-dirty
       - name: Skip publish (no token)
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
