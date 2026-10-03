@@ -14,8 +14,13 @@
 # Deliberately NOT here:
 #   * `cargo fmt --check` — these crates are formatted with rustfmt 1.9.0 and a
 #     different version reformats large parts of the tree.
-#   * `-D warnings` — pre-existing clippy warnings would make this start red for
-#     reasons no individual PR caused.  Clippy runs and stays visible.
+# `-D warnings` IS here as of noetl/ai-meta#378.  It was deliberately omitted when
+# this workflow was written, because the three pre-existing `question_mark` lints
+# in src/arrow_codec.rs would have made it start red for reasons no individual PR
+# caused.  Those three are now fixed, so the gate starts green and a new lint is
+# the only thing that can turn it red.  There is no allow-list: if one becomes
+# necessary, add the entry AND the reason, because an unexplained `-A` is how a
+# gate quietly stops gating.
 name: test
 
 on:
@@ -70,5 +75,8 @@ jobs:
       - name: cargo test --doc
         run: cargo test --workspace --doc --locked
 
-      - name: clippy (visible, non-gating)
-        run: cargo clippy --workspace --all-targets --locked || true
+      # Gating since noetl/ai-meta#378.  Proven to fail on a planted lint before
+      # the allow-list-free form was committed -- a lint gate that has never been
+      # seen to go red is indistinguishable from one that cannot.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

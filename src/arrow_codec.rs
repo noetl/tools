@@ -155,14 +155,13 @@ pub fn try_encode_tabular_json(value: &serde_json::Value) -> Option<TabularEncod
     // the value is a full `ToolResult`).
     let payload = if value.get("rows").is_some() {
         value
-    } else if let Some(nested) = value.get("data") {
+    } else {
+        let nested = value.get("data")?;
         if nested.get("rows").is_some() {
             nested
         } else {
             return None;
         }
-    } else {
-        return None;
     };
 
     let rows = payload.get("rows").and_then(|r| r.as_array())?;
@@ -177,10 +176,9 @@ pub fn try_encode_tabular_json(value: &serde_json::Value) -> Option<TabularEncod
             cols.iter()
                 .map(|v| v.as_str().unwrap_or_default().to_string())
                 .collect()
-        } else if let Some(first_obj) = rows.first().and_then(|r| r.as_object()) {
-            first_obj.keys().cloned().collect()
         } else {
-            return None;
+            let first_obj = rows.first().and_then(|r| r.as_object())?;
+            first_obj.keys().cloned().collect()
         };
 
     if column_names.is_empty() {
@@ -198,10 +196,9 @@ pub fn try_encode_tabular_json(value: &serde_json::Value) -> Option<TabularEncod
         for (idx, (name, ctype, values)) in columns_inferred.iter_mut().enumerate() {
             let cell = if let Some(obj) = row.as_object() {
                 obj.get(name).cloned()
-            } else if let Some(arr) = row.as_array() {
-                arr.get(idx).cloned()
             } else {
-                return None;
+                let arr = row.as_array()?;
+                arr.get(idx).cloned()
             };
             let cell = cell.unwrap_or(serde_json::Value::Null);
             if !cell.is_null() {
