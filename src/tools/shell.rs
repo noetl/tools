@@ -50,7 +50,9 @@ pub struct ShellConfig {
 /// Pre-fix this defaulted to `"bash"` which broke shell-tool
 /// dispatch in any Alpine-based worker image with:
 ///
-///     Process error: Failed to spawn process: No such file or directory (os error 2)
+/// ```text
+/// Process error: Failed to spawn process: No such file or directory (os error 2)
+/// ```
 ///
 /// Surfaced by the noetl-worker (Rust) kind validation pass on
 /// 2026-05-31; tracked on [noetl/tools#3].

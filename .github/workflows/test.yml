@@ -62,5 +62,13 @@ jobs:
       - name: test
         run: cargo test --workspace --all-targets --locked
 
+      # ⚠ `--all-targets` EXCLUDES doctests, so this repo's doctests were never run
+      # by CI -- and one of them had been failing to COMPILE on main
+      # (src/tools/shell.rs had example output in an indented block, which rustdoc
+      # treats as Rust). `cargo test` locally exited 101 while CI stayed green.
+      # A separate --doc run is the only way this gate can see them.
+      - name: cargo test --doc
+        run: cargo test --workspace --doc --locked
+
       - name: clippy (visible, non-gating)
         run: cargo clippy --workspace --all-targets --locked || true
