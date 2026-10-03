@@ -96,7 +96,18 @@ bytes = "1"
 sha2 = "0.10"
 # Snowflake key-pair (JWT) auth: RS256-sign a JWT with the account private
 # key + the public-key SHA256 fingerprint, bypassing password/MFA login.
-jsonwebtoken = "9"
+# 10.3.0 is the patched line for GHSA-h395-gr6q-cpjc (noetl/ai-meta#385); 9.x is
+# vulnerable.  Used in exactly one place -- the Snowflake key-pair JWT in
+# src/tools/snowflake.rs -- via encode/Algorithm/EncodingKey/Header.
+#
+# `rust_crypto` is REQUIRED, not cosmetic: 10.x stopped auto-selecting a
+# CryptoProvider and panics at RUNTIME without one --
+#   "Could not automatically determine the process-level CryptoProvider"
+# which is a panic in Snowflake key-pair auth, not a compile error.  Caught by
+# tools::snowflake::tests::keypair_jwt_has_snowflake_claims.
+# Pure-Rust provider chosen over `aws_lc_rs`, which pulls the AWS-LC C library --
+# this tree avoids C deps so the cross-platform wheel matrix stays buildable.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 pem = "3"
 
 # HMAC-SHA256 for the S3 spool backend's AWS SigV4 request signing
