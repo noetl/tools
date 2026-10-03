@@ -636,10 +636,17 @@ async fn object_put(
     let binary = encode_object_data(cfg)?;
     let size = binary.len();
 
+    // async-nats 0.47 added `metadata` and `headers` to ObjectMetadata.  Both are
+    // set to the empty/absent values 0.38 effectively used, so the object written is
+    // unchanged.  Listed explicitly rather than `..Default::default()` on purpose:
+    // the next field this struct gains should be a compile error here, not a silent
+    // default.
     let meta = object_store::ObjectMetadata {
         name: name.to_string(),
         description: cfg.description.clone(),
         chunk_size: None,
+        metadata: Default::default(),
+        headers: None,
     };
 
     // `put` takes `impl AsyncRead + Unpin`; use a cursor over our Vec<u8>.
