@@ -536,3 +536,9 @@ mod tests {
         assert!(batch.column(0).is_null(1));
     }
 }
+
+#[allow(dead_code)]
+fn ci_planted_lint_probe(n: usize) -> usize {
+    let doubled = n * 2;
+    doubled
+}
