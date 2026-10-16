@@ -16,7 +16,10 @@
 //! - `subscription` - Bounded-drain message subscription poll (NATS /
 //!   Pub/Sub / Kafka) behind the [`source`] source-client abstraction
 //!   (noetl/ai-meta#90 Phase 1)
+//! - `agent` - Native Claude tool-use loop (Anthropic Messages API), driven
+//!   turn-by-turn through [`AgentSession`] so the host runs the agent's tools
 
+mod agent;
 mod artifact;
 mod container;
 // The DuckDB tool implementation compiles the bundled DuckDB C++ amalgamation
@@ -52,6 +55,10 @@ mod subscription;
 mod task_sequence;
 mod transfer;
 
+pub use self::agent::{
+    AgentConfig, AgentFramework, AgentSession, AgentTool, AgentToolCall, AgentToolOutput,
+    AgentToolSpec, AgentTurn,
+};
 pub use self::artifact::ArtifactTool;
 pub use self::container::ContainerTool;
 // noetl/ai-meta#145 G2 — poll-based completion fallback.  Re-exported so
