@@ -82,6 +82,10 @@ fn default_max_tokens() -> u32 {
     4096
 }
 
+fn default_prompt_cache() -> bool {
+    true
+}
+
 fn default_input_schema() -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": {} })
 }
@@ -146,6 +150,18 @@ pub struct AgentConfig {
     /// `claude-code` only: working directory for the CLI.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// `claude` only: mark the conversation for Anthropic prompt caching so each
+    /// turn re-reads the previous turns at the cached rate (default on).
+    #[serde(default = "default_prompt_cache")]
+    pub prompt_cache: bool,
+    /// `claude` only: `disabled` or `adaptive`, sent as `thinking: {type}`.  Unset
+    /// leaves the model default; some models think adaptively on hard turns,
+    /// which spends `max_tokens` on reasoning.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// `claude` only: `low` / `medium` / `high`, sent as `output_config.effort`.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// A tool call the model requested in its latest turn.
@@ -184,6 +200,8 @@ pub struct AgentSession {
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
 }
 
 impl std::fmt::Debug for AgentSession {
@@ -278,6 +296,8 @@ impl AgentSession {
             turns: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         })
     }
 
@@ -374,6 +394,14 @@ impl AgentSession {
             .pointer("/usage/output_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        self.cache_read_tokens += body
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        self.cache_write_tokens += body
+            .pointer("/usage/cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let content = body
             .get("content")
@@ -403,25 +431,45 @@ impl AgentSession {
             })
             .collect();
 
-        if !calls.is_empty() {
-            tracing::debug!(calls = calls.len(), "agent requested tool calls");
-            return Ok(AgentTurn::ToolCalls(calls));
-        }
-
         let text: Vec<&str> = content
             .iter()
             .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
             .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
             .collect();
+        let text = text.join("\n");
+
+        // A turn cut off by max_tokens may carry incomplete tool calls, or no
+        // answer at all; neither may pass as a finished run.
+        let truncated = stop_reason == "max_tokens";
+        if truncated && (!calls.is_empty() || text.trim().is_empty()) {
+            let types: Vec<&str> = content
+                .iter()
+                .filter_map(|b| b.get("type").and_then(|t| t.as_str()))
+                .collect();
+            return Err(ToolError::ExecutionFailed(format!(
+                "agent output hit max_tokens={} on turn {} before finishing (content blocks: [{}]); raise max_tokens or ask for a shorter answer",
+                self.config.max_tokens,
+                self.turns,
+                types.join(", ")
+            )));
+        }
+
+        if !calls.is_empty() {
+            tracing::debug!(calls = calls.len(), "agent requested tool calls");
+            return Ok(AgentTurn::ToolCalls(calls));
+        }
 
         Ok(AgentTurn::Final(serde_json::json!({
-            "text": text.join("\n"),
+            "text": text,
             "stop_reason": stop_reason,
+            "truncated": truncated,
             "model": self.config.model,
             "turns": self.turns,
             "usage": {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
+                "cache_read_input_tokens": self.cache_read_tokens,
+                "cache_creation_input_tokens": self.cache_write_tokens,
             },
         })))
     }
@@ -573,16 +621,26 @@ impl AgentSession {
     }
 
     fn request_body(&self) -> serde_json::Value {
+        let mut messages = self.messages.clone();
+        if self.config.prompt_cache {
+            mark_cache_breakpoint(&mut messages);
+        }
         let mut body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": self.config.max_tokens,
-            "messages": self.messages,
+            "messages": messages,
         });
         if let Some(system) = &self.config.system {
             body["system"] = serde_json::json!(system);
         }
         if let Some(t) = self.config.temperature {
             body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(mode) = &self.config.thinking {
+            body["thinking"] = serde_json::json!({ "type": mode });
+        }
+        if let Some(effort) = &self.config.effort {
+            body["output_config"] = serde_json::json!({ "effort": effort });
         }
         if !self.config.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
@@ -600,6 +658,24 @@ impl AgentSession {
             );
         }
         body
+    }
+}
+
+/// Put a prompt-cache breakpoint on the last content block of the last
+/// message.  The cached prefix then covers tools, system and every earlier
+/// turn, so the next turn reads it at the cached rate instead of paying full
+/// price again.  Prefixes below the model's minimum cacheable length are
+/// simply not cached by the API.
+fn mark_cache_breakpoint(messages: &mut [serde_json::Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    let content = &mut last["content"];
+    if let Some(text) = content.as_str().map(str::to_string) {
+        *content = serde_json::json!([{ "type": "text", "text": text }]);
+    }
+    if let Some(block) = content.as_array_mut().and_then(|blocks| blocks.last_mut()) {
+        block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
     }
 }
 
@@ -988,6 +1064,143 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("allowed_tools"), "{err}");
+    }
+
+    fn claude_cfg(server: &MockServer, extra: serde_json::Value) -> ToolConfig {
+        let mut body = serde_json::json!({
+            "framework": "claude", "model": "m", "prompt": "hi", "endpoint": server.uri(),
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        tool_config(body, true)
+    }
+
+    #[tokio::test]
+    async fn max_tokens_without_an_answer_fails_with_block_types() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [], "stop_reason": "max_tokens",
+                "usage": { "input_tokens": 5, "output_tokens": 2048 },
+            })))
+            .mount(&server)
+            .await;
+        let mut session =
+            AgentSession::start(&claude_cfg(&server, serde_json::json!({})), &ctx_with_key())
+                .await
+                .unwrap();
+        let err = session.next_turn().await.unwrap_err().to_string();
+        assert!(
+            err.contains("max_tokens=4096") && err.contains("content blocks: []"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_partial_tool_calls_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{ "type": "tool_use", "id": "t", "name": "x", "input": {} }],
+                "stop_reason": "max_tokens",
+            })))
+            .mount(&server)
+            .await;
+        let cfg = claude_cfg(&server, serde_json::json!({ "tools": [{ "name": "x" }] }));
+        let mut session = AgentSession::start(&cfg, &ctx_with_key()).await.unwrap();
+        let err = session.next_turn().await.unwrap_err().to_string();
+        assert!(err.contains("tool_use"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_text_is_returned_flagged_truncated() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{ "type": "text", "text": "partial" }], "stop_reason": "max_tokens",
+            })))
+            .mount(&server)
+            .await;
+        let mut session =
+            AgentSession::start(&claude_cfg(&server, serde_json::json!({})), &ctx_with_key())
+                .await
+                .unwrap();
+        match session.next_turn().await.unwrap() {
+            AgentTurn::Final(v) => {
+                assert_eq!(v["text"], "partial");
+                assert_eq!(v["truncated"], true);
+            }
+            other => panic!("expected final, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_marks_the_last_block_and_counts_cache_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+                last["content"][0]["cache_control"]["type"] == "ephemeral"
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{ "type": "text", "text": "ok" }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 3, "output_tokens": 1,
+                           "cache_read_input_tokens": 900, "cache_creation_input_tokens": 100 },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut session =
+            AgentSession::start(&claude_cfg(&server, serde_json::json!({})), &ctx_with_key())
+                .await
+                .unwrap();
+        match session.next_turn().await.unwrap() {
+            AgentTurn::Final(v) => {
+                assert_eq!(v["usage"]["cache_read_input_tokens"], 900);
+                assert_eq!(v["usage"]["cache_creation_input_tokens"], 100);
+            }
+            other => panic!("expected final, got {other:?}"),
+        }
+        // The stored history itself stays unmarked; only the request carries it.
+        assert!(session.messages[0]["content"].is_string());
+    }
+
+    #[tokio::test]
+    async fn thinking_and_effort_pass_through_only_when_set() {
+        let server = MockServer::start().await;
+        let plain =
+            AgentSession::start(&claude_cfg(&server, serde_json::json!({})), &ctx_with_key())
+                .await
+                .unwrap()
+                .request_body();
+        assert!(plain.get("thinking").is_none() && plain.get("output_config").is_none());
+
+        let set = AgentSession::start(
+            &claude_cfg(
+                &server,
+                serde_json::json!({ "thinking": "disabled", "effort": "low" }),
+            ),
+            &ctx_with_key(),
+        )
+        .await
+        .unwrap()
+        .request_body();
+        assert_eq!(set["thinking"], serde_json::json!({ "type": "disabled" }));
+        assert_eq!(set["output_config"], serde_json::json!({ "effort": "low" }));
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_can_be_turned_off() {
+        let server = MockServer::start().await;
+        let session = AgentSession::start(
+            &claude_cfg(&server, serde_json::json!({ "prompt_cache": false })),
+            &ctx_with_key(),
+        )
+        .await
+        .unwrap();
+        assert!(!session.request_body().to_string().contains("cache_control"));
     }
 
     #[tokio::test]
