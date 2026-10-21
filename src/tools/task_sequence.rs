@@ -175,6 +175,20 @@ impl TaskSequenceTool {
     }
 }
 
+/// A task's `auth:` block, lifted out of its (rendered) config into
+/// `ToolConfig::auth`, which is where tools read it (e.g. `http` with
+/// `type: gcp_adc`). A top-level step gets this from `ToolConfig`'s own
+/// deserialisation; a pipeline task is built by hand, so without this its
+/// `auth:` stayed inside `config` and the request went out unauthenticated.
+/// An `auth` that isn't an `AuthConfig` (a credential alias string) is left
+/// in place for the tool to interpret, as before.
+fn take_auth(config: &mut serde_json::Value) -> Option<crate::registry::AuthConfig> {
+    let obj = config.as_object_mut()?;
+    let auth = serde_json::from_value::<crate::registry::AuthConfig>(obj.get("auth")?.clone()).ok()?;
+    obj.remove("auth");
+    Some(auth)
+}
+
 impl Default for TaskSequenceTool {
     fn default() -> Self {
         Self::new()
@@ -350,15 +364,16 @@ impl Tool for TaskSequenceTool {
                 &task_ctx.variables,
                 task_ctx.template_metadata(),
             );
-            let rendered = self
+            let mut rendered = self
                 .template_engine
                 .render_value_with(&raw_task_config.config, &task_ctx_value)?;
+            let auth = raw_task_config.auth.or_else(|| take_auth(&mut rendered));
             let task_config = ToolConfig {
                 kind: raw_task_config.kind,
                 config: rendered,
                 timeout: raw_task_config.timeout,
                 retry: raw_task_config.retry,
-                auth: raw_task_config.auth,
+                auth,
             };
 
             // noetl/server#434 — a Rust `Err` must reach the policy engine.
@@ -958,6 +973,28 @@ fn set_nested_var(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pipeline_task_keeps_its_auth_block() {
+        let mut cfg = serde_json::json!({
+            "method": "POST",
+            "url": "https://example.com",
+            "auth": { "type": "gcp_adc", "scopes": ["https://www.googleapis.com/auth/cloud-platform"] }
+        });
+        let auth = take_auth(&mut cfg).expect("auth lifted out of the task config");
+        assert!(matches!(auth.auth_type, crate::registry::AuthType::GcpAdc));
+        assert!(cfg.get("auth").is_none());
+        assert_eq!(cfg["url"], "https://example.com");
+
+        // A credential alias string is left for the tool, as before.
+        let mut cfg = serde_json::json!({ "url": "https://example.com", "auth": "pg_k8s" });
+        assert!(take_auth(&mut cfg).is_none());
+        assert_eq!(cfg["auth"], "pg_k8s");
+        // No auth: nothing changes.
+        let mut cfg = serde_json::json!({ "url": "https://example.com" });
+        assert!(take_auth(&mut cfg).is_none());
+    }
+
     use super::*;
 
     #[test]
