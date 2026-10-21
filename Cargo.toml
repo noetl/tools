@@ -94,6 +94,8 @@ bytes = "1"
 # SHA-256 integrity hashing for the store-and-forward spool item envelope
 # (RFC #90 Phase 4 — spool payload-ref + sha256 in the event log).
 sha2 = "0.10"
+# OS CSPRNG for the rhai `random_digits` / `random_token` functions.
+getrandom = "0.2"
 # Snowflake key-pair (JWT) auth: RS256-sign a JWT with the account private
 # key + the public-key SHA256 fingerprint, bypassing password/MFA login.
 # 10.3.0 is the patched line for GHSA-h395-gr6q-cpjc (noetl/ai-meta#385); 9.x is
