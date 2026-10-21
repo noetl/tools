@@ -201,6 +201,8 @@ impl RhaiTool {
             }
         });
 
+        register_crypto(&mut engine);
+
         engine
     }
 
@@ -466,6 +468,90 @@ fn dynamic_to_json(value: &Dynamic) -> serde_json::Value {
     }
 }
 
+/// Hashing, HMAC and randomness for scripts that issue or check one-time
+/// codes and similar secrets (auth provider playbooks): `sha256_hex(s)`,
+/// `hmac_sha256_hex(key, msg)`, `random_digits(n)` (1..=32 decimal digits),
+/// `random_token(bytes)` (1..=64 random bytes, base64url without padding)
+/// and `eq_ct(a, b)` (comparison whose time doesn't depend on where the
+/// strings differ). Randomness comes from the OS CSPRNG.
+fn register_crypto(engine: &mut Engine) {
+    engine.register_fn("sha256_hex", |s: &str| hex_lower(&sha256(s.as_bytes())));
+    engine.register_fn("hmac_sha256_hex", |key: &str, msg: &str| {
+        hex_lower(&hmac_sha256(key.as_bytes(), msg.as_bytes()))
+    });
+    engine.register_fn(
+        "random_digits",
+        |n: i64| -> Result<String, Box<rhai::EvalAltResult>> {
+            if !(1..=32).contains(&n) {
+                return Err("random_digits: n must be 1..=32".into());
+            }
+            let mut out = String::with_capacity(n as usize);
+            let mut buf = [0u8; 64];
+            while out.len() < n as usize {
+                getrandom::getrandom(&mut buf).map_err(|e| format!("random_digits: {e}"))?;
+                // Rejection sampling: bytes >= 250 would bias the digits.
+                for b in buf.iter().filter(|b| **b < 250) {
+                    if out.len() == n as usize {
+                        break;
+                    }
+                    out.push(char::from(b'0' + b % 10));
+                }
+            }
+            Ok(out)
+        },
+    );
+    engine.register_fn(
+        "random_token",
+        |bytes: i64| -> Result<String, Box<rhai::EvalAltResult>> {
+            if !(1..=64).contains(&bytes) {
+                return Err("random_token: bytes must be 1..=64".into());
+            }
+            let mut buf = vec![0u8; bytes as usize];
+            getrandom::getrandom(&mut buf).map_err(|e| format!("random_token: {e}"))?;
+            Ok(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                &buf,
+            ))
+        },
+    );
+    engine.register_fn("eq_ct", |a: &str, b: &str| {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let mut diff = (a.len() ^ b.len()) as u8 | ((a.len() ^ b.len()) >> 8) as u8;
+        for i in 0..a.len().max(b.len()) {
+            diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+        }
+        diff == 0
+    });
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
+/// HMAC-SHA256 (RFC 2104) over `sha2`, so the rhai tool doesn't need the
+/// optional `hmac` dependency.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = sha2::Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = sha2::Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +687,55 @@ mod tests {
             )
             .unwrap();
         assert!(result);
+    }
+
+    #[test]
+    fn test_rhai_crypto_functions() {
+        let tool = RhaiTool::new();
+        let engine = tool.create_engine();
+        let mut scope = Scope::new();
+        let eval = |code: &str| -> Dynamic { engine.eval_with_scope(&mut Scope::new(), code).unwrap() };
+
+        // FIPS 180-2 / RFC 4231 test vectors.
+        assert_eq!(
+            eval(r#"sha256_hex("abc")"#).into_string().unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            eval(r#"hmac_sha256_hex("Jefe", "what do ya want for nothing?")"#).into_string().unwrap(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the block size works (exact vector in the next test).
+        let code = format!(r#"hmac_sha256_hex("{}", "msg")"#, "k".repeat(131));
+        assert_eq!(eval(&code).into_string().unwrap().len(), 64);
+
+        let d = eval("random_digits(6)").into_string().unwrap();
+        assert_eq!(d.len(), 6);
+        assert!(d.chars().all(|c| c.is_ascii_digit()));
+        assert_ne!(eval("random_digits(32)").into_string().unwrap(), eval("random_digits(32)").into_string().unwrap());
+        assert!(engine.eval_with_scope::<String>(&mut scope, "random_digits(0)").is_err());
+        assert!(engine.eval_with_scope::<String>(&mut scope, "random_digits(33)").is_err());
+
+        let t = eval("random_token(32)").into_string().unwrap();
+        assert_eq!(t.len(), 43);
+        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(engine.eval_with_scope::<String>(&mut scope, "random_token(65)").is_err());
+
+        assert!(eval(r#"eq_ct("123456", "123456")"#).as_bool().unwrap());
+        assert!(!eval(r#"eq_ct("123456", "123457")"#).as_bool().unwrap());
+        assert!(!eval(r#"eq_ct("123456", "1234567")"#).as_bool().unwrap());
+        assert!(!eval(r#"eq_ct("", "a")"#).as_bool().unwrap());
+        assert!(eval(r#"eq_ct("", "")"#).as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_hmac_sha256_long_key_matches_rfc4231() {
+        // RFC 4231 test case 6: 131 bytes of 0xaa.
+        let key = [0xaau8; 131];
+        let mac = hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First");
+        assert_eq!(
+            hex_lower(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 }
