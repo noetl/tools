@@ -36,6 +36,7 @@ use crate::error::ToolError;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod nats;
+pub mod timer;
 #[cfg(feature = "pubsub")]
 pub mod pubsub;
 

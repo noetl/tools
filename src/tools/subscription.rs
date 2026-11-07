@@ -32,6 +32,8 @@
 //!
 //! Pub/Sub uses `subscription: "projects/<p>/subscriptions/<s>"` (+ optional
 //! `endpoint` for the emulator); Kafka uses `brokers`, `topic`, `group`.
+//! `source: timer` (`every`, `immediate`, `payload`) emits one message per
+//! period; with `noetl subscribe` it is a scheduler (see `source::timer`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -126,6 +128,17 @@ pub struct SubscriptionConfig {
     /// Kafka consumer group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+
+    // --- Timer ---
+    /// Period: `500ms`, `30s`, `5m`, `1h`, or a number of seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every: Option<serde_json::Value>,
+    /// Fire once at start (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immediate: Option<bool>,
+    /// Mapping merged into every tick message's data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 fn default_operation() -> String {
@@ -207,6 +220,15 @@ pub fn build_source(
             )))
         }
 
+        "timer" => {
+            let every = super::source::timer::parse_every(cfg.every.as_ref())?;
+            Ok(Box::new(super::source::timer::TimerSource::new(
+                every,
+                cfg.immediate.unwrap_or(true),
+                cfg.payload.clone(),
+            )?))
+        }
+
         #[cfg(feature = "pubsub")]
         "pubsub" => {
             let subscription = cfg.subscription.clone().ok_or_else(|| {
@@ -262,10 +284,10 @@ pub fn build_source(
 /// List the source backends compiled into this build (feature-gated).
 fn available_sources() -> &'static str {
     match (cfg!(feature = "pubsub"), cfg!(feature = "kafka")) {
-        (true, true) => "nats, pubsub, kafka",
-        (true, false) => "nats, pubsub",
-        (false, true) => "nats, kafka",
-        (false, false) => "nats",
+        (true, true) => "nats, timer, pubsub, kafka",
+        (true, false) => "nats, timer, pubsub",
+        (false, true) => "nats, timer, kafka",
+        (false, false) => "nats, timer",
     }
 }
 
