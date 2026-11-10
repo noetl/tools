@@ -755,34 +755,22 @@ fn trim_slash(s: &str) -> String {
 /// Strips MCP-specific path segments (`/mcp`, `/sse`, `/message`) and appends
 /// `/healthz`; otherwise appends `/healthz` to whatever path is already there.
 pub(crate) fn resolve_health_url(endpoint: &str) -> String {
-    // Simple approach: parse scheme+host, then decide on path.
-    if let Ok(url) = reqwest::Url::parse(endpoint) {
-        let path = url.path().trim_end_matches('/');
-        let new_path = if matches!(path, "/mcp" | "/sse" | "/message") || path.is_empty() {
-            "/healthz".to_string()
-        } else {
-            format!("{path}/healthz")
-        };
-        let mut base = format!(
-            "{}://{}{}",
-            url.scheme(),
-            url.host_str().unwrap_or(""),
-            new_path
-        );
-        if let Some(port) = url.port() {
-            // re-insert port
-            base = format!(
-                "{}://{}:{}{}",
-                url.scheme(),
-                url.host_str().unwrap_or(""),
-                port,
-                new_path
-            );
-        }
-        return base;
+    // A trailing MCP segment (`/mcp`, `/sse`, `/message`) is replaced by
+    // `/healthz`, keeping any mount prefix before it
+    // (`/ehgraph/noetl-cluster/mcp` → `/ehgraph/noetl-cluster/healthz`); any
+    // other path gets `/healthz` appended.
+    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
+        let path = url.path().trim_end_matches('/').to_string();
+        let base = ["/mcp", "/sse", "/message"]
+            .iter()
+            .find_map(|seg| path.strip_suffix(seg))
+            .unwrap_or(&path)
+            .to_string();
+        url.set_path(&format!("{base}/healthz"));
+        url.set_query(None);
+        return url.to_string();
     }
-    // Fallback: append /healthz
-    format!("{endpoint}/healthz")
+    format!("{}/healthz", endpoint.trim_end_matches('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,5 +1707,16 @@ mod tests {
         assert!(result.is_ok(), "tools/list failed: {:?}", result);
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    #[test]
+    fn health_url_keeps_a_mount_prefix() {
+        assert_eq!(resolve_health_url("http://h:8080/mcp"), "http://h:8080/healthz");
+        assert_eq!(
+            resolve_health_url("http://h:8082/ehgraph/noetl-cluster/mcp"),
+            "http://h:8082/ehgraph/noetl-cluster/healthz"
+        );
+        assert_eq!(resolve_health_url("http://h/x"), "http://h/x/healthz");
+        assert_eq!(resolve_health_url("http://h"), "http://h/healthz");
     }
 }
