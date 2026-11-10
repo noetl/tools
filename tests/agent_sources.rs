@@ -588,3 +588,28 @@ async fn framework_remote_reads_input_under_the_servers_args_name() {
     .unwrap();
     assert_eq!(sent["input"]["question"], "via args");
 }
+
+#[tokio::test]
+async fn an_empty_args_object_from_the_server_counts_as_unset() {
+    // claude with the server's empty `args` is not "input on the wrong framework".
+    let mcp = mcp_server(None).await;
+    let (llm, _) = model("ehg__graph_lookup", json!({"id": "r1"})).await;
+    let data = AgentTool::new()
+        .execute(
+            &cfg(
+                "agent",
+                json!({
+                    "framework": "claude", "model": "m", "prompt": "p", "endpoint": llm.uri(), "args": {},
+                    "mcp_servers": [{"name": "ehg", "endpoint": format!("{}/mcp", mcp.uri()), "tools": ["graph.lookup"]}]
+                }),
+                Some(api_key("anthropic")),
+            ),
+            &ctx(),
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(data["source_tool_calls"], 1);
+}
+

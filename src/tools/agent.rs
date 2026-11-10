@@ -310,8 +310,18 @@ impl AgentSession {
     /// `auth` is required: there is no fallback to an environment variable or
     /// any other ambient key.
     pub async fn start(config: &ToolConfig, ctx: &ExecutionContext) -> Result<Self, ToolError> {
-        let parsed: AgentConfig = serde_json::from_value(config.config.clone())
+        let mut parsed: AgentConfig = serde_json::from_value(config.config.clone())
             .map_err(|e| ToolError::Configuration(format!("Invalid agent config: {}", e)))?;
+        // noetl-server puts an `args` object on every tool config (empty when
+        // the step wrote no `input:`), and `input` reads `args`; an empty or
+        // null value means "not set".
+        if parsed
+            .input
+            .as_ref()
+            .is_some_and(|v| v.is_null() || v.as_object().is_some_and(|m| m.is_empty()))
+        {
+            parsed.input = None;
+        }
         if parsed.max_turns == 0 {
             return Err(ToolError::Configuration(
                 "agent max_turns must be at least 1".to_string(),
@@ -427,7 +437,6 @@ impl AgentSession {
             "content": parsed.prompt,
         })];
 
-        let mut parsed = parsed;
         let remote = match parsed.remote.clone() {
             Some(spec) => Some(RemoteAgent::resolve(spec, ctx).await?),
             None => None,
