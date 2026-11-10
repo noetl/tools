@@ -208,7 +208,11 @@ pub struct AgentConfig {
     pub remote: Option<RemoteAgentSpec>,
     /// `remote` only: the input sent (`noetl`: an object; `a2a`: text or JSON).
     /// Unset sends `{prompt}` (`noetl`) or `prompt` (`a2a`).
-    #[serde(default)]
+    ///
+    /// `args` is accepted too: noetl-server's step model decodes a tool's
+    /// `input:` into `args` (the alias the python / shell tools rely on), so on
+    /// the cluster worker this field arrives under that name.
+    #[serde(default, alias = "args")]
     pub input: Option<serde_json::Value>,
 }
 

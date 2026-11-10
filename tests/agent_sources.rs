@@ -560,3 +560,31 @@ async fn framework_remote_rejects_misplaced_fields() {
         assert!(err.to_string().contains(needle), "{body}: {err}");
     }
 }
+
+#[tokio::test]
+async fn framework_remote_reads_input_under_the_servers_args_name() {
+    let peer = noetl_agent(None).await;
+    let data = AgentTool::new()
+        .execute(
+            &cfg(
+                "agent",
+                json!({
+                    "framework": "remote",
+                    "remote": {"endpoint": peer.uri(), "agent": "peer/ask"},
+                    "args": {"question": "via args"}
+                }),
+                None,
+            ),
+            &ctx(),
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(data["status"], "completed", "{data}");
+    let sent: Value = serde_json::from_slice(
+        &peer.received_requests().await.unwrap().iter().find(|r| r.url.path() == "/api/agents/send").unwrap().body,
+    )
+    .unwrap();
+    assert_eq!(sent["input"]["question"], "via args");
+}
