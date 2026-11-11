@@ -57,12 +57,15 @@
 //! [py-src]: https://github.com/noetl/noetl/blob/main/noetl/tools/mcp/executor.py
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::auth::{AuthCredentials, AuthResolver};
 use crate::context::ExecutionContext;
 use crate::error::ToolError;
+use crate::registry::AuthConfig;
 use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
@@ -172,6 +175,24 @@ pub struct McpConfig {
     /// Capabilities object sent in `initialize` (default: `{}`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<serde_json::Value>,
+
+    // --- auth ---
+    /// Literal request headers (`{name: value}`), sent on every request of the
+    /// invocation.  Values are rendered with the rest of the config, so a host
+    /// can carry `{{ keychain.<alias>.<field> }}` here.  A header that renders
+    /// empty is dropped rather than sent blank.  `content-type`, `accept`,
+    /// `mcp-session-id`, `content-length` and `host` belong to the tool and are
+    /// refused.  The step's `auth:` block (the [`ToolConfig::auth`] the host
+    /// passes) adds an `Authorization` / api-key header on top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, serde_json::Value>>,
+
+    /// `fail` turns a provider error into a failed step: a transport, JSON-RPC
+    /// or envelope failure (otherwise reported as a successful `status: "error"`
+    /// result), or a `tools/call` result carrying MCP's `isError: true`.
+    /// `continue` (and unset) keeps the result for the playbook to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_provider_error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +248,9 @@ impl Tool for McpTool {
         ctx: &ExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let mcp_cfg = self.parse_config(config, ctx)?;
+        let fail_on_provider_error = parse_provider_error_policy(&mcp_cfg.on_provider_error)?;
+        let extra = request_headers(&mcp_cfg.headers, config.auth.as_ref(), ctx).await?;
+        let sent_headers = header_names(&extra);
 
         let server = mcp_cfg
             .server
@@ -272,19 +296,29 @@ impl Tool for McpTool {
             &method,
             timeout_secs,
             request_id,
+            &extra,
         )
         .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
-            Ok(data) => {
+            Ok(mut data) => {
                 tracing::debug!(
                     method = %method,
                     server = %server,
                     duration_ms,
                     "MCP request complete"
                 );
+                if fail_on_provider_error && is_tool_error(&data) {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "mcp {method} on '{server}' returned isError: {}",
+                        truncate(data.get("text").and_then(|t| t.as_str()).unwrap_or(""), 300)
+                    )));
+                }
+                if !sent_headers.is_empty() {
+                    data["sent_headers"] = serde_json::json!(sent_headers);
+                }
                 Ok(ToolResult::success(data).with_duration(duration_ms))
             }
             Err(e) => {
@@ -300,7 +334,13 @@ impl Tool for McpTool {
                 // Return a structured error payload (mirrors Python tool behaviour:
                 // errors are returned as `status: "error"` rather than propagated
                 // as ToolError, so the playbook can inspect the error field).
-                let payload = serde_json::json!({
+                if fail_on_provider_error {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "mcp {method} on '{server}' failed: {}",
+                        truncate(&e.to_string(), 300)
+                    )));
+                }
+                let mut payload = serde_json::json!({
                     "status": "error",
                     "server": server,
                     "endpoint": endpoint,
@@ -308,6 +348,9 @@ impl Tool for McpTool {
                     "error": e.to_string(),
                     "text": e.to_string(),
                 });
+                if !sent_headers.is_empty() {
+                    payload["sent_headers"] = serde_json::json!(sent_headers);
+                }
                 Ok(ToolResult::success(payload).with_duration(duration_ms))
             }
         }
@@ -325,6 +368,7 @@ async fn execute_mcp(
     method: &str,
     timeout_secs: f64,
     request_id: u64,
+    extra: &HeaderMap,
 ) -> Result<serde_json::Value, McpError> {
     let timeout = Duration::from_secs_f64(timeout_secs);
 
@@ -335,6 +379,7 @@ async fn execute_mcp(
         let client = build_client(timeout)?;
         let response = client
             .get(&health_url)
+            .headers(extra.clone())
             .send()
             .await
             .map_err(|e| McpError::Http(e.to_string()))?;
@@ -383,7 +428,8 @@ async fn execute_mcp(
         },
     });
 
-    let (init_envelope, session_id) = post_jsonrpc(&client, endpoint, &init_payload, None).await?;
+    let (init_envelope, session_id) =
+        post_jsonrpc(&client, endpoint, &init_payload, None, extra).await?;
 
     if session_id.is_none() {
         tracing::debug!(
@@ -402,8 +448,14 @@ async fn execute_mcp(
         "params": params,
     });
 
-    let (envelope, _) =
-        post_jsonrpc(&client, endpoint, &call_payload, session_id.as_deref()).await?;
+    let (envelope, _) = post_jsonrpc(
+        &client,
+        endpoint,
+        &call_payload,
+        session_id.as_deref(),
+        extra,
+    )
+    .await?;
 
     let result = envelope
         .get("result")
@@ -498,8 +550,9 @@ async fn post_jsonrpc(
     endpoint: &str,
     payload: &serde_json::Value,
     session_id: Option<&str>,
+    extra: &HeaderMap,
 ) -> Result<(serde_json::Value, Option<String>), McpError> {
-    let mut headers = HeaderMap::new();
+    let mut headers = extra.clone();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         ACCEPT,
@@ -702,34 +755,22 @@ fn trim_slash(s: &str) -> String {
 /// Strips MCP-specific path segments (`/mcp`, `/sse`, `/message`) and appends
 /// `/healthz`; otherwise appends `/healthz` to whatever path is already there.
 pub(crate) fn resolve_health_url(endpoint: &str) -> String {
-    // Simple approach: parse scheme+host, then decide on path.
-    if let Ok(url) = reqwest::Url::parse(endpoint) {
-        let path = url.path().trim_end_matches('/');
-        let new_path = if matches!(path, "/mcp" | "/sse" | "/message") || path.is_empty() {
-            "/healthz".to_string()
-        } else {
-            format!("{path}/healthz")
-        };
-        let mut base = format!(
-            "{}://{}{}",
-            url.scheme(),
-            url.host_str().unwrap_or(""),
-            new_path
-        );
-        if let Some(port) = url.port() {
-            // re-insert port
-            base = format!(
-                "{}://{}:{}{}",
-                url.scheme(),
-                url.host_str().unwrap_or(""),
-                port,
-                new_path
-            );
-        }
-        return base;
+    // A trailing MCP segment (`/mcp`, `/sse`, `/message`) is replaced by
+    // `/healthz`, keeping any mount prefix before it
+    // (`/ehgraph/noetl-cluster/mcp` → `/ehgraph/noetl-cluster/healthz`); any
+    // other path gets `/healthz` appended.
+    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
+        let path = url.path().trim_end_matches('/').to_string();
+        let base = ["/mcp", "/sse", "/message"]
+            .iter()
+            .find_map(|seg| path.strip_suffix(seg))
+            .unwrap_or(&path)
+            .to_string();
+        url.set_path(&format!("{base}/healthz"));
+        url.set_query(None);
+        return url.to_string();
     }
-    // Fallback: append /healthz
-    format!("{endpoint}/healthz")
+    format!("{}/healthz", endpoint.trim_end_matches('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +825,337 @@ fn read_float_env(name: &str, default: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Request headers: `headers:` + `auth:`
+// ---------------------------------------------------------------------------
+
+/// Headers the tool owns.  A step may not set them, because the MCP session
+/// and the JSON-RPC transport depend on them.
+const RESERVED_HEADERS: &[&str] = &[
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "content-length",
+    "host",
+];
+
+fn reject_reserved(name: &str) -> Result<(), ToolError> {
+    if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(ToolError::Configuration(format!(
+            "mcp header '{name}' is set by the tool and cannot be overridden"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_sensitive(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &str,
+) -> Result<(), ToolError> {
+    let mut v = HeaderValue::from_str(value).map_err(|_| {
+        ToolError::Configuration(format!("mcp header '{name}' has an invalid value"))
+    })?;
+    // Never printed by reqwest's Debug output.
+    v.set_sensitive(true);
+    headers.insert(name, v);
+    Ok(())
+}
+
+/// Build the extra request headers for an MCP call from a literal `headers:`
+/// map and an optional `auth:` block resolved against `ctx`.
+///
+/// Header values and resolved credentials are never logged and never echoed
+/// into a result; [`header_names`] gives the header *names* a caller may report.
+pub async fn request_headers(
+    literal: &Option<BTreeMap<String, serde_json::Value>>,
+    auth: Option<&AuthConfig>,
+    ctx: &ExecutionContext,
+) -> Result<HeaderMap, ToolError> {
+    let mut out = HeaderMap::new();
+    for (k, v) in literal.iter().flatten() {
+        reject_reserved(k)?;
+        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+            ToolError::Configuration(format!("mcp header name '{k}' is invalid: {e}"))
+        })?;
+        let value = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => String::new(),
+            _ => {
+                return Err(ToolError::Configuration(format!(
+                    "mcp header '{k}' must be a string"
+                )))
+            }
+        };
+        // A header whose template rendered empty (an unresolved credential) is
+        // dropped, not sent blank: the server then reports the missing credential.
+        if value.is_empty() {
+            continue;
+        }
+        insert_sensitive(&mut out, name, &value)?;
+    }
+    if let Some(auth) = auth {
+        match AuthResolver::new().resolve(auth, ctx).await? {
+            AuthCredentials::Bearer(token) => {
+                insert_sensitive(&mut out, AUTHORIZATION, &format!("Bearer {token}"))?;
+            }
+            AuthCredentials::Basic(user, pass) => {
+                use base64::Engine as _;
+                let enc =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+                insert_sensitive(&mut out, AUTHORIZATION, &format!("Basic {enc}"))?;
+            }
+            AuthCredentials::ApiKey(name, value) => {
+                let name = HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| ToolError::Auth(format!("api_key header name is invalid: {e}")))?;
+                reject_reserved(name.as_str())?;
+                insert_sensitive(&mut out, name, &value)?;
+            }
+            AuthCredentials::None => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The sorted header names of `headers`, for a result's `sent_headers` field.
+pub fn header_names(headers: &HeaderMap) -> Vec<String> {
+    let mut names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `on_provider_error`: `Some("fail")` → true; unset / `continue` → false; any
+/// other value is a configuration error, so a typo never silently means
+/// "continue".
+fn parse_provider_error_policy(v: &Option<String>) -> Result<bool, ToolError> {
+    match v.as_deref().map(str::trim) {
+        None | Some("") | Some("continue") => Ok(false),
+        Some("fail") => Ok(true),
+        Some(other) => Err(ToolError::Configuration(format!(
+            "on_provider_error must be 'fail' or 'continue', got '{other}'"
+        ))),
+    }
+}
+
+/// Does a successful `execute_mcp` payload carry MCP's tool-level error flag?
+fn is_tool_error(data: &serde_json::Value) -> bool {
+    data.pointer("/result/isError").and_then(|v| v.as_bool()) == Some(true)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+// ---------------------------------------------------------------------------
+// McpClient: a reusable MCP session (agent tool sources, hosts)
+// ---------------------------------------------------------------------------
+
+/// One MCP tool as a server advertises it in `tools/list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// A JSON-RPC session against one MCP server (Streamable HTTP, JSON or SSE
+/// replies).  `kind: mcp` steps use the same transport; this type exists so
+/// other tools (the agent's `mcp_servers:` sources) can hold a session across
+/// several calls instead of re-initializing per call.
+pub struct McpClient {
+    client: reqwest::Client,
+    endpoint: String,
+    headers: HeaderMap,
+    session_id: Option<String>,
+    next_id: u64,
+    initialized: bool,
+}
+
+impl std::fmt::Debug for McpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Header values (credentials) are deliberately absent.
+        f.debug_struct("McpClient")
+            .field("endpoint", &self.endpoint)
+            .field("headers", &header_names(&self.headers))
+            .field("initialized", &self.initialized)
+            .finish()
+    }
+}
+
+impl McpClient {
+    /// A client for `endpoint` that sends `headers` (see [`request_headers`])
+    /// on every request.
+    pub fn new(endpoint: &str, headers: HeaderMap, timeout: Duration) -> Result<Self, ToolError> {
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() {
+            return Err(ToolError::Configuration("mcp endpoint is empty".into()));
+        }
+        Ok(Self {
+            client: build_client(timeout)?,
+            endpoint: trim_slash(endpoint),
+            headers,
+            session_id: None,
+            next_id: 1,
+            initialized: false,
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Send `initialize` (once) and keep the `Mcp-Session-Id`, if any.
+    pub async fn initialize(&mut self) -> Result<serde_json::Value, ToolError> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "noetl", "version": env!("CARGO_PKG_VERSION") },
+            },
+        });
+        let (env, sid) =
+            post_jsonrpc(&self.client, &self.endpoint, &payload, None, &self.headers).await?;
+        self.session_id = sid;
+        self.initialized = true;
+        // `notifications/initialized` is best effort: stateless servers answer
+        // 202 with no body, which `post_jsonrpc` would reject as an envelope.
+        let _ = self
+            .client
+            .post(&self.endpoint)
+            .headers(self.request_headers()?)
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await;
+        Ok(env
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Send one JSON-RPC request and return its `result`.  Initializes first
+    /// when needed.
+    pub async fn request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        if !self.initialized {
+            self.initialize().await?;
+        }
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id(),
+            "method": method,
+            "params": params,
+        });
+        let (env, _) = post_jsonrpc(
+            &self.client,
+            &self.endpoint,
+            &payload,
+            self.session_id.as_deref(),
+            &self.headers,
+        )
+        .await?;
+        Ok(env
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Every tool the server lists, following `nextCursor` (bounded at 50 pages).
+    pub async fn list_tools(&mut self) -> Result<Vec<McpToolInfo>, ToolError> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..50 {
+            let params = match &cursor {
+                Some(c) => serde_json::json!({ "cursor": c }),
+                None => serde_json::json!({}),
+            };
+            let result = self.request("tools/list", params).await?;
+            for t in result
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(name) = t.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                out.push(McpToolInfo {
+                    name: name.to_string(),
+                    description: t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    input_schema: t
+                        .get("inputSchema")
+                        .cloned()
+                        .filter(|s| s.is_object())
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                });
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(str::to_string);
+            if cursor.is_none() {
+                return Ok(out);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `tools/call`; returns `(text, result, is_error)`.
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<(String, serde_json::Value, bool), ToolError> {
+        let arguments = if arguments.is_null() {
+            serde_json::json!({})
+        } else {
+            arguments
+        };
+        let result = self
+            .request(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let is_error = result.get("isError").and_then(|v| v.as_bool()) == Some(true);
+        Ok((extract_text(&result), result, is_error))
+    }
+
+    fn take_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn request_headers(&self) -> Result<HeaderMap, ToolError> {
+        let mut h = self.headers.clone();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        h.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        if let Some(sid) = &self.session_id {
+            if let Ok(v) = HeaderValue::from_str(sid) {
+                h.insert("Mcp-Session-Id", v);
+            }
+        }
+        Ok(h)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum McpError {
@@ -916,6 +1288,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         assert_eq!(resolve_endpoint(&cfg).unwrap(), "http://localhost:8080/mcp");
     }
@@ -942,6 +1316,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         assert_eq!(resolve_endpoint(&cfg).unwrap(), "http://localhost:8080/mcp");
     }
@@ -971,6 +1347,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let ep = resolve_endpoint(&cfg).unwrap();
         std::env::remove_var(&env_name);
@@ -1002,6 +1380,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         assert!(resolve_endpoint(&cfg).is_err());
     }
@@ -1142,6 +1522,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let (params, tool_name, args) = build_method_params(&cfg, "tools/call").unwrap();
         assert_eq!(params["name"], "get_pods");
@@ -1172,6 +1554,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let r = build_method_params(&cfg, "tools/call");
         assert!(r.is_err());
@@ -1199,6 +1583,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let (params, tool, args) = build_method_params(&cfg, "tools/list").unwrap();
         assert!(params.as_object().unwrap().is_empty());
@@ -1228,6 +1614,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let (params, _, _) = build_method_params(&cfg, "resources/list").unwrap();
         assert_eq!(params["cursor"], "abc");
@@ -1270,6 +1658,8 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
         let result = execute_mcp(
             &cfg,
@@ -1277,9 +1667,7 @@ mod tests {
             cfg.endpoint.as_deref().unwrap(),
             "health",
             10.0,
-            1,
-        )
-        .await;
+            1, &HeaderMap::new()).await;
         assert!(result.is_ok(), "health probe failed: {:?}", result);
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
@@ -1312,10 +1700,23 @@ mod tests {
             client_name: None,
             client_version: None,
             capabilities: None,
+            headers: None,
+            on_provider_error: None,
         };
-        let result = execute_mcp(&cfg, "test", &endpoint, "tools/list", 15.0, 1).await;
+        let result = execute_mcp(&cfg, "test", &endpoint, "tools/list", 15.0, 1, &HeaderMap::new()).await;
         assert!(result.is_ok(), "tools/list failed: {:?}", result);
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    #[test]
+    fn health_url_keeps_a_mount_prefix() {
+        assert_eq!(resolve_health_url("http://h:8080/mcp"), "http://h:8080/healthz");
+        assert_eq!(
+            resolve_health_url("http://h:8082/ehgraph/noetl-cluster/mcp"),
+            "http://h:8082/ehgraph/noetl-cluster/healthz"
+        );
+        assert_eq!(resolve_health_url("http://h/x"), "http://h/x/healthz");
+        assert_eq!(resolve_health_url("http://h"), "http://h/healthz");
     }
 }

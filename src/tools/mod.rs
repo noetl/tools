@@ -45,6 +45,7 @@ mod playbook;
 mod postgres;
 mod provider;
 mod python;
+pub mod remote_agent;
 mod result_fetch;
 mod rhai;
 mod script;
@@ -57,7 +58,7 @@ mod transfer;
 
 pub use self::agent::{
     AgentConfig, AgentFramework, AgentSession, AgentTool, AgentToolCall, AgentToolOutput,
-    AgentToolSpec, AgentTurn,
+    AgentToolSpec, AgentTurn, McpServerSpec,
 };
 pub use self::artifact::ArtifactTool;
 pub use self::container::ContainerTool;
@@ -69,15 +70,18 @@ pub use self::container::{poll_job_to_terminal, JobTerminalOutcome, PollOptions}
 pub use self::duckdb::DuckdbTool;
 pub use self::ducklake::DucklakeTool;
 pub use self::http::HttpTool;
-pub use self::mcp::McpTool;
+pub use self::mcp::{
+    header_names as mcp_header_names, request_headers as mcp_request_headers, McpClient, McpTool,
+    McpToolInfo,
+};
 pub use self::nats::NatsTool;
 pub use self::noop::NoopTool;
 pub use self::playbook::PlaybookTool;
 pub use self::postgres::PostgresTool;
-pub use self::provider::ProviderTool;
 /// Provider ownership / drift / orphan projection (Fork 1) — the pure fold over
 /// the provider event stream.  Consumed by the EHDB-backed state adapter.
 pub use self::provider::state as provider_state;
+pub use self::provider::ProviderTool;
 pub use self::python::PythonTool;
 pub use self::result_fetch::ResultFetchTool;
 pub use self::rhai::RhaiTool;

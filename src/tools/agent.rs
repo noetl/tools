@@ -68,6 +68,8 @@ use crate::error::ToolError;
 use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
+use crate::tools::mcp::{request_headers, McpClient};
+use crate::tools::remote_agent::{RemoteAgent, RemoteAgentSpec, RemoteProtocol};
 
 /// Anthropic Messages API base URL used when `endpoint` is not set.
 pub const DEFAULT_ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com";
@@ -100,6 +102,34 @@ pub enum AgentFramework {
     /// The Claude Code CLI run headless; billed to the CLI's signed-in account.
     #[serde(rename = "claude-code")]
     ClaudeCode,
+    /// No model here: the step is one call to an external agent (`remote:`),
+    /// over the NoETL agent protocol or A2A.  See [`super::remote_agent`].
+    #[serde(rename = "remote")]
+    Remote,
+}
+
+/// An MCP server whose tools the model may call (`mcp_servers:`).  The agent
+/// session lists the server's tools at start and runs each call itself, so an
+/// agent with only MCP / remote-agent tools runs on any runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    /// Prefix of the tool names the model sees (`<name>__<tool>`).
+    pub name: String,
+    /// MCP Streamable HTTP endpoint.
+    pub endpoint: String,
+    /// Literal headers (rendered like the rest of the config).
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Credential for the server; resolved like any tool `auth:`.
+    #[serde(default)]
+    pub auth: Option<crate::registry::AuthConfig>,
+    /// Allowlist of the server's tool names.  Unset exposes every tool the
+    /// server lists; an empty list exposes none.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Seconds per MCP request (default 60).
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 /// One tool the model may call.
@@ -123,7 +153,12 @@ pub struct AgentToolSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub framework: AgentFramework,
+    /// Required for `claude` / `claude-code`; unused by `remote`.
+    #[serde(default)]
     pub model: String,
+    /// Required for `claude` / `claude-code`.  For `remote` it is the message
+    /// sent when `input` is unset.
+    #[serde(default)]
     pub prompt: String,
     #[serde(default)]
     pub system: Option<String>,
@@ -162,6 +197,51 @@ pub struct AgentConfig {
     /// `claude` only: `low` / `medium` / `high`, sent as `output_config.effort`.
     #[serde(default)]
     pub effort: Option<String>,
+    /// `claude` only: MCP servers whose tools the model may call.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
+    /// `claude` only: external agents the model may call, one tool each.
+    #[serde(default)]
+    pub agents: Vec<RemoteAgentSpec>,
+    /// `remote` only: the agent the step calls.
+    #[serde(default)]
+    pub remote: Option<RemoteAgentSpec>,
+    /// `remote` only: the input sent (`noetl`: an object; `a2a`: text or JSON).
+    /// Unset sends `{prompt}` (`noetl`) or `prompt` (`a2a`).
+    ///
+    /// `args` is accepted too: noetl-server's step model decodes a tool's
+    /// `input:` into `args` (the alias the python / shell tools rely on), so on
+    /// the cluster worker this field arrives under that name.
+    #[serde(default, alias = "args")]
+    pub input: Option<serde_json::Value>,
+}
+
+/// Binding keys the session owns.  A `tools:` entry may not use them, so a
+/// playbook cannot forge a binding the host would mistake for its own.
+const BINDING_MCP_SERVER: &str = "mcp_server";
+const BINDING_MCP_TOOL: &str = "mcp_tool";
+const BINDING_REMOTE_AGENT: &str = "remote_agent";
+
+/// `<prefix>__<name>` restricted to the model's tool-name alphabet
+/// (`[A-Za-z0-9_-]{1,64}`).
+fn source_tool_name(prefix: &str, name: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let joined = if prefix.is_empty() {
+        clean(name)
+    } else {
+        format!("{}__{}", clean(prefix), clean(name))
+    };
+    joined.chars().take(64).collect()
 }
 
 /// A tool call the model requested in its latest turn.
@@ -202,6 +282,14 @@ pub struct AgentSession {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    /// `mcp_servers:` sessions, by server name.
+    mcp: std::collections::HashMap<String, McpClient>,
+    /// `agents:` sources, by tool name.
+    remotes: std::collections::HashMap<String, RemoteAgent>,
+    /// `framework: remote`'s agent.
+    remote: Option<RemoteAgent>,
+    /// Tool calls the session answered itself (MCP / remote agents).
+    source_calls: u32,
 }
 
 impl std::fmt::Debug for AgentSession {
@@ -222,8 +310,18 @@ impl AgentSession {
     /// `auth` is required: there is no fallback to an environment variable or
     /// any other ambient key.
     pub async fn start(config: &ToolConfig, ctx: &ExecutionContext) -> Result<Self, ToolError> {
-        let parsed: AgentConfig = serde_json::from_value(config.config.clone())
+        let mut parsed: AgentConfig = serde_json::from_value(config.config.clone())
             .map_err(|e| ToolError::Configuration(format!("Invalid agent config: {}", e)))?;
+        // noetl-server puts an `args` object on every tool config (empty when
+        // the step wrote no `input:`), and `input` reads `args`; an empty or
+        // null value means "not set".
+        if parsed
+            .input
+            .as_ref()
+            .is_some_and(|v| v.is_null() || v.as_object().is_some_and(|m| m.is_empty()))
+        {
+            parsed.input = None;
+        }
         if parsed.max_turns == 0 {
             return Err(ToolError::Configuration(
                 "agent max_turns must be at least 1".to_string(),
@@ -237,8 +335,60 @@ impl AgentSession {
             }
         }
 
+        for spec in &parsed.tools {
+            for reserved in [BINDING_MCP_SERVER, BINDING_MCP_TOOL, BINDING_REMOTE_AGENT] {
+                if spec.binding.contains_key(reserved) {
+                    return Err(ToolError::Configuration(format!(
+                        "agent tool `{}` uses the reserved binding key `{}`; declare MCP servers under `mcp_servers:` and external agents under `agents:`",
+                        spec.name, reserved
+                    )));
+                }
+            }
+        }
+        let has_sources = !parsed.mcp_servers.is_empty() || !parsed.agents.is_empty();
+        if parsed.framework != AgentFramework::Remote
+            && (parsed.model.trim().is_empty() || parsed.prompt.trim().is_empty())
+        {
+            return Err(ToolError::Configuration(
+                "agent `model` and `prompt` are required".to_string(),
+            ));
+        }
+        if parsed.framework != AgentFramework::Remote
+            && (parsed.remote.is_some() || parsed.input.is_some())
+        {
+            return Err(ToolError::Configuration(
+                "`remote:` / `input:` belong to `framework: remote`".to_string(),
+            ));
+        }
+
         let api_key = match parsed.framework {
+            AgentFramework::Remote => {
+                if config.auth.is_some() {
+                    return Err(ToolError::Configuration(
+                        "framework remote runs no model; put the remote agent's credential under `remote.auth`"
+                            .to_string(),
+                    ));
+                }
+                if !parsed.tools.is_empty() || has_sources {
+                    return Err(ToolError::Configuration(
+                        "framework remote calls one agent; `tools:`, `mcp_servers:` and `agents:` need a model (`framework: claude`)"
+                            .to_string(),
+                    ));
+                }
+                if parsed.remote.is_none() {
+                    return Err(ToolError::Configuration(
+                        "framework remote needs `remote: {endpoint, protocol, agent}`".to_string(),
+                    ));
+                }
+                None
+            }
             AgentFramework::ClaudeCode => {
+                if has_sources {
+                    return Err(ToolError::Configuration(
+                        "framework claude-code connects MCP servers itself; use `mcp_config` instead of `mcp_servers:` / `agents:`"
+                            .to_string(),
+                    ));
+                }
                 if config.auth.is_some() {
                     return Err(ToolError::Configuration(
                         "framework claude-code uses the claude CLI's own sign-in; remove `auth:`"
@@ -287,6 +437,115 @@ impl AgentSession {
             "content": parsed.prompt,
         })];
 
+        let remote = match parsed.remote.clone() {
+            Some(spec) => Some(RemoteAgent::resolve(spec, ctx).await?),
+            None => None,
+        };
+
+        // Tool sources: list each MCP server's tools and describe each remote
+        // agent, then add them to the model's tool list.
+        let mut mcp = std::collections::HashMap::new();
+        for server in &parsed.mcp_servers {
+            if server.name.trim().is_empty() {
+                return Err(ToolError::Configuration(
+                    "every `mcp_servers` entry needs a `name`".into(),
+                ));
+            }
+            if mcp.contains_key(&server.name) {
+                return Err(ToolError::Configuration(format!(
+                    "mcp_servers name `{}` is used twice",
+                    server.name
+                )));
+            }
+            let headers = request_headers(&server.headers, server.auth.as_ref(), ctx).await?;
+            let mut client = McpClient::new(
+                &server.endpoint,
+                headers,
+                Duration::from_secs(server.timeout.unwrap_or(60).clamp(1, 600)),
+            )?;
+            let listed = client.list_tools().await.map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "agent mcp_servers `{}`: tools/list failed: {}",
+                    server.name, e
+                ))
+            })?;
+            for t in listed {
+                if let Some(allow) = &server.tools {
+                    if !allow.iter().any(|a| a == &t.name) {
+                        continue;
+                    }
+                }
+                let mut binding = serde_json::Map::new();
+                binding.insert(BINDING_MCP_SERVER.into(), serde_json::json!(server.name));
+                binding.insert(BINDING_MCP_TOOL.into(), serde_json::json!(t.name));
+                parsed.tools.push(AgentToolSpec {
+                    name: source_tool_name(&server.name, &t.name),
+                    description: t.description,
+                    input_schema: t.input_schema,
+                    binding,
+                });
+            }
+            mcp.insert(server.name.clone(), client);
+        }
+        let mut remotes = std::collections::HashMap::new();
+        for spec in &parsed.agents {
+            let name = spec
+                .name
+                .clone()
+                .or_else(|| spec.agent.clone())
+                .unwrap_or_default();
+            let tool_name = source_tool_name("", &name);
+            if tool_name.is_empty() {
+                return Err(ToolError::Configuration(
+                    "every `agents` entry needs a `name`".into(),
+                ));
+            }
+            let agent = RemoteAgent::resolve(spec.clone(), ctx).await?;
+            let card = agent.card().await;
+            let description = spec
+                .description
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .or_else(|| {
+                    card.as_ref()
+                        .and_then(|c| c.get("description"))
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("External agent {name}."));
+            let input_schema = match spec.protocol {
+                RemoteProtocol::Noetl => card
+                    .as_ref()
+                    .and_then(|c| c.get("inputSchema"))
+                    .filter(|s| s.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+                RemoteProtocol::A2a => serde_json::json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string", "description": "What to ask the agent." } },
+                    "required": ["message"],
+                }),
+            };
+            let mut binding = serde_json::Map::new();
+            binding.insert(BINDING_REMOTE_AGENT.into(), serde_json::json!(tool_name));
+            parsed.tools.push(AgentToolSpec {
+                name: tool_name.clone(),
+                description,
+                input_schema,
+                binding,
+            });
+            remotes.insert(tool_name, agent);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for t in &parsed.tools {
+            if !seen.insert(t.name.as_str()) {
+                return Err(ToolError::Configuration(format!(
+                    "agent tool name `{}` is declared twice (check `tools:`, `mcp_servers:` and `agents:`)",
+                    t.name
+                )));
+            }
+        }
+
         Ok(Self {
             config: parsed,
             api_key,
@@ -298,7 +557,121 @@ impl AgentSession {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            mcp,
+            remotes,
+            remote,
+            source_calls: 0,
         })
+    }
+
+    /// Is this tool answered by the session itself (an `mcp_servers:` or
+    /// `agents:` source) rather than by the host?
+    pub fn is_source_tool(&self, name: &str) -> bool {
+        self.tool_spec(name).is_some_and(|spec| {
+            spec.binding
+                .get(BINDING_MCP_SERVER)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| self.mcp.contains_key(s))
+                || spec
+                    .binding
+                    .get(BINDING_REMOTE_AGENT)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| self.remotes.contains_key(s))
+        })
+    }
+
+    /// Answer a tool call bound to an MCP server or a remote agent.  `None`
+    /// means the call belongs to the host (a `tools:` entry).
+    ///
+    /// Failures become `is_error` outputs for the model to react to; they do
+    /// not fail the step.
+    pub async fn run_source_tool(&mut self, call: &AgentToolCall) -> Option<AgentToolOutput> {
+        if !self.is_source_tool(&call.name) {
+            return None;
+        }
+        let spec = self.tool_spec(&call.name)?.clone();
+        self.source_calls += 1;
+        let output = |content: String, is_error: bool| AgentToolOutput {
+            tool_use_id: call.id.clone(),
+            content,
+            is_error,
+        };
+        if let Some(server) = spec
+            .binding
+            .get(BINDING_MCP_SERVER)
+            .and_then(|v| v.as_str())
+        {
+            let tool = spec
+                .binding
+                .get(BINDING_MCP_TOOL)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let span =
+                tracing::info_span!("tool.dispatch.agent.mcp", server = %server, tool = %tool);
+            let client = self.mcp.get_mut(server)?;
+            return Some(
+                match client
+                    .call_tool(&tool, call.input.clone())
+                    .instrument(span)
+                    .await
+                {
+                    Ok((text, result, is_error)) => {
+                        let content = if text.trim().is_empty() {
+                            result.to_string()
+                        } else {
+                            text
+                        };
+                        output(content, is_error)
+                    }
+                    Err(e) => output(format!("mcp {server}/{tool} failed: {e}"), true),
+                },
+            );
+        }
+        let name = spec
+            .binding
+            .get(BINDING_REMOTE_AGENT)
+            .and_then(|v| v.as_str())?;
+        let agent = self.remotes.get(name)?.clone();
+        let span = tracing::info_span!("tool.dispatch.agent.remote", agent = %name);
+        Some(
+            match agent.call(call.input.clone()).instrument(span).await {
+                Ok(outcome) if outcome.ok() => output(outcome.text, false),
+                Ok(outcome) => output(
+                    format!(
+                        "remote agent {name} ended {}: {}",
+                        outcome.status, outcome.text
+                    ),
+                    true,
+                ),
+                Err(e) => output(format!("remote agent {name} failed: {e}"), true),
+            },
+        )
+    }
+
+    /// `framework: remote`: one call to the configured agent.
+    async fn run_remote(&mut self) -> Result<AgentTurn, ToolError> {
+        let agent = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| ToolError::Configuration("framework remote needs `remote:`".into()))?;
+        let input = match (&self.config.input, agent.spec().protocol) {
+            (Some(v), _) => v.clone(),
+            (None, RemoteProtocol::Noetl) => serde_json::json!({ "prompt": self.config.prompt }),
+            (None, RemoteProtocol::A2a) => serde_json::json!(self.config.prompt),
+        };
+        let span = tracing::info_span!("tool.dispatch.agent", framework = "remote", endpoint = %agent.spec().endpoint);
+        let outcome = agent.call(input).instrument(span).await?;
+        if !outcome.ok() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "remote agent ended {}: {}",
+                outcome.status,
+                outcome.text.chars().take(300).collect::<String>()
+            )));
+        }
+        let mut value = outcome.to_value(agent.spec());
+        value["framework"] = serde_json::json!("remote");
+        Ok(AgentTurn::Final(value))
     }
 
     /// The parsed configuration.
@@ -331,6 +704,9 @@ impl AgentSession {
 
         if self.config.framework == AgentFramework::ClaudeCode {
             return self.run_claude_code().await;
+        }
+        if self.config.framework == AgentFramework::Remote {
+            return self.run_remote().await;
         }
         let api_key = self.api_key.as_deref().unwrap_or_default();
 
@@ -465,6 +841,7 @@ impl AgentSession {
             "truncated": truncated,
             "model": self.config.model,
             "turns": self.turns,
+            "source_tool_calls": self.source_calls,
             "usage": {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
@@ -679,17 +1056,34 @@ fn mark_cache_breakpoint(messages: &mut [serde_json::Value]) {
     }
 }
 
-/// Registry entry for `kind: agent`.  Runs agents that declare no tools; tool
-/// calls need a host that drives [`AgentSession`] directly (the CLI local
-/// runtime does).
+/// Registry entry for `kind: agent`, the path a host that is not the CLI
+/// local runtime (the cluster worker) dispatches.
+///
+/// It runs the loop itself and answers every tool call bound to an
+/// `mcp_servers:` or `agents:` source, so an agent whose tools are MCP servers
+/// or external agents runs here exactly as in the CLI.  A `tools:` entry
+/// (a playbook binding) needs a host that runs sub-playbooks between turns —
+/// the CLI local runtime does; on the cluster that is RFC Phase 6 Stage B — so
+/// it is refused before the first model call rather than half-run.
 pub struct AgentTool {
     template_engine: TemplateEngine,
+    allow_claude_code: bool,
 }
 
 impl AgentTool {
     pub fn new() -> Self {
         Self {
             template_engine: TemplateEngine::new(),
+            allow_claude_code: true,
+        }
+    }
+
+    /// For shared, multi-tenant pools: refuse `framework: claude-code`, which
+    /// would run a local CLI under whatever account that host is signed in to.
+    pub fn for_shared_pool() -> Self {
+        Self {
+            allow_claude_code: false,
+            ..Self::new()
         }
     }
 }
@@ -712,6 +1106,14 @@ impl Tool for AgentTool {
         ctx: &ExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let started = std::time::Instant::now();
+        if !self.allow_claude_code
+            && config.config.get("framework").and_then(|f| f.as_str()) == Some("claude-code")
+        {
+            return Err(ToolError::Configuration(
+                "framework claude-code runs a local CLI under its signed-in account and is not available on this runtime; use framework claude or remote"
+                    .to_string(),
+            ));
+        }
         let rendered = ToolConfig {
             config: self
                 .template_engine
@@ -719,20 +1121,39 @@ impl Tool for AgentTool {
             ..config.clone()
         };
         let mut session = AgentSession::start(&rendered, ctx).await?;
-        if !session.config().tools.is_empty() {
-            return Err(ToolError::Configuration(
-                "agent tools need a host that runs them; this runtime supports tool-free agents only"
-                    .to_string(),
-            ));
+        if let Some(host_tool) = session
+            .config()
+            .tools
+            .iter()
+            .find(|t| !session.is_source_tool(&t.name))
+        {
+            return Err(ToolError::Configuration(format!(
+                "agent tool `{}` is bound to a playbook, which needs a host that runs sub-playbooks (the CLI local runtime); on this runtime declare tools as `mcp_servers:` or `agents:`",
+                host_tool.name
+            )));
         }
-        match session.next_turn().await? {
-            AgentTurn::Final(value) => {
-                Ok(ToolResult::success(value).with_duration(started.elapsed().as_millis() as u64))
+        loop {
+            match session.next_turn().await? {
+                AgentTurn::Final(value) => {
+                    return Ok(ToolResult::success(value)
+                        .with_duration(started.elapsed().as_millis() as u64))
+                }
+                AgentTurn::ToolCalls(calls) => {
+                    let mut outputs = Vec::with_capacity(calls.len());
+                    for call in &calls {
+                        match session.run_source_tool(call).await {
+                            Some(out) => outputs.push(out),
+                            None => {
+                                return Err(ToolError::ExecutionFailed(format!(
+                                    "model requested undeclared tool `{}`",
+                                    call.name
+                                )))
+                            }
+                        }
+                    }
+                    session.submit_tool_results(outputs);
+                }
             }
-            AgentTurn::ToolCalls(calls) => Err(ToolError::ExecutionFailed(format!(
-                "model requested undeclared tool `{}`",
-                calls[0].name
-            ))),
         }
     }
 }
