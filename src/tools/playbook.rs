@@ -67,6 +67,16 @@ pub struct PlaybookConfig {
     /// Poll interval seconds.
     #[serde(default)]
     pub poll_interval: Option<u64>,
+    /// Cross-instance mode for a remote reference (`noetl://<instance>/…` or
+    /// `peer/<instance>/…`): `import` or `delegate` (noetl/ai-meta#548
+    /// follow-up). Forwarded to `/api/execute` as is; the server decides,
+    /// and refuses `delegate` by name unless `NOETL_CATALOG_REMOTE_CALLS` is on.
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// `sha256:` digest the resolved child must have. Forwarded to
+    /// `/api/execute` (honoured under `NOETL_CATALOG_PINNING`).
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +86,25 @@ struct ExecuteResponse {
     status: Option<String>,
     #[serde(default)]
     commands_generated: Option<i32>,
+    /// Present when the server delegated the call to another instance
+    /// (`remote: delegate`). `execution_id` is then the server's call id.
+    #[serde(default)]
+    remote: Option<RemoteCall>,
+}
+
+/// The server's account of a delegated call (noetl/server catalog_remote).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RemoteCall {
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    remote_execution_id: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    /// Server-relative path that serves this call's detail; `{detail_path}/status`
+    /// serves its status. Replaces `/api/executions/{id}` for the wait.
+    #[serde(default)]
+    detail_path: Option<String>,
 }
 
 /// Playbook composition tool.
@@ -131,6 +160,23 @@ impl PlaybookTool {
             return payload.clone();
         }
         config.args.clone().unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    /// Where the wait polls. A delegated call (`remote: delegate`) is served
+    /// by the server's call route instead of `/api/executions/{id}`; the
+    /// path must be server-relative, so a reply can never point the worker
+    /// at another host.
+    fn detail_url(server_url: &str, child_execution_id: &str, start: &ExecuteResponse) -> String {
+        let base = server_url.trim_end_matches('/');
+        match start
+            .remote
+            .as_ref()
+            .and_then(|r| r.detail_path.as_deref())
+            .filter(|p| p.starts_with("/api/") && !p.contains("://") && !p.contains(".."))
+        {
+            Some(p) => format!("{base}{p}"),
+            None => format!("{base}/api/executions/{child_execution_id}"),
+        }
     }
 
     /// Returns `true` when the status-endpoint payload indicates a terminal
@@ -339,6 +385,12 @@ impl Tool for PlaybookTool {
         if let Some(version) = playbook_config.version {
             body["version"] = serde_json::json!(version);
         }
+        if let Some(remote) = playbook_config.remote.as_deref().filter(|s| !s.is_empty()) {
+            body["remote"] = serde_json::json!(remote);
+        }
+        if let Some(digest) = playbook_config.digest.as_deref().filter(|s| !s.is_empty()) {
+            body["digest"] = serde_json::json!(digest);
+        }
 
         let parent_execution_id = playbook_config
             .parent_execution_id
@@ -384,17 +436,21 @@ impl Tool for PlaybookTool {
         // Async start mode — unchanged for every caller that neither sets
         // `return_step` (legacy status poll) nor `return_result` (#136).
         if playbook_config.return_step.is_none() && !want_child_result {
-            return Ok(ToolResult::success(serde_json::json!({
-                "status": start_result.status.unwrap_or_else(|| "started".to_string()),
+            let mut started = serde_json::json!({
+                "status": start_result.status.clone().unwrap_or_else(|| "started".to_string()),
                 "execution_id": child_execution_id,
                 "path": playbook_config.path,
                 "async": true
-            }))
-            // Redundant here — the payload already names the child — but set on
-            // BOTH paths so the field means "this tool spawned that execution"
-            // unconditionally, rather than "…except on the path that happens to
-            // inline it", which is the shape that made #328 invisible.
-            .with_child_execution_id(child_execution_id));
+            });
+            if let Some(r) = &start_result.remote {
+                started["remote"] = serde_json::to_value(r).unwrap_or_default();
+            }
+            return Ok(ToolResult::success(started)
+                // Redundant here — the payload already names the child — but set on
+                // BOTH paths so the field means "this tool spawned that execution"
+                // unconditionally, rather than "…except on the path that happens to
+                // inline it", which is the shape that made #328 invisible.
+                .with_child_execution_id(child_execution_id));
         }
 
         // Blocking wait mode.  `return_result` (#136) defaults to a longer
@@ -405,11 +461,7 @@ impl Tool for PlaybookTool {
                 .timeout
                 .unwrap_or(if want_child_result { 180 } else { 300 });
         let poll_interval = playbook_config.poll_interval.unwrap_or(2).max(1);
-        let detail_url = format!(
-            "{}/api/executions/{}",
-            ctx.server_url.trim_end_matches('/'),
-            child_execution_id
-        );
+        let detail_url = Self::detail_url(&ctx.server_url, &child_execution_id, &start_result);
         let status_url = format!("{}/status", detail_url);
 
         let started = std::time::Instant::now();
@@ -732,6 +784,8 @@ mod tests {
             result_step: None,
             timeout: None,
             poll_interval: None,
+            remote: None,
+            digest: None,
         };
         let p = PlaybookTool::build_payload(&cfg);
         assert_eq!(p["method"], "tools/call");
@@ -752,6 +806,8 @@ mod tests {
             result_step: None,
             timeout: None,
             poll_interval: None,
+            remote: None,
+            digest: None,
         };
         assert_eq!(PlaybookTool::build_payload(&cfg)["method"], "tools/call");
     }
@@ -772,6 +828,8 @@ mod tests {
             result_step: None,
             timeout: None,
             poll_interval: None,
+            remote: None,
+            digest: None,
         };
         assert_eq!(PlaybookTool::build_payload(&cfg)["from"], "args");
     }
@@ -788,6 +846,69 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.return_result, Some(true));
         assert_eq!(cfg.result_step.as_deref(), Some("google_places_dispatch"));
+    }
+
+    #[test]
+    fn config_reads_remote_and_digest() {
+        let cfg: PlaybookConfig = serde_json::from_value(serde_json::json!({
+            "path": "noetl://ni-b/xc/target",
+            "remote": "delegate",
+            "digest": "sha256:ab",
+            "return_result": true,
+        }))
+        .unwrap();
+        assert_eq!(cfg.remote.as_deref(), Some("delegate"));
+        assert_eq!(cfg.digest.as_deref(), Some("sha256:ab"));
+        let plain: PlaybookConfig =
+            serde_json::from_value(serde_json::json!({"path": "a/b"})).unwrap();
+        assert_eq!((plain.remote, plain.digest), (None, None));
+    }
+
+    fn start(remote: Option<serde_json::Value>) -> ExecuteResponse {
+        let mut v = serde_json::json!({"execution_id": "77", "status": "started"});
+        if let Some(r) = remote {
+            v["remote"] = r;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_delegated_call_is_polled_at_its_detail_path() {
+        let s = start(Some(serde_json::json!({
+            "mode": "delegate",
+            "instance_id": "ni-b",
+            "remote_execution_id": "99",
+            "path": "xc/target",
+            "version": 1,
+            "digest": "sha256:ab",
+            "detail_path": "/api/catalog/remote/calls/77"
+        })));
+        assert_eq!(
+            PlaybookTool::detail_url("http://srv:8082/", "77", &s),
+            "http://srv:8082/api/catalog/remote/calls/77"
+        );
+        assert_eq!(
+            PlaybookTool::detail_url("http://srv:8082", "77", &start(None)),
+            "http://srv:8082/api/executions/77"
+        );
+    }
+
+    #[test]
+    fn a_detail_path_can_never_leave_the_server() {
+        for bad in [
+            "http://evil/api/x",
+            "//evil/api/x",
+            "/api/../../x",
+            "api/catalog/remote/calls/1",
+            "/health",
+        ] {
+            let s = start(Some(serde_json::json!({ "detail_path": bad })));
+            assert_eq!(
+                PlaybookTool::detail_url("http://srv", "77", &s),
+                "http://srv/api/executions/77",
+                "{bad}"
+            );
+        }
     }
 
     #[test]
