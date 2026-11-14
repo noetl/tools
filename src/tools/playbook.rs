@@ -236,6 +236,24 @@ impl PlaybookTool {
         status_str
     }
 
+    /// The child's result `call.done` is readable: the named step's, or (none
+    /// named) any non-terminal one (noetl/ai-meta#559).
+    pub(crate) fn result_call_done_present(
+        detail: &serde_json::Value,
+        result_step: Option<&str>,
+    ) -> bool {
+        let Some(events) = detail.get("events").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        events.iter().any(|ev| {
+            ev.get("event_type").and_then(|v| v.as_str()) == Some("call.done")
+                && match result_step {
+                    Some(step) => ev.get("node_name").and_then(|v| v.as_str()) == Some(step),
+                    None => ev.get("node_name").and_then(|v| v.as_str()) != Some("playbook"),
+                }
+        })
+    }
+
     /// noetl/ai-meta#559 2b: `NOETL_PLAYBOOK_AWAIT_PARK` (default off) — ask the
     /// server to park a `return_result` await instead of holding the slot.
     pub(crate) fn await_park_enabled() -> bool {
@@ -626,19 +644,35 @@ impl Tool for PlaybookTool {
 
             // COMPLETED — fetch the full detail (the `/status` payload
             // carries no events) and resolve the child's final result.
-            let detail: serde_json::Value = match client.get(&detail_url).send().await {
-                Ok(res) if res.status().is_success() => res
-                    .json()
-                    .await
-                    .map_err(|e| ToolError::Json(e.to_string()))?,
-                Ok(res) => {
-                    return Err(ToolError::Http(format!(
-                        "GET {} returned {}",
-                        detail_url,
-                        res.status()
-                    )));
+            //
+            // noetl/ai-meta#559: woken by `/wait` the moment the terminal row is
+            // written, the result `call.done` may not be readable yet (the
+            // materializer can write the terminal row first), and the selection
+            // would fall back to a `command.completed` envelope. Re-read briefly
+            // until it is (the 2 s poll used to hide this).
+            let mut settle = 0u32;
+            let detail: serde_json::Value = loop {
+                let detail: serde_json::Value = match client.get(&detail_url).send().await {
+                    Ok(res) if res.status().is_success() => res
+                        .json()
+                        .await
+                        .map_err(|e| ToolError::Json(e.to_string()))?,
+                    Ok(res) => {
+                        return Err(ToolError::Http(format!(
+                            "GET {} returned {}",
+                            detail_url,
+                            res.status()
+                        )));
+                    }
+                    Err(e) => return Err(ToolError::Http(e.to_string())),
+                };
+                if settle >= 20
+                    || Self::result_call_done_present(&detail, playbook_config.result_step.as_deref())
+                {
+                    break detail;
                 }
-                Err(e) => return Err(ToolError::Http(e.to_string())),
+                settle += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             };
 
             let Some(event) =
