@@ -94,6 +94,9 @@ struct ExecuteResponse {
     /// (`remote: delegate`). `execution_id` is then the server's call id.
     #[serde(default)]
     remote: Option<RemoteCall>,
+    /// noetl/ai-meta#559 2b: the server accepted `await_park`.
+    #[serde(default)]
+    parked: Option<bool>,
 }
 
 /// The server's account of a delegated call (noetl/server catalog_remote).
@@ -231,6 +234,14 @@ impl PlaybookTool {
             return "CANCELLED".to_string();
         }
         status_str
+    }
+
+    /// noetl/ai-meta#559 2b: `NOETL_PLAYBOOK_AWAIT_PARK` (default off) — ask the
+    /// server to park a `return_result` await instead of holding the slot.
+    pub(crate) fn await_park_enabled() -> bool {
+        std::env::var("NOETL_PLAYBOOK_AWAIT_PARK")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"))
+            .unwrap_or(false)
     }
 
     /// noetl/ai-meta#559: `NOETL_EXECUTION_WAIT` (default off) — wait on the
@@ -412,6 +423,27 @@ impl Tool for PlaybookTool {
             body["parent_execution_id"] = serde_json::json!(parent_execution_id);
         }
 
+        // noetl/ai-meta#559 2b: ask the server to park this await, so the step
+        // frees its worker slot and is resumed with the child's result. Only a
+        // `return_result` await of the calling step itself (no parent override),
+        // and only when we know our own command; the server decides, and any
+        // refusal leaves today's wait.
+        let want_park = matches!(playbook_config.return_result, Some(true))
+            && Self::await_child_result_enabled()
+            && Self::await_park_enabled()
+            && playbook_config.parent_execution_id.is_none()
+            && ctx.execution_id > 0
+            && ctx.command_id.is_some();
+        if want_park {
+            body["await_park"] = serde_json::json!({
+                "parent_execution_id": ctx.execution_id,
+                "parent_step": ctx.step,
+                "parent_command_id": ctx.command_id,
+                "result_step": playbook_config.result_step,
+                "timeout_secs": playbook_config.timeout.unwrap_or(180),
+            });
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout.unwrap_or(30)))
             .build()
@@ -464,6 +496,19 @@ impl Tool for PlaybookTool {
                 // unconditionally, rather than "…except on the path that happens to
                 // inline it", which is the shape that made #328 invisible.
                 .with_child_execution_id(child_execution_id));
+        }
+
+        // noetl/ai-meta#559 2b: parked — free the slot. The worker skips
+        // `call.done` and marks its `command.completed` `pending_callback`; the
+        // server emits this step's `call.done` with the child's result.
+        if want_park && start_result.parked == Some(true) {
+            return Ok(ToolResult::success(serde_json::json!({
+                "status": "parked",
+                "execution_id": child_execution_id,
+                "path": playbook_config.path,
+            }))
+            .with_pending_callback(true)
+            .with_child_execution_id(child_execution_id));
         }
 
         // Blocking wait mode.  `return_result` (#136) defaults to a longer
