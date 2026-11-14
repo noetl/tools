@@ -666,7 +666,9 @@ impl Tool for PlaybookTool {
                     }
                     Err(e) => return Err(ToolError::Http(e.to_string())),
                 };
-                if settle >= 20
+                // Only on the wait path; flag off is byte-identical to today.
+                if !Self::execution_wait_enabled()
+                    || settle >= 20
                     || Self::result_call_done_present(&detail, playbook_config.result_step.as_deref())
                 {
                     break detail;
