@@ -11,6 +11,10 @@ use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
 
+/// How long one `/wait` request is held open (noetl/ai-meta#559). Short enough
+/// to sit well inside any proxy's idle timeout; the loop re-issues it.
+const WAIT_CHUNK_SECS: u64 = 20;
+
 /// Playbook tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybookConfig {
@@ -227,6 +231,15 @@ impl PlaybookTool {
             return "CANCELLED".to_string();
         }
         status_str
+    }
+
+    /// noetl/ai-meta#559: `NOETL_EXECUTION_WAIT` (default off) — wait on the
+    /// server's `GET /api/executions/{id}/wait` long poll instead of sleeping
+    /// `poll_interval` between `/status` polls.
+    pub(crate) fn execution_wait_enabled() -> bool {
+        std::env::var("NOETL_EXECUTION_WAIT")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"))
+            .unwrap_or(false)
     }
 
     /// noetl/ai-meta#136 kill-switch.  Defaults ON: a `return_result: true`
@@ -465,6 +478,7 @@ impl Tool for PlaybookTool {
         let status_url = format!("{}/status", detail_url);
 
         let started = std::time::Instant::now();
+        let mut use_wait = Self::execution_wait_enabled();
         loop {
             if started.elapsed().as_secs() >= timeout_seconds {
                 if want_child_result {
@@ -485,17 +499,52 @@ impl Tool for PlaybookTool {
                 .with_child_execution_id(child_execution_id.clone()));
             }
 
-            tokio::time::sleep(Duration::from_secs(poll_interval)).await;
-
-            let status_response = client.get(&status_url).send().await;
-            let status_payload = match status_response {
-                Ok(res) if res.status().is_success() => res.json::<serde_json::Value>().await.ok(),
-                _ => match client.get(&detail_url).send().await {
+            // noetl/ai-meta#559: with NOETL_EXECUTION_WAIT the server holds this
+            // request open and answers the moment the child's terminal row is
+            // written, instead of the tool sleeping `poll_interval` first. A
+            // server without the route (no `x-noetl-wait` header) puts this call
+            // back on the poll for good; a transient error polls this once.
+            let waited = if use_wait {
+                let remaining = timeout_seconds
+                    .saturating_sub(started.elapsed().as_secs())
+                    .max(1);
+                let wait_s = remaining.min(WAIT_CHUNK_SECS);
+                match client
+                    .get(format!("{detail_url}/wait?timeout={wait_s}"))
+                    .timeout(Duration::from_secs(wait_s + 10))
+                    .send()
+                    .await
+                {
+                    Ok(res) if res.headers().get("x-noetl-wait").is_none() => {
+                        use_wait = false;
+                        None
+                    }
                     Ok(res) if res.status().is_success() => {
                         res.json::<serde_json::Value>().await.ok()
                     }
                     _ => None,
-                },
+                }
+            } else {
+                None
+            };
+
+            let status_payload = match waited {
+                Some(payload) => Some(payload),
+                None => {
+                    tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+                    let status_response = client.get(&status_url).send().await;
+                    match status_response {
+                        Ok(res) if res.status().is_success() => {
+                            res.json::<serde_json::Value>().await.ok()
+                        }
+                        _ => match client.get(&detail_url).send().await {
+                            Ok(res) if res.status().is_success() => {
+                                res.json::<serde_json::Value>().await.ok()
+                            }
+                            _ => None,
+                        },
+                    }
+                }
             };
 
             let Some(payload) = status_payload else {
@@ -580,6 +629,78 @@ impl Tool for PlaybookTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// noetl/ai-meta#559 — with NOETL_EXECUTION_WAIT the awaiting step returns as
+    /// soon as the server's `/wait` reports the child terminal: no `poll_interval`
+    /// sleep (2 s here) before the first look. And against a server without the
+    /// route (no `x-noetl-wait` header) the same call falls back to the poll and
+    /// still completes. One test, serially, because both arms set the same
+    /// process-wide env var.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn await_uses_the_wait_long_poll_and_falls_back_without_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let detail = serde_json::json!({"events": [
+            {"event_type": "call.done", "node_name": "end",
+             "result": {"status": "COMPLETED", "context": {"answer": 42}}}
+        ]});
+        let terminal = serde_json::json!({"execution_id": 99, "status": "COMPLETED", "is_cancelled": false});
+        let cfg = |server: &MockServer| {
+            let ctx = ExecutionContext::new(1, "parent", server.uri());
+            let config = ToolConfig {
+                kind: "playbook".into(),
+                config: serde_json::json!({
+                    "path": "bench/child", "return_result": true, "result_step": "end",
+                    "poll_interval": 2, "timeout": 30
+                }),
+                timeout: None,
+                retry: None,
+                auth: None,
+            };
+            (ctx, config)
+        };
+
+        // Arm 1: the server serves /wait.
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/execute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"execution_id": "99"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/executions/99/wait"))
+            .respond_with(ResponseTemplate::new(200).insert_header("x-noetl-wait", "1").set_body_json(terminal.clone()))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/executions/99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail.clone()))
+            .mount(&server).await;
+        std::env::set_var("NOETL_EXECUTION_WAIT", "true");
+        let (ctx, config) = cfg(&server);
+        let t = std::time::Instant::now();
+        let out = PlaybookTool::new().execute(&config, &ctx).await.expect("await completes");
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(1500),
+            "the wait path must not sleep poll_interval first (took {took:?})");
+        assert_eq!(out.child_execution_id.as_deref(), Some("99"));
+        let polled_status = server.received_requests().await.unwrap_or_default().iter()
+            .any(|r| r.url.path() == "/api/executions/99/status");
+        assert!(!polled_status, "with /wait served, /status is never polled");
+
+        // Arm 2: no /wait route (a flag-off server): fall back to the poll.
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/execute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"execution_id": "99"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/executions/99/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(terminal))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/executions/99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+            .mount(&server).await;
+        let (ctx, config) = cfg(&server);
+        let t = std::time::Instant::now();
+        let out = PlaybookTool::new().execute(&config, &ctx).await.expect("poll fallback completes");
+        std::env::remove_var("NOETL_EXECUTION_WAIT");
+        assert!(t.elapsed() >= std::time::Duration::from_secs(2), "fallback sleeps poll_interval as before");
+        assert_eq!(out.child_execution_id.as_deref(), Some("99"));
+    }
 
     /// ⚠ The #328 regression, pinned at the shape that caused it.
     ///
