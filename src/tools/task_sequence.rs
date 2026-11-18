@@ -225,6 +225,18 @@ impl Tool for TaskSequenceTool {
         // Running context that accumulates `set:` values across
         // tool items — the forward-only propagation surface.
         let mut running_ctx = ctx.clone();
+        // ⚠ noetl/travel#185: a sub-task is NOT the command — the sequence is.
+        // `command_id` is what lets a tool hand its command to the server to be
+        // finished later by a callback (`kind: playbook` + `return_result` asks
+        // the server to park under NOETL_PLAYBOOK_AWAIT_PARK, keyed on it). A
+        // sequence cannot be resumed by a callback: it builds its result with
+        // `pending_callback: None` and moves on, so a parked sub-task's result
+        // became the `{"status":"parked"}` placeholder and the child's real
+        // result was lost. Without `command_id` every sub-task awaits inline
+        // (it holds the slot, as before #559), its failure comes back as an
+        // `Err` the policy rules below can match, and the result is the child's.
+        // `command_id` has no other reader in this crate.
+        running_ctx.command_id = None;
 
         // Track context mutations from policy-rule `set:` so the
         // server can propagate them to subsequent steps.  Worker-side
@@ -1081,6 +1093,143 @@ mod tests {
             result.is_success(),
             "expected success, got: {:?}",
             result.error
+        );
+    }
+
+    /// noetl/travel#185 — a `kind: playbook` sub-task inside a tool list must
+    /// not park, even with NOETL_PLAYBOOK_AWAIT_PARK on and a command id on the
+    /// sequence's context. The control arm shows the same call DOES park when it
+    /// is the step's own tool, so the test can tell the two apart. The third arm
+    /// is profile.yaml's pattern: a failed child plus `do: continue` completes
+    /// the sequence. One test, serially, because the arms share a process env var.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_playbook_sub_task_awaits_inline_and_never_parks() {
+        use crate::tools::playbook::PlaybookTool;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn server(execute_status: u16) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/execute"))
+                .respond_with(
+                    ResponseTemplate::new(execute_status)
+                        .set_body_json(serde_json::json!({"execution_id": "99", "parked": true})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET")).and(path("/api/executions/99/status"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"execution_id": 99, "status": "COMPLETED", "is_cancelled": false})))
+                .mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/api/executions/99"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"events": [
+                        {"event_type": "call.done", "node_name": "end",
+                         "result": {"status": "COMPLETED", "context": {"items": [1, 2]}}}
+                    ]}),
+                ))
+                .mount(&server)
+                .await;
+            server
+        }
+        let call = serde_json::json!({
+            "kind": "playbook", "path": "bench/child", "return_result": true,
+            "result_step": "end", "poll_interval": 1, "timeout": 30,
+            "spec": {"policy": {"rules": [
+                {"when": "{{ output.status == 'error' }}", "then": {"do": "continue"}}
+            ]}}
+        });
+        let ctx_for = |server: &MockServer| {
+            let mut ctx = ExecutionContext::new(1, "suggest_pois", server.uri());
+            ctx.command_id = Some("1:suggest_pois:2".into());
+            ctx
+        };
+        let sent_park = |reqs: &[wiremock::Request]| {
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/execute")
+                .any(|r| {
+                    serde_json::from_slice::<serde_json::Value>(&r.body)
+                        .ok()
+                        .map(|b| b.get("await_park").is_some())
+                        .unwrap_or(false)
+                })
+        };
+        std::env::set_var("NOETL_PLAYBOOK_AWAIT_PARK", "true");
+
+        // Control: the same call as the step's own tool parks.
+        let s = server(200).await;
+        let direct = ToolConfig {
+            kind: "playbook".into(),
+            config: call.clone(),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let out = PlaybookTool::new()
+            .execute(&direct, &ctx_for(&s))
+            .await
+            .expect("direct call");
+        assert!(
+            sent_park(&s.received_requests().await.unwrap()),
+            "control: a top-level call asks to park"
+        );
+        assert_eq!(
+            out.data.as_ref().and_then(|d| d.get("status")),
+            Some(&serde_json::json!("parked"))
+        );
+
+        // Inside a list: no park request, and the child's real result comes back.
+        let s = server(200).await;
+        let seq = ToolConfig {
+            kind: "task_sequence".into(),
+            config: serde_json::json!([{"places": call.clone()}]),
+            timeout: None,
+            retry: None,
+            auth: None,
+        };
+        let out = TaskSequenceTool::new()
+            .execute(&seq, &ctx_for(&s))
+            .await
+            .expect("sequence");
+        assert!(
+            !sent_park(&s.received_requests().await.unwrap()),
+            "a sub-task must not ask to park"
+        );
+        assert!(out.is_success(), "got {:?}", out.error);
+        let places = out
+            .data
+            .as_ref()
+            .and_then(|d| d.get("places"))
+            .cloned()
+            .unwrap_or_default();
+        assert_ne!(
+            places.get("status"),
+            Some(&serde_json::json!("parked")),
+            "placeholder leaked: {places}"
+        );
+        assert_eq!(
+            places.get("items"),
+            Some(&serde_json::json!([1, 2])),
+            "child payload: {places}"
+        );
+
+        // profile.yaml's pattern: the child cannot start (HTTP 500) and the rule continues.
+        let s = server(500).await;
+        let out = TaskSequenceTool::new()
+            .execute(&seq, &ctx_for(&s))
+            .await
+            .expect("sequence");
+        std::env::remove_var("NOETL_PLAYBOOK_AWAIT_PARK");
+        assert!(
+            out.is_success(),
+            "do: continue must absorb a failed child, got {:?}",
+            out.error
+        );
+        assert_eq!(
+            out.data.as_ref().and_then(|d| d.get("places")),
+            Some(&serde_json::Value::Null)
         );
     }
 
