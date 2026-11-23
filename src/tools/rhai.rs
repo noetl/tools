@@ -26,7 +26,6 @@ pub struct RhaiConfig {
 
 /// Rhai script execution tool.
 pub struct RhaiTool {
-    http_client: reqwest::Client,
     gcp_auth: Arc<GcpAuth>,
     template_engine: TemplateEngine,
 }
@@ -35,7 +34,6 @@ impl RhaiTool {
     /// Create a new Rhai tool.
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
             gcp_auth: Arc::new(GcpAuth::new()),
             template_engine: TemplateEngine::new(),
         }
@@ -110,11 +108,12 @@ impl RhaiTool {
             false
         });
 
-        // HTTP functions are registered with the client
-        let client = self.http_client.clone();
-        let client_get = client.clone();
+        // HTTP functions fetch the process-wide client when they are CALLED,
+        // not when the engine is built: building a `reqwest::Client` loads the
+        // native root store (~120 ms on macOS), and most scripts never make an
+        // HTTP call.  See `crate::http_client`.
         engine.register_fn("http_get", move |url: &str| -> Dynamic {
-            match http_get_sync(&client_get, url) {
+            match http_get_sync(&crate::http_client::shared(), url) {
                 Ok(body) => Dynamic::from(body),
                 Err(e) => {
                     tracing::error!("HTTP GET error: {}", e);
@@ -123,9 +122,8 @@ impl RhaiTool {
             }
         });
 
-        let client_post = client.clone();
         engine.register_fn("http_post", move |url: &str, body: &str| -> Dynamic {
-            match http_post_sync(&client_post, url, body, None) {
+            match http_post_sync(&crate::http_client::shared(), url, body, None) {
                 Ok(response) => Dynamic::from(response),
                 Err(e) => {
                     tracing::error!("HTTP POST error: {}", e);
@@ -134,9 +132,8 @@ impl RhaiTool {
             }
         });
 
-        let client_delete = client.clone();
         engine.register_fn("http_delete", move |url: &str| -> Dynamic {
-            match http_delete_sync(&client_delete, url, None) {
+            match http_delete_sync(&crate::http_client::shared(), url, None) {
                 Ok(response) => Dynamic::from(response),
                 Err(e) => {
                     tracing::error!("HTTP DELETE error: {}", e);
@@ -146,9 +143,8 @@ impl RhaiTool {
         });
 
         // HTTP functions with auth
-        let client_get_auth = client.clone();
         engine.register_fn("http_get_auth", move |url: &str, token: &str| -> Dynamic {
-            match http_get_auth_sync(&client_get_auth, url, token) {
+            match http_get_auth_sync(&crate::http_client::shared(), url, token) {
                 Ok(body) => Dynamic::from(body),
                 Err(e) => {
                     tracing::error!("HTTP GET auth error: {}", e);
@@ -157,11 +153,10 @@ impl RhaiTool {
             }
         });
 
-        let client_post_auth = client.clone();
         engine.register_fn(
             "http_post_auth",
             move |url: &str, body: &str, token: &str| -> Dynamic {
-                match http_post_sync(&client_post_auth, url, body, Some(token)) {
+                match http_post_sync(&crate::http_client::shared(), url, body, Some(token)) {
                     Ok(response) => Dynamic::from(response),
                     Err(e) => {
                         tracing::error!("HTTP POST auth error: {}", e);
@@ -171,11 +166,10 @@ impl RhaiTool {
             },
         );
 
-        let client_delete_auth = client;
         engine.register_fn(
             "http_delete_auth",
             move |url: &str, token: &str| -> Dynamic {
-                match http_delete_sync(&client_delete_auth, url, Some(token)) {
+                match http_delete_sync(&crate::http_client::shared(), url, Some(token)) {
                     Ok(response) => Dynamic::from(response),
                     Err(e) => {
                         tracing::error!("HTTP DELETE auth error: {}", e);
@@ -313,7 +307,14 @@ impl Tool for RhaiTool {
         let code = rhai_config.code.clone();
         let args = rhai_config.args.clone();
         let ctx = ctx.clone();
-        let tool = Self::new(); // Create a new instance for the blocking task
+        // The blocking task needs an owned tool.  Reuse this instance's GCP
+        // auth (an `Arc`, so its token cache survives) rather than calling
+        // `Self::new()`, which used to build a fresh `reqwest::Client` per step.
+        // See `crate::http_client`.
+        let tool = Self {
+            gcp_auth: self.gcp_auth.clone(),
+            template_engine: TemplateEngine::new(),
+        };
 
         tokio::task::spawn_blocking(move || tool.execute_script(&code, &args, &ctx))
             .await
@@ -555,6 +556,37 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard for the per-step cost fixed with `crate::http_client`: the rhai
+    /// tool must never build its own `reqwest::Client`.  Each build loads the
+    /// native root store when the final binary enables native roots (~120 ms on
+    /// macOS in the CLI), and the local runtime builds a `RhaiTool` per step, so
+    /// a client in `new()` or `execute()` costs that much on every rhai step.
+    ///
+    /// This is a source check rather than a timing check on purpose: in this
+    /// crate's own test build `Client::new()` is fast, so a timing assertion
+    /// passes with the defect present.
+    #[test]
+    fn rhai_tool_never_builds_its_own_http_client() {
+        let src = include_str!("rhai.rs");
+        // Everything before this test module is the non-test code.
+        let non_test = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module marker not found")];
+        // Assert the extraction before asserting about it: an early cut would
+        // pass vacuously.
+        assert!(
+            non_test.contains("fn create_engine") && non_test.contains("async fn execute"),
+            "non-test slice ({} bytes) does not contain the tool body",
+            non_test.len()
+        );
+        for banned in ["Client::new(", "Client::builder("] {
+            assert!(
+                !non_test.contains(banned),
+                "rhai.rs builds a reqwest client (`{banned}`); use crate::http_client::shared() when an HTTP function is called"
+            );
+        }
+    }
 
     #[test]
     fn test_json_to_dynamic() {

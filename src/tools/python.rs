@@ -420,7 +420,7 @@ impl PythonTool {
     pub fn new() -> Self {
         Self {
             template_engine: TemplateEngine::new(),
-            http_client: reqwest::Client::new(),
+            http_client: crate::http_client::shared(),
             gcp_auth: GcpAuth::new(),
         }
     }
