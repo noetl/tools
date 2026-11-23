@@ -199,7 +199,7 @@ impl ScriptTool {
     /// Create a new script tool.
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: crate::http_client::shared(),
             template_engine: TemplateEngine::new(),
         }
     }

@@ -20,6 +20,7 @@ pub mod auth;
 pub use noetl_locator as locator;
 pub mod context;
 pub mod error;
+pub mod http_client;
 pub mod registry;
 pub mod result;
 pub mod spool;

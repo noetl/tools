@@ -305,7 +305,7 @@ impl TransferTool {
     /// Create a new transfer tool.
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: crate::http_client::shared(),
             auth_resolver: AuthResolver::new(),
             template_engine: TemplateEngine::new(),
         }
