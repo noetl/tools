@@ -12,6 +12,7 @@ use crate::error::ToolError;
 use crate::registry::{Tool, ToolConfig};
 use crate::result::ToolResult;
 use crate::template::TemplateEngine;
+use noetl_rhai_pure::{dynamic_to_json, hex_lower, sha256};
 
 /// Rhai tool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,26 +46,17 @@ impl RhaiTool {
     fn create_engine(&self) -> Engine {
         let mut engine = Engine::new();
 
-        // Register logging functions
-        engine.register_fn("log", |msg: &str| {
-            tracing::info!(target: "rhai", "{}", msg);
-        });
-        engine.register_fn("print", |msg: &str| {
-            tracing::info!(target: "rhai", "{}", msg);
-        });
-        engine.register_fn("debug", |msg: &str| {
-            tracing::debug!(target: "rhai", "{}", msg);
-        });
-        engine.register_fn("info", |msg: &str| {
-            tracing::info!(target: "rhai", "{}", msg);
-        });
-        engine.register_fn("warn", |msg: &str| {
-            tracing::warn!(target: "rhai", "{}", msg);
-        });
-        engine.register_fn("error", |msg: &str| {
-            tracing::error!(target: "rhai", "{}", msg);
+        // The pure functions (logging, JSON, strings, sha256_hex) are shared
+        // with compiled playbooks (noetl-rhai-pure), so a script that uses only
+        // those gives the same result on a worker and in a wasm32 module.
+        noetl_rhai_pure::register_pure(&mut engine, |level, msg| match level {
+            noetl_rhai_pure::Level::Debug => tracing::debug!(target: "rhai", "{}", msg),
+            noetl_rhai_pure::Level::Info => tracing::info!(target: "rhai", "{}", msg),
+            noetl_rhai_pure::Level::Warn => tracing::warn!(target: "rhai", "{}", msg),
+            noetl_rhai_pure::Level::Error => tracing::error!(target: "rhai", "{}", msg),
         });
 
+        // Host-only from here on (noetl_rhai_pure::HOST_ONLY_FUNCTIONS).
         // Register timestamp function
         engine.register_fn("timestamp", || chrono::Utc::now().timestamp().to_string());
 
@@ -79,35 +71,6 @@ impl RhaiTool {
 
         engine.register_fn("sleep_ms", |millis: i64| {
             std::thread::sleep(std::time::Duration::from_millis(millis as u64));
-        });
-
-        // Register JSON functions
-        engine.register_fn("parse_json", |s: &str| -> Dynamic {
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(v) => json_to_dynamic(&v),
-                Err(_) => Dynamic::UNIT,
-            }
-        });
-
-        engine.register_fn("to_json", |val: Dynamic| -> String {
-            let json = dynamic_to_json(&val);
-            serde_json::to_string(&json).unwrap_or_else(|_| "null".to_string())
-        });
-
-        // Register string functions
-        engine.register_fn("contains", |s: &str, substr: &str| -> bool {
-            s.contains(substr)
-        });
-
-        engine.register_fn("contains_any", |s: &str, substrs: rhai::Array| -> bool {
-            for item in substrs {
-                if let Ok(substr) = item.into_string() {
-                    if s.contains(substr.as_str()) {
-                        return true;
-                    }
-                }
-            }
-            false
         });
 
         // HTTP functions are registered with the client
@@ -212,25 +175,13 @@ impl RhaiTool {
         args: &HashMap<String, String>,
         ctx: &ExecutionContext,
     ) -> Scope<'static> {
-        let mut scope = Scope::new();
-
-        // Add arguments
-        for (k, v) in args {
-            scope.push(k.clone(), v.clone());
-        }
-
-        // Add context variables
-        for (k, v) in &ctx.variables {
-            let dynamic = json_to_dynamic(v);
-            scope.push(k.clone(), dynamic);
-        }
-
-        // Add execution metadata
-        scope.push("execution_id", ctx.execution_id);
-        scope.push("step", ctx.step.clone());
-        scope.push("server_url", ctx.server_url.clone());
-
-        scope
+        noetl_rhai_pure::scope(
+            args,
+            &ctx.variables,
+            ctx.execution_id,
+            &ctx.step,
+            &ctx.server_url,
+        )
     }
 
     /// Execute a Rhai script.
@@ -397,85 +348,13 @@ fn http_delete_sync(
     })
 }
 
-// JSON <-> Dynamic conversion
-
-fn json_to_dynamic(value: &serde_json::Value) -> Dynamic {
-    match value {
-        serde_json::Value::Null => Dynamic::UNIT,
-        serde_json::Value::Bool(b) => Dynamic::from(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Dynamic::from(i)
-            } else if let Some(f) = n.as_f64() {
-                Dynamic::from(f)
-            } else {
-                Dynamic::UNIT
-            }
-        }
-        serde_json::Value::String(s) => Dynamic::from(s.clone()),
-        serde_json::Value::Array(arr) => {
-            let rhai_arr: rhai::Array = arr.iter().map(json_to_dynamic).collect();
-            Dynamic::from(rhai_arr)
-        }
-        serde_json::Value::Object(obj) => {
-            let mut map = rhai::Map::new();
-            for (k, v) in obj {
-                map.insert(k.clone().into(), json_to_dynamic(v));
-            }
-            Dynamic::from(map)
-        }
-    }
-}
-
-fn dynamic_to_json(value: &Dynamic) -> serde_json::Value {
-    if value.is_unit() {
-        serde_json::Value::Null
-    } else if let Ok(b) = value.as_bool() {
-        serde_json::Value::Bool(b)
-    } else if let Ok(i) = value.as_int() {
-        serde_json::Value::Number(i.into())
-    } else if let Ok(f) = value.as_float() {
-        serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null)
-    } else if let Ok(s) = value.clone().into_string() {
-        serde_json::Value::String(s)
-    } else if value.is_array() {
-        let arr = value.clone().into_array().unwrap_or_default();
-        serde_json::Value::Array(arr.iter().map(dynamic_to_json).collect())
-    } else if value.is_map() {
-        let map = value.clone().into_typed_array::<(String, Dynamic)>().ok();
-        if let Some(entries) = map {
-            let obj: serde_json::Map<String, serde_json::Value> = entries
-                .into_iter()
-                .map(|(k, v)| (k, dynamic_to_json(&v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        } else {
-            // Try casting to rhai::Map
-            if let Some(rhai_map) = value.clone().try_cast::<rhai::Map>() {
-                let obj: serde_json::Map<String, serde_json::Value> = rhai_map
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), dynamic_to_json(&v)))
-                    .collect();
-                serde_json::Value::Object(obj)
-            } else {
-                serde_json::Value::String(value.to_string())
-            }
-        }
-    } else {
-        serde_json::Value::String(value.to_string())
-    }
-}
-
 /// Hashing, HMAC and randomness for scripts that issue or check one-time
-/// codes and similar secrets (auth provider playbooks): `sha256_hex(s)`,
-/// `hmac_sha256_hex(key, msg)`, `random_digits(n)` (1..=32 decimal digits),
+/// codes and similar secrets (auth provider playbooks): `hmac_sha256_hex(key, msg)`
+/// (`sha256_hex(s)` is in noetl-rhai-pure), `random_digits(n)` (1..=32 decimal digits),
 /// `random_token(bytes)` (1..=64 random bytes, base64url without padding)
 /// and `eq_ct(a, b)` (comparison whose time doesn't depend on where the
 /// strings differ). Randomness comes from the OS CSPRNG.
 fn register_crypto(engine: &mut Engine) {
-    engine.register_fn("sha256_hex", |s: &str| hex_lower(&sha256(s.as_bytes())));
     engine.register_fn("hmac_sha256_hex", |key: &str, msg: &str| {
         hex_lower(&hmac_sha256(key.as_bytes(), msg.as_bytes()))
     });
@@ -524,11 +403,6 @@ fn register_crypto(engine: &mut Engine) {
     });
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    sha2::Sha256::digest(data).into()
-}
-
 /// HMAC-SHA256 (RFC 2104) over `sha2`, so the rhai tool doesn't need the
 /// optional `hmac` dependency.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -548,13 +422,43 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noetl_rhai_pure::json_to_dynamic;
+
+    /// Every host function the tool registers is classified, so a new one can't
+    /// slip into compiled playbooks: pure ones must be in noetl-rhai-pure (which
+    /// compiled playbooks link), the rest in HOST_ONLY_FUNCTIONS (which their
+    /// purity check refuses).
+    #[test]
+    fn every_registered_function_is_pure_or_host_only() {
+        let engine = RhaiTool::new().create_engine();
+        let mut names: Vec<String> = engine
+            .gen_fn_signatures(false)
+            .into_iter()
+            .map(|sig| sig.split('(').next().unwrap_or("").trim().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        for n in &names {
+            assert!(
+                noetl_rhai_pure::PURE_FUNCTIONS.contains(&n.as_str())
+                    || noetl_rhai_pure::HOST_ONLY_FUNCTIONS.contains(&n.as_str()),
+                "rhai function '{n}' is neither in PURE_FUNCTIONS nor in HOST_ONLY_FUNCTIONS"
+            );
+        }
+        for n in noetl_rhai_pure::PURE_FUNCTIONS
+            .iter()
+            .chain(noetl_rhai_pure::HOST_ONLY_FUNCTIONS.iter())
+            .filter(|n| **n != "timestamp")
+        {
+            assert!(
+                names.iter().any(|x| x == n),
+                "'{n}' is listed but not registered"
+            );
+        }
+    }
 
     #[test]
     fn test_json_to_dynamic() {
@@ -694,7 +598,8 @@ mod tests {
         let tool = RhaiTool::new();
         let engine = tool.create_engine();
         let mut scope = Scope::new();
-        let eval = |code: &str| -> Dynamic { engine.eval_with_scope(&mut Scope::new(), code).unwrap() };
+        let eval =
+            |code: &str| -> Dynamic { engine.eval_with_scope(&mut Scope::new(), code).unwrap() };
 
         // FIPS 180-2 / RFC 4231 test vectors.
         assert_eq!(
@@ -702,7 +607,9 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            eval(r#"hmac_sha256_hex("Jefe", "what do ya want for nothing?")"#).into_string().unwrap(),
+            eval(r#"hmac_sha256_hex("Jefe", "what do ya want for nothing?")"#)
+                .into_string()
+                .unwrap(),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
         // A key longer than the block size works (exact vector in the next test).
@@ -712,14 +619,25 @@ mod tests {
         let d = eval("random_digits(6)").into_string().unwrap();
         assert_eq!(d.len(), 6);
         assert!(d.chars().all(|c| c.is_ascii_digit()));
-        assert_ne!(eval("random_digits(32)").into_string().unwrap(), eval("random_digits(32)").into_string().unwrap());
-        assert!(engine.eval_with_scope::<String>(&mut scope, "random_digits(0)").is_err());
-        assert!(engine.eval_with_scope::<String>(&mut scope, "random_digits(33)").is_err());
+        assert_ne!(
+            eval("random_digits(32)").into_string().unwrap(),
+            eval("random_digits(32)").into_string().unwrap()
+        );
+        assert!(engine
+            .eval_with_scope::<String>(&mut scope, "random_digits(0)")
+            .is_err());
+        assert!(engine
+            .eval_with_scope::<String>(&mut scope, "random_digits(33)")
+            .is_err());
 
         let t = eval("random_token(32)").into_string().unwrap();
         assert_eq!(t.len(), 43);
-        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        assert!(engine.eval_with_scope::<String>(&mut scope, "random_token(65)").is_err());
+        assert!(t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(engine
+            .eval_with_scope::<String>(&mut scope, "random_token(65)")
+            .is_err());
 
         assert!(eval(r#"eq_ct("123456", "123456")"#).as_bool().unwrap());
         assert!(!eval(r#"eq_ct("123456", "123457")"#).as_bool().unwrap());
@@ -732,7 +650,10 @@ mod tests {
     fn test_hmac_sha256_long_key_matches_rfc4231() {
         // RFC 4231 test case 6: 131 bytes of 0xaa.
         let key = [0xaau8; 131];
-        let mac = hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First");
+        let mac = hmac_sha256(
+            &key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
         assert_eq!(
             hex_lower(&mac),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"

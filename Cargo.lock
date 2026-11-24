@@ -2520,6 +2520,15 @@ name = "noetl-locator"
 version = "0.1.1"
 
 [[package]]
+name = "noetl-rhai-pure"
+version = "0.1.0"
+dependencies = [
+ "rhai",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "noetl-tools"
 version = "4.0.1"
 dependencies = [
@@ -2546,6 +2555,7 @@ dependencies = [
  "noetl-arrow-flight-client",
  "noetl-directives",
  "noetl-locator",
+ "noetl-rhai-pure",
  "pem",
  "regex",
  "reqwest",
@@ -3306,6 +3316,8 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rhai_codegen",
+ "serde",
+ "serde_json",
  "smallvec",
  "smartstring",
  "thin-vec",
@@ -3777,6 +3789,9 @@ name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smartstring"
