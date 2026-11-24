@@ -21,6 +21,9 @@ default = ["engine"]
 engine = ["dep:rhai", "dep:serde_json", "dep:sha2"]
 
 [dependencies]
-rhai = { version = "1.19", features = ["sync"], optional = true }
+# No rhai `default`: it only adds ahash's runtime RNG (hash seeding, no effect
+# on results), which has no backend on wasm32-unknown-unknown. noetl-tools
+# depends on rhai with its defaults, so a worker's engine is unchanged.
+rhai = { version = "1.19", default-features = false, features = ["std", "sync"], optional = true }
 serde_json = { version = "1.0", optional = true }
 sha2 = { version = "0.10", optional = true }
