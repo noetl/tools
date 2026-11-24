@@ -138,6 +138,27 @@ jobs:
             # Give the sparse index a moment so the root crate's publish resolves it.
             sleep 20
           fi
+      # Publish the workspace member `noetl-rhai-pure` before the root crate:
+      # noetl-tools' rhai tool uses it, and noetl-server's orchestrate-core
+      # (catalog::purity, without the `engine` feature) and plugins/playbook-wasm
+      # (compiled playbooks) depend on it directly.  Idempotent like the others.
+      - name: Publish noetl-rhai-pure (if changed)
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version = ' rhai-pure/Cargo.toml | head -1 | cut -d'"' -f2)"
+          if cargo search noetl-rhai-pure 2>/dev/null | grep -q "noetl-rhai-pure = \"${VER}\""; then
+            echo "noetl-rhai-pure ${VER} already on crates.io; skipping."
+          else
+            OUTPUT="$(cargo publish -p noetl-rhai-pure --allow-dirty 2>&1)" || {
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
+            }
+            echo "$OUTPUT"
+            sleep 20
+          fi
       - name: Publish noetl-tools crate
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         env:

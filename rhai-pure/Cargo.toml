@@ -1,0 +1,29 @@
+[package]
+name = "noetl-rhai-pure"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/noetl/tools"
+homepage = "https://noetl.io"
+description = "The deterministic half of NoETL's rhai tool: the pure host functions, the JSON <-> Dynamic bridge and the step scope, shared by the worker's rhai tool and compiled (wasm32) playbooks."
+keywords = ["noetl", "rhai", "wasm"]
+
+# Deliberately lean: rhai + serde_json + sha2. Compiled playbooks
+# (noetl/server plugins/playbook-wasm) link this into a wasm32 module with no
+# imports, so nothing here may touch the clock, the network, the filesystem or
+# randomness. noetl-tools' RhaiTool registers these SAME functions and then adds
+# its host-only ones (http_*, timestamp*, sleep*, get_gcp_token, crypto).
+[features]
+# Without `engine` the crate is only the function lists and the build-time
+# scanner (`scan`, no dependencies), which noetl-server's orchestrate-core
+# `catalog::purity` links so the control plane carries no rhai.
+default = ["engine"]
+engine = ["dep:rhai", "dep:serde_json", "dep:sha2"]
+
+[dependencies]
+# No rhai `default`: it only adds ahash's runtime RNG (hash seeding, no effect
+# on results), which has no backend on wasm32-unknown-unknown. noetl-tools
+# depends on rhai with its defaults, so a worker's engine is unchanged.
+rhai = { version = "1.19", default-features = false, features = ["std", "sync"], optional = true }
+serde_json = { version = "1.0", optional = true }
+sha2 = { version = "0.10", optional = true }

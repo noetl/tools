@@ -4,7 +4,7 @@
 # noetl-gateway can consume the security-sensitive allowlist WITHOUT pulling
 # noetl-tools' heavy graph (duckdb/kube/tokio).  noetl-tools re-exports it.
 [workspace]
-members = ["directives", "noetl-locator"]
+members = ["directives", "noetl-locator", "rhai-pure"]
 resolver = "2"
 
 [package]
@@ -146,6 +146,8 @@ minijinja = { version = "2.5", features = ["loader"] }
 
 # Rhai scripting
 rhai = { version = "1.19", features = ["sync"] }
+# The pure rhai functions + JSON bridge + scope, shared with compiled playbooks.
+noetl-rhai-pure = { version = "0.1", path = "rhai-pure" }
 
 # DuckDB — optional, behind the non-default `duckdb-integration` feature.
 # `features = ["bundled"]` compiles the full DuckDB C++ amalgamation via
@@ -227,6 +229,8 @@ arrow-flight = "53"
 noetl-arrow-flight-client = "0.5"
 
 [dev-dependencies]
+# `metadata` lists the registered functions (rhai tool classification test).
+rhai = { version = "1.19", features = ["sync", "metadata"] }
 tokio-test = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # In-process mock HTTP server for the provider tool's apply-mode + LRO tests
